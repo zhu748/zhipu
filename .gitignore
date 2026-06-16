@@ -7,3 +7,4 @@ dist/
 *.tsbuildinfo
 /.omo
 /_reverse
+/zcode-proxy.exe
