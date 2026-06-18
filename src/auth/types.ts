@@ -20,6 +20,8 @@ export interface Credential {
   expiresAt?: number;
   /** Upstream user identifier (OAuth only). Injected as `metadata.user_id` on Anthropic-format requests. */
   userId?: string;
+  /** JWT token for start-plan (zcode.z.ai). Present when login captured the ZCode plan token. */
+  jwt?: string;
 }
 
 /**

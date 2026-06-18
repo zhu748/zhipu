@@ -53,6 +53,8 @@ export interface ProxyConfig {
   auth: AuthConfig;
   /** Active upstream provider. */
   provider: "zai" | "bigmodel";
+  /** Which plan tier to use. "coding-plan" (default) uses direct upstream endpoints; "start-plan" routes through zcode.z.ai with JWT auth. */
+  plan: "coding-plan" | "start-plan";
   /** Per-provider endpoint overrides. */
   providers: {
     zai: ProviderEndpoints;

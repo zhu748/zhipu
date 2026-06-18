@@ -34,6 +34,8 @@ export interface OAuthResult {
   provider: ProviderId;
   /** Upstream user identifier, when the OAuth response included one. Passed through to `metadata.user_id` on Anthropic-format requests. */
   userId?: string;
+  /** ZCode plan JWT for start-plan (zcode.z.ai). The OAuth poll/exchange response includes this alongside the provider access_token. */
+  jwt?: string;
 }
 
 export type FetchFn = typeof fetch;
@@ -202,7 +204,7 @@ export class ZaiOAuthClient {
         if (!accessToken || typeof accessToken !== "string") {
           throw new Error("OAuth ready but no access_token in response");
         }
-        return { accessToken, provider: "zai", userId: result.userId };
+        return { accessToken, provider: "zai", userId: result.userId, jwt: result.token };
       }
       if (result.status === "failed") {
         throw new Error("Authorization failed. Please retry login.");
@@ -347,7 +349,7 @@ export class BigmodelOAuthClient {
     authCode: string,
     redirectUri: string,
     state: string,
-  ): Promise<{ accessToken: string; userId?: string }> {
+  ): Promise<{ accessToken: string; userId?: string; jwt?: string }> {
     const resp = await this.fetchImpl(ZCODE_TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -381,7 +383,8 @@ export class BigmodelOAuthClient {
       throw new Error("Bigmodel token response missing bigmodel.access_token");
     }
     const userId = raw?.data?.user?.user_id;
-    return { accessToken, userId: typeof userId === "string" ? userId : undefined };
+    const jwt = raw?.data?.token?.trim() ?? undefined;
+    return { accessToken, userId: typeof userId === "string" ? userId : undefined, jwt };
   }
 
   async authorize(
@@ -393,8 +396,8 @@ export class BigmodelOAuthClient {
 
     try {
       const authCode = await this.waitForCallback(timeoutMs);
-      const { accessToken, userId } = await this.exchangeCode(authCode, callbackUrl, state);
-      return { accessToken, provider: "bigmodel", userId };
+      const { accessToken, userId, jwt } = await this.exchangeCode(authCode, callbackUrl, state);
+      return { accessToken, provider: "bigmodel", userId, jwt };
     } finally {
       await this.close();
     }

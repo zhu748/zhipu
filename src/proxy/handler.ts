@@ -57,7 +57,7 @@ export async function proxyRequest(
   }
 
   const transformedBody = transformRequestBody(body, { format, userId: cred.userId });
-  const upstreamReq = buildUpstreamRequest(clientReq, format, provider, cred, transformedBody, config.identity);
+  const upstreamReq = buildUpstreamRequest(clientReq, format, provider, cred, transformedBody, config.identity, config.plan);
 
   let upstreamResp: Response;
   try {
@@ -65,6 +65,11 @@ export async function proxyRequest(
   } catch (err) {
     logRequest(format, meta, 502, started);
     return errorResponse(502, "upstream_unreachable", (err as Error).message);
+  }
+
+  if (upstreamResp.status === 401 && config.plan === "start-plan") {
+    logRequest(format, meta, 401, started);
+    return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
   }
 
   logRequest(format, meta, upstreamResp.status, started);

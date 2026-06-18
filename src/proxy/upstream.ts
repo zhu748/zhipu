@@ -12,6 +12,9 @@ import { buildIdentityHeaders } from "./identity.js";
 
 const ANTHROPIC_VERSION = "2023-06-01";
 
+const STARTPLAN_ANTHROPIC_BASE = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
+const STARTPLAN_OPENAI_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
+
 const STRIP_HEADERS = new Set([
   "host",
   "authorization",
@@ -28,15 +31,21 @@ const STRIP_HEADERS = new Set([
   "x-session-id",
 ]);
 
-export function buildUpstreamURL(format: Format, provider: ProviderDef): string {
+export function buildUpstreamURL(format: Format, provider: ProviderDef, plan: "coding-plan" | "start-plan" = "coding-plan"): string {
+  if (plan === "start-plan") {
+    if (format === "anthropic") {
+      return `${STARTPLAN_ANTHROPIC_BASE}/v1/messages`;
+    }
+    return `${STARTPLAN_OPENAI_BASE}/chat/completions`;
+  }
   if (format === "anthropic") {
     return `${provider.anthropicBaseURL}/v1/messages`;
   }
   return `${provider.openaiBaseURL}/chat/completions`;
 }
 
-export function buildAuthHeaders(format: Format, cred: Credential, identity: ProxyIdentity): Record<string, string> {
-  const credStr = credentialString(cred);
+export function buildAuthHeaders(format: Format, cred: Credential, identity: ProxyIdentity, plan: "coding-plan" | "start-plan" = "coding-plan"): Record<string, string> {
+  const credStr = plan === "start-plan" && cred.jwt ? cred.jwt : credentialString(cred);
   const base: Record<string, string> = {
     ...buildIdentityHeaders(identity),
     "x-request-id": crypto.randomUUID(),
@@ -74,9 +83,10 @@ export function buildUpstreamRequest(
   cred: Credential,
   body: string | undefined,
   identity: ProxyIdentity,
+  plan: "coding-plan" | "start-plan" = "coding-plan",
 ): Request {
-  const url = buildUpstreamURL(format, provider);
-  const authHeaders = buildAuthHeaders(format, cred, identity);
+  const url = buildUpstreamURL(format, provider, plan);
+  const authHeaders = buildAuthHeaders(format, cred, identity, plan);
   const passthrough = collectPassthroughHeaders(clientReq);
 
   const headers: Record<string, string> = {

@@ -84,6 +84,7 @@ async function serve(configPath?: string): Promise<void> {
   const url = `http://${server.hostname}:${server.port}`;
   console.log(`zcode-proxy listening on ${url}`);
   console.log(`  provider: ${config.provider}`);
+  console.log(`  plan: ${config.plan}`);
   console.log(`  auth mode: ${config.auth.mode}`);
   console.log(`  models: ${config.models.length} available`);
 
@@ -129,10 +130,11 @@ async function authLogin(args: string[]): Promise<void> {
   if (importMode) {
     cred = importFromZCodeConfig(provider);
   } else {
-    const { accessToken, userId } = await runOAuth(provider);
+    const { accessToken, userId, jwt } = await runOAuth(provider);
     console.log("\nResolving API key...");
     const resolver = new KeyResolver();
     cred = await resolver.resolveCodingPlanCredential(accessToken, provider, userId);
+    if (jwt) cred.jwt = jwt;
   }
 
   await saveCredential(cred);
@@ -163,7 +165,7 @@ async function authStatus(): Promise<void> {
   console.log(`  Store:   ${getStorePath()}`);
 }
 
-async function runOAuth(provider: ProviderId): Promise<{ accessToken: string; userId?: string }> {
+async function runOAuth(provider: ProviderId): Promise<{ accessToken: string; userId?: string; jwt?: string }> {
   if (provider === "bigmodel") {
     const oauth = new BigmodelOAuthClient();
     const result = await oauth.authorize((url) => {
@@ -172,7 +174,7 @@ async function runOAuth(provider: ProviderId): Promise<{ accessToken: string; us
       console.log("Waiting for authorization... (expires in 300s)\n");
       openBrowser(url);
     });
-    return { accessToken: result.accessToken, userId: result.userId };
+    return { accessToken: result.accessToken, userId: result.userId, jwt: result.jwt };
   }
 
   const oauth = new ZaiOAuthClient();
@@ -185,7 +187,7 @@ async function runOAuth(provider: ProviderId): Promise<{ accessToken: string; us
   openBrowser(init.authorizeUrl);
 
   const result = await oauth.waitForAuth(init);
-  return { accessToken: result.accessToken, userId: result.userId };
+  return { accessToken: result.accessToken, userId: result.userId, jwt: result.jwt };
 }
 
 function importFromZCodeConfig(provider: ProviderId): Credential {
@@ -212,8 +214,12 @@ function importFromZCodeConfig(provider: ProviderId): Credential {
     process.exit(1);
   }
 
+  const startPlanKey = `builtin:${provider}-start-plan`;
+  const jwt = config.provider?.[startPlanKey]?.options?.apiKey?.trim() || undefined;
+
   console.log(`Imported from ${configPath}`);
-  return { apiKey, provider };
+  if (jwt) console.log(`  Start-plan JWT: ${jwt.slice(0, 12)}...`);
+  return { apiKey, provider, jwt };
 }
 
 function openBrowser(url: string): void {

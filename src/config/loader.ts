@@ -21,6 +21,7 @@ const DEFAULTS = {
   PORT: 8080,
   HOST: "0.0.0.0",
   PROVIDER: "zai" as const,
+  PLAN: "coding-plan" as const,
   DEFAULT_MODEL: "glm-4.6",
   LOG_LEVEL: "info" as const,
   ZAI_ANTHROPIC_BASE: "https://api.z.ai/api/anthropic",
@@ -59,6 +60,7 @@ export function loadConfig(path: string): ProxyConfig {
 
   // --- provider ---
   const provider = resolveProvider(process.env[ENV.PROVIDER] ?? parsed?.provider);
+  const plan = resolvePlan(parsed?.plan);
 
   // --- providers ---
   const zai: ProviderEndpoints = {
@@ -93,6 +95,7 @@ export function loadConfig(path: string): ProxyConfig {
     server: { port, host },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
     provider,
+    plan,
     providers: { zai, bigmodel },
     defaultModel,
     models,
@@ -121,6 +124,11 @@ function resolveProvider(raw: unknown): "zai" | "bigmodel" {
     throw new Error(`Invalid provider "${v}": must be "zai" or "bigmodel"`);
   }
   return v;
+}
+
+function resolvePlan(raw: unknown): "coding-plan" | "start-plan" {
+  if (raw === "start-plan") return "start-plan";
+  return DEFAULTS.PLAN;
 }
 
 /** Resolve log level with fallback. */
