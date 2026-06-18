@@ -6,10 +6,9 @@ import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import { loadConfig } from "./config/loader.js";
 import { AuthManager } from "./auth/manager.js";
 import { startServer } from "./server/server.js";
-import type { Server } from "bun";
 
-let proxyServer: Server;
-let mockUpstreamServer: Server;
+let proxyServer: ReturnType<typeof Bun.serve>;
+let mockUpstreamServer: ReturnType<typeof Bun.serve>;
 let proxyPort: number;
 let mockPort: number;
 

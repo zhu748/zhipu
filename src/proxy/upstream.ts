@@ -11,7 +11,6 @@ import { credentialString } from "../auth/types.js";
 import { buildIdentityHeaders } from "./identity.js";
 
 const ANTHROPIC_VERSION = "2023-06-01";
-const SESSION_ROTATE_MS = 10 * 60 * 1000;
 
 const STRIP_HEADERS = new Set([
   "host",
@@ -29,18 +28,6 @@ const STRIP_HEADERS = new Set([
   "x-session-id",
 ]);
 
-let currentSessionId = crypto.randomUUID();
-let sessionRotateAt = Date.now() + SESSION_ROTATE_MS;
-
-function getSessionId(): string {
-  const now = Date.now();
-  if (now >= sessionRotateAt) {
-    currentSessionId = crypto.randomUUID();
-    sessionRotateAt = now + SESSION_ROTATE_MS;
-  }
-  return currentSessionId;
-}
-
 export function buildUpstreamURL(format: Format, provider: ProviderDef): string {
   if (format === "anthropic") {
     return `${provider.anthropicBaseURL}/v1/messages`;
@@ -55,7 +42,7 @@ export function buildAuthHeaders(format: Format, cred: Credential, identity: Pro
     "x-request-id": crypto.randomUUID(),
     "x-zcode-trace-id": crypto.randomUUID(),
     "x-query-id": `query_${crypto.randomUUID()}`,
-    "x-session-id": getSessionId(),
+    "x-session-id": crypto.randomUUID(),
   };
 
   if (format === "anthropic") {
@@ -94,6 +81,7 @@ export function buildUpstreamRequest(
 
   const headers: Record<string, string> = {
     "content-type": "application/json",
+    "accept-encoding": "gzip",
     ...passthrough,
     ...authHeaders,
   };

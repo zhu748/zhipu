@@ -12,24 +12,14 @@ const STORE_DIR = join(homedir(), ".zcode-proxy");
 const STORE_FILE = join(STORE_DIR, "credentials.json");
 const ENV_SECRET = "ZCODE_PROXY_CREDENTIAL_SECRET";
 
-function getEncryptionKey(): Uint8Array {
-  const envKey = process.env[ENV_SECRET];
-  if (envKey) {
-    const encoder = new TextEncoder();
-    const hash = new Uint8Array(32);
-    const keyBytes = encoder.encode(envKey);
-    for (let i = 0; i < keyBytes.length; i++) {
-      hash[i % 32] ^= keyBytes[i];
-    }
-    return hash;
-  }
-
-  const machineId = `${homedir()}-${process.platform}-${process.arch}`;
+function getEncryptionKey() {
+  const hash = new Uint8Array(new ArrayBuffer(32));
   const encoder = new TextEncoder();
-  const hash = new Uint8Array(32);
-  const idBytes = encoder.encode(machineId);
-  for (let i = 0; i < idBytes.length; i++) {
-    hash[i % 32] ^= idBytes[i];
+
+  const seed = process.env[ENV_SECRET] ?? `${homedir()}-${process.platform}-${process.arch}`;
+  const seedBytes = encoder.encode(seed);
+  for (let i = 0; i < seedBytes.length; i++) {
+    hash[i % 32] ^= seedBytes[i];
   }
   return hash;
 }

@@ -84,6 +84,22 @@ describe("buildAuthHeaders", () => {
     expect(h["X-ZCode-Agent"]).toBe("glm");
     expect(h["HTTP-Referer"]).toBe("https://zcode.z.ai");
   });
+
+  it("generates unique x-session-id per call (no shared singleton)", () => {
+    const h1 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY);
+    const h2 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY);
+    expect(h1["x-session-id"]).toBeTruthy();
+    expect(h2["x-session-id"]).toBeTruthy();
+    expect(h1["x-session-id"]).not.toBe(h2["x-session-id"]);
+  });
+
+  it("generates unique x-request-id and x-zcode-trace-id per call", () => {
+    const h1 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY);
+    const h2 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY);
+    expect(h1["x-request-id"]).not.toBe(h2["x-request-id"]);
+    expect(h1["x-zcode-trace-id"]).not.toBe(h2["x-zcode-trace-id"]);
+    expect(h1["x-query-id"]).not.toBe(h2["x-query-id"]);
+  });
 });
 
 describe("buildUpstreamRequest", () => {
@@ -197,6 +213,28 @@ describe("proxyRequest", () => {
     expect(text).toContain("message_start");
     expect(text).toContain("text_delta");
     expect(text).toContain("message_stop");
+  });
+
+  it("forwards content-encoding from upstream response (decompress: false passthrough)", async () => {
+    const fetchMock = mock(async (_req: Request, init?: RequestInit & { decompress?: boolean }): Promise<Response> => {
+      expect(init?.decompress).toBe(false);
+      return new Response('{"id":"msg_1","content":[{"text":"Hello"}]}', {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "content-encoding": "gzip",
+        },
+      });
+    });
+
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
+    const clientReq = makeClientReq('{"model":"glm-4.6","messages":[]}');
+
+    const resp = await proxyRequest(clientReq, "anthropic", { config: testConfig, auth, fetchImpl: fetchMock as any });
+
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("content-type")).toBe("application/json");
+    expect(resp.headers.get("content-encoding")).toBe("gzip");
   });
 
   it("returns 502 when upstream is unreachable", async () => {

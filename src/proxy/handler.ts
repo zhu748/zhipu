@@ -20,18 +20,14 @@ export interface ProxyHandlerOptions {
 /**
  * Forward a client request to the upstream provider with injected auth.
  *
- * Steps:
- * 1. Read client request body
- * 2. Get provider definition from config
- * 3. Get credential from auth manager
- * 4. Build upstream request (URL + headers + body)
- * 5. Fetch from upstream
- * 6. Stream the response back (body is piped for both streaming + non-streaming)
+ * Uses `decompress: false` on the upstream fetch so compressed response bodies
+ * (gzip/deflate/br) pass through untouched — the raw bytes and Content-Encoding
+ * header are forwarded as-is, letting the client handle decompression.
  *
- * @returns The upstream `Response`, ready to return from a Bun.serve handler.
+ * No upstream timeout is applied — matches ZCode desktop client behaviour
+ * (the bundle has no automatic timer on LLM calls, only user-initiated abort).
+ * Connection-level errors (ECONNREFUSED, DNS failure) still surface as 502.
  */
-const UPSTREAM_TIMEOUT_MS = 180_000;
-
 export async function proxyRequest(
   clientReq: Request,
   format: Format,
@@ -39,8 +35,11 @@ export async function proxyRequest(
 ): Promise<Response> {
   const { config, auth } = opts;
   const fetchImpl = opts.fetchImpl ?? fetch;
+  const started = Date.now();
 
   const body = await readBody(clientReq);
+
+  const meta = peekBody(body);
 
   const staticProvider = getProvider(config.provider);
   const provider = {
@@ -53,6 +52,7 @@ export async function proxyRequest(
   try {
     cred = await auth.getCredential();
   } catch (err) {
+    logRequest(format, meta, 503, started);
     return errorResponse(503, "credential_unavailable", (err as Error).message);
   }
 
@@ -61,13 +61,13 @@ export async function proxyRequest(
 
   let upstreamResp: Response;
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
-    upstreamResp = await fetchImpl(upstreamReq, { signal: controller.signal }).finally(() => clearTimeout(timer));
+    upstreamResp = await fetchImpl(upstreamReq, { decompress: false });
   } catch (err) {
+    logRequest(format, meta, 502, started);
     return errorResponse(502, "upstream_unreachable", (err as Error).message);
   }
 
+  logRequest(format, meta, upstreamResp.status, started);
   return passthroughResponse(upstreamResp);
 }
 
@@ -119,4 +119,32 @@ export function errorResponse(status: number, type: string, message: string): Re
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+interface RequestMeta {
+  model: string;
+  stream: boolean;
+}
+
+function peekBody(body: string | undefined): RequestMeta {
+  if (!body) return { model: "-", stream: false };
+  try {
+    const p = JSON.parse(body) as Record<string, unknown>;
+    return {
+      model: typeof p.model === "string" ? p.model : "-",
+      stream: p.stream === true,
+    };
+  } catch {
+    return { model: "-", stream: false };
+  }
+}
+
+function logRequest(format: Format, meta: RequestMeta, status: number, started: number): void {
+  const ts = new Date().toISOString().slice(11, 23);
+  const elapsed = Date.now() - started;
+  const tag = format === "anthropic" ? "ANT" : "OAI";
+  const mode = meta.stream ? "stream" : "batch";
+  console.log(
+    `[${ts}] ${tag} ${meta.model.padEnd(14)} ${mode.padEnd(6)} ${String(status).padEnd(4)} ${elapsed}ms`,
+  );
 }
