@@ -1,5 +1,9 @@
 # zcode-proxy 使用说明
 
+> **v0.1.5 修复版本**
+> - **跨项目凭证互通**：zhipu 现在能直接读取 zcode-api-ref (TriDefender/zcode-api) 创建的 `credentials.json`，无需重新登录
+> - **解密 fallback 链扩充**：依次尝试 (1) 当前 SHA-256/Node-crypto 格式 → (2) 早期 SHA-256/WebCrypto 格式 → (3) zcode-api-ref 的 XOR-fold/WebCrypto 格式
+>
 > **v0.1.4 修复版本**
 > - **导入密钥时自动识别 plan**：从 ZCode config 导入时，自动检测 `enabled: true` 的那个 plan 作为账号的 plan，无需用户手动选择
 > - **`--plan=` 改为可选的强制覆盖**：默认走自动识别，加 `--plan=` 可强制指定

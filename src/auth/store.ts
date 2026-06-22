@@ -52,6 +52,29 @@ function getEncryptionKeyBuffer(): Buffer {
 }
 
 /**
+ * Derive the legacy XOR-fold key used by zcode-api-ref (the open-source
+ * reference repo) and early zhipu versions. The seed string is identical
+ * to getEncryptionKeyBuffer(), but the derivation is different:
+ *
+ *   zcode-api-ref: hash[i % 32] ^= seedBytes[i]   (XOR fold, NOT cryptographic)
+ *   current zhipu: SHA-256(seed)                   (cryptographic)
+ *
+ * We keep this around so users who already have a credentials.json created
+ * by zcode-api-ref (or the open-source clone) can have it transparently
+ * migrated when they switch to zhipu — instead of getting a "Failed to
+ * decrypt credential store" error and having to re-login.
+ */
+function getLegacyXorEncryptionKey(): Buffer {
+  const hash = Buffer.alloc(32);
+  const seed = process.env[ENV_SECRET] ?? `${homedir()}-${process.platform}-${process.arch}`;
+  const seedBytes = Buffer.from(seed, "utf8");
+  for (let i = 0; i < seedBytes.length; i++) {
+    hash[i % 32] ^= seedBytes[i];
+  }
+  return hash;
+}
+
+/**
  * Encrypt plaintext using AES-256-GCM (Node.js crypto).
  * Output format: base64( IV[16] + AUTH_TAG[16] + CIPHERTEXT )
  */
@@ -65,17 +88,21 @@ async function encrypt(plaintext: string): Promise<string> {
 }
 
 /**
- * Decrypt ciphertext. Tries the new Node.js crypto format first,
- * then falls back to the legacy WebCrypto format (IV[12] + encrypted+tag)
- * for stores created by older versions.
+ * Decrypt ciphertext. Tries multiple formats in order:
+ *   1. New Node.js crypto format (IV[16] + AUTH_TAG[16] + CIPHERTEXT, SHA-256 key)
+ *   2. zhipu legacy WebCrypto format (IV[12] + encrypted+tag, SHA-256 key)
+ *   3. zcode-api-ref format (IV[12] + encrypted+tag, XOR-fold key)
+ *
+ * Step 3 lets users who already have a credentials.json from the open-source
+ * zcode-api-ref repo transparently migrate to zhipu without re-logging in.
  */
 async function decrypt(ciphertext: string): Promise<string> {
-  const key = getEncryptionKeyBuffer();
   const data = Buffer.from(ciphertext, "base64");
 
-  // --- Try new format: IV[16] + AUTH_TAG[16] + CIPHERTEXT ---
+  // --- Try 1: new format: IV[16] + AUTH_TAG[16] + CIPHERTEXT (SHA-256 key) ---
   if (data.length >= 32) {
     try {
+      const key = getEncryptionKeyBuffer();
       const iv = data.subarray(0, 16);
       const tag = data.subarray(16, 32);
       const encrypted = data.subarray(32);
@@ -87,11 +114,16 @@ async function decrypt(ciphertext: string): Promise<string> {
     }
   }
 
-  // --- Fallback: legacy WebCrypto format: IV[12] + (encrypted + tag appended) ---
+  // --- Try 2: zhipu legacy WebCrypto format (IV[12] + encrypted+tag, SHA-256 key) ---
   try {
+    const key = getEncryptionKeyBuffer();
+    // Copy into a fresh ArrayBuffer to satisfy BufferSource typing (avoids
+    // the SharedArrayBuffer-incompatible typing issue with Buffer.subarray).
+    const keyCopy = new Uint8Array(32);
+    keyCopy.set(key);
     const cryptoKey = await crypto.subtle.importKey(
       "raw",
-      new Uint8Array(key),
+      keyCopy,
       { name: "AES-GCM" },
       false,
       ["decrypt"],
@@ -105,10 +137,40 @@ async function decrypt(ciphertext: string): Promise<string> {
     );
     return new TextDecoder().decode(decrypted);
   } catch {
-    // Legacy format also failed
+    // zhipu legacy format also failed — try zcode-api-ref format next
   }
 
-  throw new Error("Failed to decrypt credential store (tried both current and legacy formats)");
+  // --- Try 3: zcode-api-ref format (IV[12] + encrypted+tag, XOR-fold key) ---
+  // This is the format used by https://github.com/TriDefender/zcode-api
+  // and early zhipu versions before the SHA-256 migration. Same seed string
+  // but XOR-fold key derivation instead of SHA-256.
+  try {
+    const legacyKey = getLegacyXorEncryptionKey();
+    const keyCopy = new Uint8Array(32);
+    keyCopy.set(legacyKey);
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      keyCopy,
+      { name: "AES-GCM" },
+      false,
+      ["decrypt"],
+    );
+    const iv = new Uint8Array(data.subarray(0, 12));
+    const encrypted = new Uint8Array(data.subarray(12));
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv },
+      cryptoKey,
+      encrypted,
+    );
+    return new TextDecoder().decode(decrypted);
+  } catch {
+    // All three formats failed
+  }
+
+  throw new Error(
+    "Failed to decrypt credential store (tried current SHA-256/Node-crypto, " +
+    "legacy SHA-256/WebCrypto, and zcode-api-ref XOR-fold formats)"
+  );
 }
 
 // ---------------------------------------------------------------------------
