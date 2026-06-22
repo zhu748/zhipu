@@ -26,6 +26,11 @@ beforeEach(() => {
   delete process.env.ZCODE_APP_VERSION;
   delete process.env.ZCODE_SOURCE_TITLE;
   delete process.env.ZCODE_REFERER_ORIGIN;
+  delete process.env.ZCODE_RETRY_MAX;
+  delete process.env.ZCODE_RETRY_INITIAL_DELAY_MS;
+  delete process.env.ZCODE_RETRY_MAX_DELAY_MS;
+  delete process.env.ZCODE_RETRY_BACKOFF_FACTOR;
+  delete process.env.ZCODE_RETRY_STATUSES;
 });
 
 afterEach(() => {
@@ -206,5 +211,69 @@ identity:
 `);
     const cfg = loadConfig(path);
     expect(cfg.identity.appVersion).toBe("3.1.1");
+  });
+
+  it("retry: applies defaults when no retry section provided", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.retry.maxRetries).toBe(3);
+    expect(cfg.retry.initialDelayMs).toBe(1000);
+    expect(cfg.retry.maxDelayMs).toBe(8000);
+    expect(cfg.retry.backoffFactor).toBe(2);
+    expect(cfg.retry.retryableStatuses).toEqual([529]);
+  });
+
+  it("retry: loads retry config from YAML", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+retry:
+  maxRetries: 5
+  initialDelayMs: 2000
+  maxDelayMs: 16000
+  backoffFactor: 3
+  retryableStatuses:
+    - 529
+    - 429
+    - 503
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.retry.maxRetries).toBe(5);
+    expect(cfg.retry.initialDelayMs).toBe(2000);
+    expect(cfg.retry.maxDelayMs).toBe(16000);
+    expect(cfg.retry.backoffFactor).toBe(3);
+    expect(cfg.retry.retryableStatuses).toEqual([529, 429, 503]);
+  });
+
+  it("retry: env vars override YAML values", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+retry:
+  maxRetries: 1
+`);
+    process.env.ZCODE_RETRY_MAX = "7";
+    process.env.ZCODE_RETRY_STATUSES = "529,503";
+    const cfg = loadConfig(path);
+    expect(cfg.retry.maxRetries).toBe(7);
+    expect(cfg.retry.retryableStatuses).toEqual([529, 503]);
+  });
+
+  it("retry: maxRetries=0 disables retries", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+retry:
+  maxRetries: 0
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.retry.maxRetries).toBe(0);
   });
 });

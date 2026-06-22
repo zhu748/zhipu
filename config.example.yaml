@@ -63,3 +63,27 @@ identity:
 
 logging:
   level: info
+
+# Retry configuration for upstream requests.
+# When the upstream returns a retryable status code (e.g. 529 site overloaded),
+# the proxy will automatically retry with exponential backoff.
+# All fields are optional; defaults are shown below.
+# Environment variable overrides:
+#   ZCODE_RETRY_MAX              — max number of retries
+#   ZCODE_RETRY_INITIAL_DELAY_MS — initial delay before first retry (ms)
+#   ZCODE_RETRY_MAX_DELAY_MS     — maximum delay cap (ms)
+#   ZCODE_RETRY_BACKOFF_FACTOR   — backoff multiplier per attempt
+#   ZCODE_RETRY_STATUSES         — comma-separated retryable status codes (e.g. "529,429,503")
+retry:
+  # Maximum number of retry attempts. Set to 0 to disable retries.
+  maxRetries: 3
+  # Initial delay (ms) before the first retry. Subsequent retries multiply by backoffFactor.
+  initialDelayMs: 1000
+  # Maximum delay cap (ms). Backoff will never exceed this value.
+  maxDelayMs: 8000
+  # Exponential backoff multiplier. 2 = each retry waits ~2x longer.
+  backoffFactor: 2
+  # HTTP status codes that trigger a retry.
+  # Common values: 429 (rate limited), 503 (service unavailable), 529 (site overloaded).
+  retryableStatuses:
+    - 529

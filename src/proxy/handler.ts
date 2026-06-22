@@ -132,6 +132,69 @@ export async function proxyRequest(
     }
   }
 
+  // Retry on retryable status codes (e.g. 529 site overloaded, 429 rate limited)
+  // Uses exponential backoff with jitter, and respects Retry-After header.
+  if (config.retry.maxRetries > 0 && config.retry.retryableStatuses.includes(upstreamResp.status)) {
+    try { upstreamResp.body?.cancel(); } catch {}
+
+    for (let attempt = 1; attempt <= config.retry.maxRetries; attempt++) {
+      // Calculate backoff delay: initialDelay * backoffFactor^(attempt-1), capped at maxDelay
+      const rawDelay = config.retry.initialDelayMs * Math.pow(config.retry.backoffFactor, attempt - 1);
+      let delayMs = Math.min(rawDelay, config.retry.maxDelayMs);
+
+      // Respect Retry-After header if present (value is in seconds)
+      const retryAfter = upstreamResp.headers.get("retry-after");
+      if (retryAfter) {
+        const retryAfterMs = parseFloat(retryAfter) * 1000;
+        if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+          delayMs = Math.max(delayMs, retryAfterMs);
+        }
+      }
+
+      // Add small random jitter (0–25% of delay) to avoid thundering herd
+      const jitter = delayMs * 0.25 * Math.random();
+      delayMs = Math.round(delayMs + jitter);
+
+      console.log(
+        `${reqId} upstream returned ${upstreamResp.status}, retry ${attempt}/${config.retry.maxRetries} in ${delayMs}ms...`,
+      );
+      await sleep(delayMs);
+
+      try {
+        upstreamResp = await fetchImpl(upstreamReq, translateMode ? {} : { decompress: false });
+      } catch (err) {
+        // Network error during retry — if we have retries left, keep trying; otherwise bail
+        if (attempt < config.retry.maxRetries) {
+          console.log(`${reqId} network error on retry ${attempt}, will retry again...`);
+          // Create a synthetic 502 response so the loop can continue checking retryableStatuses
+          upstreamResp = errorResponse(502, "upstream_unreachable", (err as Error).message);
+          continue;
+        }
+        printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
+        return errorResponse(502, "upstream_unreachable", (err as Error).message);
+      }
+
+      // If the new response is no longer a retryable status, break out
+      if (!config.retry.retryableStatuses.includes(upstreamResp.status)) {
+        console.log(`${reqId} retry ${attempt} succeeded (status ${upstreamResp.status})`);
+        break;
+      }
+
+      // Still a retryable status — cancel body and loop again
+      try { upstreamResp.body?.cancel(); } catch {}
+
+      // If this was the last retry attempt, log the exhaustion
+      if (attempt === config.retry.maxRetries) {
+        console.log(`${reqId} all ${config.retry.maxRetries} retries exhausted, returning ${upstreamResp.status}`);
+        // Rebuild the request one final time so we can return the response with a body
+        upstreamResp = await fetchImpl(upstreamReq, translateMode ? {} : { decompress: false }).catch((err: Error) => {
+          printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
+          return errorResponse(502, "upstream_unreachable", err.message);
+        });
+      }
+    }
+  }
+
   const isSSE = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;
 
   if (translateMode) {
@@ -165,6 +228,11 @@ async function readBody(req: Request): Promise<string | undefined> {
   const text = await req.text();
   if (text.length === 0) return undefined;
   return text;
+}
+
+/** Sleep for the specified number of milliseconds. */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**

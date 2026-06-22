@@ -4,7 +4,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ProxyConfig, ProviderEndpoints, ProxyIdentity } from "./types.js";
+import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -15,6 +15,11 @@ const ENV = {
   APP_VERSION: "ZCODE_APP_VERSION",
   SOURCE_TITLE: "ZCODE_SOURCE_TITLE",
   REFERER_ORIGIN: "ZCODE_REFERER_ORIGIN",
+  RETRY_MAX: "ZCODE_RETRY_MAX",
+  RETRY_INITIAL_DELAY_MS: "ZCODE_RETRY_INITIAL_DELAY_MS",
+  RETRY_MAX_DELAY_MS: "ZCODE_RETRY_MAX_DELAY_MS",
+  RETRY_BACKOFF_FACTOR: "ZCODE_RETRY_BACKOFF_FACTOR",
+  RETRY_STATUSES: "ZCODE_RETRY_STATUSES",
 } as const;
 
 const DEFAULTS = {
@@ -31,6 +36,11 @@ const DEFAULTS = {
   APP_VERSION: "3.1.1",
   SOURCE_TITLE: "cli",
   REFERER_ORIGIN: "https://zcode.z.ai",
+  RETRY_MAX_RETRIES: 3,
+  RETRY_INITIAL_DELAY_MS: 1000,
+  RETRY_MAX_DELAY_MS: 8000,
+  RETRY_BACKOFF_FACTOR: 2,
+  RETRY_STATUSES: [529],
 };
 
 /** Printable-ASCII gate copied from the ZCode bundle's `rYn` helper. */
@@ -91,6 +101,9 @@ export function loadConfig(path: string): ProxyConfig {
     refererYaml: parsed?.identity?.refererOrigin,
   });
 
+  // --- retry ---
+  const retry = resolveRetry(parsed?.retry);
+
   const config: ProxyConfig = {
     server: { port, host },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
@@ -101,6 +114,7 @@ export function loadConfig(path: string): ProxyConfig {
     models,
     identity,
     logging: { level: logLevel },
+    retry,
   };
 
   validate(config);
@@ -161,6 +175,56 @@ function resolveIdentity(inp: IdentityInputs): ProxyIdentity {
     || DEFAULTS.REFERER_ORIGIN;
 
   return { appVersion, sourceTitle, refererOrigin };
+}
+
+/** Resolve retry configuration with env-var overrides and defaults. */
+function resolveRetry(raw?: unknown): RetryConfig {
+  const r = (typeof raw === "object" && raw !== null) ? raw as Record<string, unknown> : {};
+
+  const maxRetries = resolvePositiveInt(
+    process.env[ENV.RETRY_MAX] ?? r.maxRetries,
+    DEFAULTS.RETRY_MAX_RETRIES,
+  );
+  const initialDelayMs = resolvePositiveInt(
+    process.env[ENV.RETRY_INITIAL_DELAY_MS] ?? r.initialDelayMs,
+    DEFAULTS.RETRY_INITIAL_DELAY_MS,
+  );
+  const maxDelayMs = resolvePositiveInt(
+    process.env[ENV.RETRY_MAX_DELAY_MS] ?? r.maxDelayMs,
+    DEFAULTS.RETRY_MAX_DELAY_MS,
+  );
+  const backoffFactor = resolvePositiveFloat(
+    process.env[ENV.RETRY_BACKOFF_FACTOR] ?? r.backoffFactor,
+    DEFAULTS.RETRY_BACKOFF_FACTOR,
+  );
+
+  // retryableStatuses: env var is comma-separated (e.g. "529,429,503"), YAML is array
+  let retryableStatuses = DEFAULTS.RETRY_STATUSES;
+  const envStatuses = process.env[ENV.RETRY_STATUSES];
+  if (typeof envStatuses === "string" && envStatuses.trim().length > 0) {
+    retryableStatuses = envStatuses.split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n > 0);
+  } else if (Array.isArray(r.retryableStatuses) && r.retryableStatuses.length > 0) {
+    retryableStatuses = r.retryableStatuses.map((s: unknown) => {
+      const n = typeof s === "number" ? s : parseInt(String(s), 10);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    }).filter((n: number | null): n is number => n !== null);
+  }
+
+  return { maxRetries, initialDelayMs, maxDelayMs, backoffFactor, retryableStatuses };
+}
+
+/** Resolve a positive integer from a raw value, falling back to default. */
+function resolvePositiveInt(raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === null) return fallback;
+  const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : fallback;
+}
+
+/** Resolve a positive float from a raw value, falling back to default. */
+function resolvePositiveFloat(raw: unknown, fallback: number): number {
+  if (raw === undefined || raw === null) return fallback;
+  const n = typeof raw === "number" ? raw : parseFloat(String(raw));
+  return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
 /** Cross-field validation after all fields are resolved. */

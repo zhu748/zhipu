@@ -146,6 +146,14 @@ identity:
 
 logging:
   level: info
+
+retry:
+  maxRetries: 3                # Maximum retry attempts for 529/overloaded errors
+  initialDelayMs: 1000         # Initial delay before first retry (ms)
+  maxDelayMs: 8000             # Maximum delay cap (ms)
+  backoffFactor: 2             # Exponential backoff multiplier
+  retryableStatuses:           # HTTP status codes that trigger retry
+    - 529
 ```
 
 ---

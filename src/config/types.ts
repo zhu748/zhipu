@@ -44,6 +44,40 @@ export interface ProxyIdentity {
   refererOrigin: string;
 }
 
+/** Retry configuration for upstream requests. */
+export interface RetryConfig {
+  /**
+   * Maximum number of retry attempts for retryable status codes.
+   * Set to 0 to disable retries entirely.
+   * Default: 3
+   */
+  maxRetries: number;
+  /**
+   * Initial delay in milliseconds before the first retry.
+   * Subsequent retries use exponential backoff: delay * backoffFactor^attempt.
+   * Default: 1000
+   */
+  initialDelayMs: number;
+  /**
+   * Maximum delay cap in milliseconds. Even with exponential backoff,
+   * the delay will never exceed this value.
+   * Default: 8000
+   */
+  maxDelayMs: number;
+  /**
+   * Multiplier applied to the delay for each subsequent retry attempt.
+   * A value of 2 means each retry waits twice as long as the previous.
+   * Default: 2
+   */
+  backoffFactor: number;
+  /**
+   * HTTP status codes that should trigger a retry.
+   * Common values: 429 (rate limited), 529 (site overloaded), 503 (service unavailable).
+   * Default: [529]
+   */
+  retryableStatuses: number[];
+}
+
 /** Top-level proxy configuration. */
 export interface ProxyConfig {
   server: {
@@ -72,4 +106,9 @@ export interface ProxyConfig {
   logging: {
     level: "debug" | "info" | "warn" | "error";
   };
+  /**
+   * Retry configuration for upstream requests.
+   * When absent, defaults are applied (3 retries, exponential backoff, 529 only).
+   */
+  retry: RetryConfig;
 }
