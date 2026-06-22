@@ -292,3 +292,45 @@ export async function setAccountLabel(id: string, label: string): Promise<boolea
   await writeStore(store);
   return true;
 }
+
+/** Update an account's plan. */
+export async function setAccountPlan(id: string, plan: "coding-plan" | "start-plan"): Promise<boolean> {
+  const store = await readStore();
+  if (!store) return false;
+  const account = store.accounts.find(a => a.id === id);
+  if (!account) return false;
+  account.credential.plan = plan;
+  await writeStore(store);
+  return true;
+}
+
+/** Export all accounts (excluding encryption — returns plain JSON for backup). */
+export async function exportAccounts(): Promise<Array<Omit<StoredAccount, "credential"> & { credential: Credential }>> {
+  const store = await readStore();
+  if (!store) return [];
+  return store.accounts;
+}
+
+/** Import accounts from a previously exported backup. Merges by id — existing accounts are updated, new ones are appended. */
+export async function importAccounts(
+  incoming: Array<Omit<StoredAccount, "credential"> & { credential: Credential }>,
+): Promise<{ added: number; updated: number }> {
+  let store = await readStore();
+  if (!store) store = { version: 2, activeId: null, accounts: [] };
+
+  let added = 0;
+  let updated = 0;
+  for (const acc of incoming) {
+    const idx = store.accounts.findIndex(a => a.id === acc.id);
+    if (idx >= 0) {
+      store.accounts[idx] = acc;
+      updated++;
+    } else {
+      store.accounts.push(acc);
+      added++;
+      if (!store.activeId) store.activeId = acc.id;
+    }
+  }
+  await writeStore(store);
+  return { added, updated };
+}

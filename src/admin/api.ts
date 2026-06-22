@@ -7,7 +7,7 @@
 import type { ProxyConfig, RoutingRule } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
-import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, maskApiKey } from "../auth/store.js";
+import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, exportAccounts, importAccounts, maskApiKey } from "../auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { errorResponse } from "../proxy/handler.js";
@@ -241,6 +241,31 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     }
   }
 
+  // Update account plan
+  if (path === "/admin/api/accounts/plan" && method === "PUT") {
+    try {
+      const body = await req.json() as { id?: string; plan?: string };
+      if (!body.id || !body.plan) {
+        return errorResponse(400, "missing_param", "id and plan are required");
+      }
+      if (body.plan !== "coding-plan" && body.plan !== "start-plan") {
+        return errorResponse(400, "invalid_param", "plan must be coding-plan or start-plan");
+      }
+      const ok = await setAccountPlan(body.id, body.plan);
+      if (!ok) return errorResponse(404, "not_found", "Account not found");
+      // If the updated account is currently active, sync config.plan
+      const cred = await loadCredential();
+      if (cred && cred.plan && cred.plan !== opts.config.plan) {
+        opts.config.plan = cred.plan;
+        appendLog("info", `Plan synced to ${cred.plan} (from account ${body.id})`);
+      }
+      appendLog("info", `Account ${body.id} plan changed to ${body.plan}`);
+      return jsonResp({ ok: true, plan: body.plan });
+    } catch (err) {
+      return errorResponse(500, "update_failed", (err as Error).message);
+    }
+  }
+
   // Delete an account
   if (path.startsWith("/admin/api/accounts/") && method === "DELETE") {
     const id = path.slice("/admin/api/accounts/".length);
@@ -263,6 +288,42 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       const cred = importFromZCodeConfig(provider, plan);
       await saveCredential(cred);
       return jsonResp({ ok: true, apiKeyMask: maskApiKey(cred.apiKey), plan: cred.plan });
+    } catch (err) {
+      return errorResponse(500, "import_failed", (err as Error).message);
+    }
+  }
+
+  // Export all accounts (backup)
+  if (path === "/admin/api/accounts/export" && method === "GET") {
+    try {
+      const accounts = await exportAccounts();
+      return jsonResp({ accounts, exportedAt: Date.now(), version: 2 });
+    } catch (err) {
+      return errorResponse(500, "export_failed", (err as Error).message);
+    }
+  }
+
+  // Import accounts from backup
+  if (path === "/admin/api/accounts/import" && method === "POST") {
+    try {
+      const body = await req.json() as { accounts?: unknown[] };
+      if (!Array.isArray(body.accounts)) {
+        return errorResponse(400, "invalid_param", "accounts array is required");
+      }
+      // Basic validation: each account must have id, label, createdAt, credential
+      const validated = body.accounts.filter((a: any) =>
+        a && typeof a.id === "string" && typeof a.label === "string" &&
+        typeof a.createdAt === "number" && a.credential && typeof a.credential.apiKey === "string"
+      );
+      if (validated.length === 0) {
+        return errorResponse(400, "invalid_param", "No valid accounts found in import data");
+      }
+      const result = await importAccounts(validated as any);
+      appendLog("info", `Imported accounts: ${result.added} added, ${result.updated} updated`);
+      // Hot-swap active credential
+      const cred = await loadCredential();
+      if (cred) opts.auth.setOAuthCredential(cred);
+      return jsonResp({ ok: true, added: result.added, updated: result.updated });
     } catch (err) {
       return errorResponse(500, "import_failed", (err as Error).message);
     }

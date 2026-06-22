@@ -187,10 +187,10 @@ tr:hover td{background:var(--surface2)}
       </div>
       <div class="card">
         <h3>Stored Accounts <span class="tag">Multi-account</span></h3>
-        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">All credentials saved via OAuth or manual entry. Click <strong>Activate</strong> to switch the active account.</p>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">All credentials saved via OAuth or manual entry. Click <strong>Activate</strong> to switch. Click <strong>Plan</strong> to change.</p>
         <table>
           <thead><tr><th>Label</th><th>Provider</th><th>Plan</th><th>API Key</th><th>Created</th><th>Status</th><th>Actions</th></tr></thead>
-          <tbody id="accountsList"><tr><td colspan="6" class="empty-state">Loading...</td></tr></tbody>
+          <tbody id="accountsList"><tr><td colspan="7" class="empty-state">Loading...</td></tr></tbody>
         </table>
       </div>
       <div class="card">
@@ -210,6 +210,15 @@ tr:hover td{background:var(--surface2)}
           <div class="form-group"><label>Plan</label><select id="importPlan"><option value="coding-plan">Coding Plan</option><option value="start-plan">Start Plan</option></select></div>
         </div>
         <div class="actions"><button class="btn btn-primary" onclick="importKey()">Import Key</button></div>
+      </div>
+      <div class="card">
+        <h3>Backup & Restore <span class="tag">Import/Export</span></h3>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">Export all accounts to a JSON file for backup, or import from a previous export.</p>
+        <div class="actions" style="gap:12px">
+          <button class="btn btn-success" onclick="exportAccounts()">Export Accounts</button>
+          <button class="btn btn-primary" onclick="document.getElementById('importFileInput').click()">Import from File</button>
+          <input type="file" id="importFileInput" accept=".json" style="display:none" onchange="importAccountsFromFile(this)">
+        </div>
       </div>
     </div>
 
@@ -537,11 +546,11 @@ async function loadAccountsList(){
     tb.innerHTML=accounts.map(a=>{
       const isActive=a.id===activeId;
       const created=new Date(a.createdAt).toLocaleString();
-      const planBadge=a.plan==='start-plan'?'<span class="badge badge-warn">Start</span>':'<span class="badge badge-success">Coding</span>';
+      const planVal=a.plan||'coding-plan';
       return `<tr>
         <td><input value="${escapeHtml(a.label)}" onchange="renameAccount('${a.id}',this.value)" style="width:100%;padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px"></td>
         <td>${a.provider}</td>
-        <td>${planBadge}</td>
+        <td><select onchange="changePlan('${a.id}',this.value)" style="padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;font-size:12px"><option value="coding-plan"${planVal==='coding-plan'?' selected':''}>Coding</option><option value="start-plan"${planVal==='start-plan'?' selected':''}>Start</option></select></td>
         <td style="font-family:monospace;font-size:12px">${a.apiKeyMask}${a.hasSecret?' <span class="badge badge-success">secret</span>':''}${a.hasJwt?' <span class="badge badge-success">jwt</span>':''}</td>
         <td style="font-size:12px;color:var(--text2)">${created}</td>
         <td>${isActive?'<span class="badge badge-success">Active</span>':'<span class="badge badge-warn">Inactive</span>'}</td>
@@ -577,6 +586,40 @@ async function deleteAccount(id,label){
     if(r.ok){toast('Account deleted','success');loadAccountInfo();loadAccountsList();loadCredStore()}
     else toast('Delete failed','error');
   }catch(e){console.error('deleteAccount failed:',e);toast('Delete failed','error')}
+}
+async function changePlan(id,plan){
+  try{
+    const r=await fetch(API+'/admin/api/accounts/plan',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,plan})});
+    if(r.ok){toast('Plan updated to '+plan,'success');loadAccountInfo();loadCredStore()}
+    else toast('Plan update failed','error');
+  }catch(e){console.error('changePlan failed:',e);toast('Plan update failed','error')}
+}
+async function exportAccounts(){
+  try{
+    const r=await fetch(API+'/admin/api/accounts/export',{headers:authHeaders()});
+    if(!r.ok){toast('Export failed','error');return}
+    const d=await r.json();
+    const blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download=`zcode-proxy-accounts-${new Date().toISOString().slice(0,10)}.json`;
+    document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
+    toast('Accounts exported ('+d.accounts.length+' accounts)','success');
+  }catch(e){console.error('exportAccounts failed:',e);toast('Export failed','error')}
+}
+async function importAccountsFromFile(input){
+  if(!input.files||!input.files[0])return;
+  const file=input.files[0];
+  try{
+    const text=await file.text();
+    const data=JSON.parse(text);
+    if(!data.accounts||!Array.isArray(data.accounts)){toast('Invalid file: missing accounts array','error');return}
+    if(!confirm(`Import ${data.accounts.length} accounts from "${file.name}"?\nExisting accounts with matching IDs will be updated.`))return;
+    const r=await fetch(API+'/admin/api/accounts/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({accounts:data.accounts})});
+    const d=await r.json();
+    if(r.ok){toast(`Imported: ${d.added} added, ${d.updated} updated`,'success');loadAccountInfo();loadAccountsList();loadCredStore()}
+    else toast(d.message||'Import failed','error');
+  }catch(e){console.error('importAccounts failed:',e);toast('Import failed: invalid file','error')}
+  input.value='';
 }
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 
