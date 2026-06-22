@@ -1958,7 +1958,33 @@ async function pollOAuth(flowId){
   document.getElementById('oauthStatusText').textContent='已超时（仍可在下方粘贴回调 URL）';
   if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
 }
-function copyOauthUrl(){navigator.clipboard.writeText(document.getElementById('oauthUrl').value);toast('URL 已复制','success')}
+function copyOauthUrl(){
+  const input=document.getElementById('oauthUrl');
+  const text=input.value;
+  if(!text){toast('URL 为空','warn');return}
+  const showSuccess=()=>toast('URL 已复制','success');
+  const showFailed=(err)=>{console.error('copyOauthUrl failed:',err);toast('复制失败，请手动选中复制','error')};
+  /* Prefer Clipboard API when available (HTTPS / localhost) */
+  if(navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
+    navigator.clipboard.writeText(text).then(showSuccess).catch(err=>{
+      /* Permission denied or not allowed — fall back to execCommand */
+      if(fallbackCopy(input))showSuccess();else showFailed(err);
+    });
+    return;
+  }
+  /* Non-secure context (HTTP LAN IP) — use legacy execCommand path */
+  if(fallbackCopy(input))showSuccess();else showFailed(new Error('Clipboard API unavailable'));
+  function fallbackCopy(el){
+    try{
+      el.focus();el.select();
+      /* For iOS / mobile */
+      if(el.setSelectionRange&&el.value.length)el.setSelectionRange(0,el.value.length);
+      const ok=document.execCommand('copy');
+      el.blur();
+      return ok;
+    }catch(e){return false}
+  }
+}
 function openOauthUrl(){window.open(document.getElementById('oauthUrl').value,'_blank')}
 async function submitCallback(){
   const callbackUrl=document.getElementById('callbackUrlInput').value.trim();
