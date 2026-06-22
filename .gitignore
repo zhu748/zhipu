@@ -8,5 +8,7 @@ dist/
 /.omo
 /_reverse
 /zcode-proxy.exe
+/zcode-proxy
 *.zip
 release/zcode-proxy.exe
+zcode-proxy-debug-*.json
