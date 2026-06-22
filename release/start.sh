@@ -24,7 +24,7 @@ case $choice in
     echo "Starting proxy server..."
     echo ""
     chmod +x zcode-proxy.exe
-    ./zcode-proxy.exe serve --config config.yaml
+    ./zcode-proxy.exe serve config.yaml
     ;;
   2)
     echo ""

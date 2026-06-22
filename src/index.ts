@@ -27,8 +27,12 @@ function main(): void {
   if (cmd === "auth") {
     authCommand(args.slice(1));
   } else if (cmd === "serve" || cmd.endsWith(".yaml") || cmd.endsWith(".yml")) {
-    const configPath = cmd === "serve" ? args[1] : cmd;
-    serve(configPath);
+    // `serve` may be followed by either a positional path or `--config <path>`
+    // (or `--config=<path>`). The legacy start.bat/start.sh used `--config`,
+    // which the old parser mis-read as the path itself — creating a file
+    // literally named `--config` and silently loading the bundled template.
+    const configPath = cmd === "serve" ? parseServeConfigArg(args.slice(1)) : cmd;
+    serve(configPath).catch(fatalError);
   } else if (cmd === "version" || cmd === "--version" || cmd === "-v") {
     console.log(`zcode-proxy ${VERSION}`);
   } else if (cmd === "help" || cmd === "--help" || cmd === "-h") {
@@ -38,6 +42,38 @@ function main(): void {
     printHelp();
     process.exit(1);
   }
+}
+
+/**
+ * Parse the arguments after `serve`, accepting both forms:
+ *   zcode-proxy serve config.yaml
+ *   zcode-proxy serve --config config.yaml
+ *   zcode-proxy serve --config=config.yaml
+ */
+function parseServeConfigArg(rest: string[]): string | undefined {
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === "--config" && i + 1 < rest.length) return rest[i + 1];
+    if (a.startsWith("--config=")) return a.slice("--config=".length);
+    if (!a.startsWith("-")) return a; // first positional non-flag arg
+  }
+  return undefined;
+}
+
+/**
+ * Last-resort error handler. Prints the error and waits briefly so the user
+ * can read it before the window closes — important on Windows where
+ * double-clicking the exe gives no parent terminal to scroll back.
+ */
+async function fatalError(err: unknown): Promise<void> {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error("\n[FATAL] " + msg);
+  console.error("\nServer could not start. This window will close in 15 seconds.");
+  // Give the user time to read the message before the window disappears.
+  // 15s is long enough to read but short enough to not feel stuck when run
+  // from an interactive terminal.
+  await new Promise(r => setTimeout(r, 15_000));
+  process.exit(1);
 }
 
 function printHelp(): void {
@@ -80,8 +116,13 @@ async function serve(configPath?: string): Promise<void> {
   if (config.auth.mode === "oauth") {
     const cred = await loadCredential();
     if (!cred) {
-      console.error("Not logged in. Run: zcode-proxy auth login " + config.provider);
-      process.exit(1);
+      throw new Error(
+        `Not logged in for OAuth mode. Run this in a terminal first:\n` +
+        `    zcode-proxy auth login ${config.provider}\n` +
+        `Or edit ${path} and set:\n` +
+        `    auth.mode: apikey\n` +
+        `    auth.apiKey: <your-key>`,
+      );
     }
     auth.setOAuthCredential(cred);
     // Sync plan from the stored credential if it has an explicit plan
@@ -128,11 +169,11 @@ function authCommand(args: string[]): void {
   const sub = args[0];
 
   if (sub === "login") {
-    authLogin(args.slice(1));
+    authLogin(args.slice(1)).catch(fatalError);
   } else if (sub === "logout") {
     authLogout();
   } else if (sub === "status") {
-    authStatus();
+    authStatus().catch(fatalError);
   } else {
     console.error("Usage: zcode-proxy auth <login|logout|status>");
     process.exit(1);

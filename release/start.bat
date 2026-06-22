@@ -32,7 +32,7 @@ goto end
 :serve
 echo.
 echo Starting proxy server...
-zcode-proxy.exe serve --config config.yaml
+zcode-proxy.exe serve config.yaml
 pause
 goto end
 

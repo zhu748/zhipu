@@ -16,6 +16,11 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { stringify as stringifyYaml } from "yaml";
+// Inline the dashboard HTML at build time so it works inside a
+// `bun build --compile` single-file executable. Runtime `readFileSync`
+// would resolve to the exe's virtual root (e.g. B:\~BUN\root\) and fail
+// with ENOENT because dashboard.html is not shipped next to the exe.
+import dashboardHtml from "./dashboard.html.txt" with { type: "text" };
 
 export interface AdminOptions {
   config: ProxyConfig;
@@ -76,14 +81,9 @@ export function appendLog(level: string, message: string) {
   }
 }
 
-/** Read the bundled dashboard HTML (cached after first read). */
-let _dashboardHtml: string | null = null;
+/** Read the bundled dashboard HTML (inlined at build time). */
 export function getDashboardHTML(): string {
-  if (!_dashboardHtml) {
-    const htmlPath = join(import.meta.dir, "dashboard.html");
-    _dashboardHtml = readFileSync(htmlPath, "utf-8");
-  }
-  return _dashboardHtml;
+  return dashboardHtml;
 }
 
 /** Handle admin API routes. Returns null if the path doesn't match. */
@@ -211,15 +211,30 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       if (!ok) return errorResponse(404, "not_found", "Account not found");
       // Hot-swap the in-memory credential and sync plan
       const cred = await loadCredential();
+      let planSynced = false;
       if (cred) {
         opts.auth.setOAuthCredential(cred);
-        // Sync config.plan to match the account's plan
+        // Sync config.plan to match the account's plan, and persist to yaml
+        // so the change survives a server restart. Without this, users who
+        // switch plan via the dashboard find the change silently reverted
+        // after restart — leading to confusing "still coding-plan" reports.
         if (cred.plan && cred.plan !== opts.config.plan) {
           opts.config.plan = cred.plan;
+          planSynced = true;
           appendLog("info", `Plan synced to ${cred.plan} (from account ${body.id})`);
         }
       }
       appendLog("info", `Switched active account to ${body.id}`);
+      // Persist the (possibly updated) plan to yaml so restart keeps it.
+      if (planSynced) {
+        try {
+          const yaml = configToYaml(opts.config);
+          await writeFile(opts.configPath, yaml, "utf-8");
+          appendLog("info", `Persisted plan=${opts.config.plan} to ${opts.configPath}`);
+        } catch (e) {
+          appendLog("error", `Failed to persist plan to config: ${(e as Error).message}`);
+        }
+      }
       return jsonResp({ ok: true, plan: cred?.plan || opts.config.plan });
     } catch (err) {
       return errorResponse(500, "switch_failed", (err as Error).message);
@@ -253,13 +268,25 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       }
       const ok = await setAccountPlan(body.id, body.plan);
       if (!ok) return errorResponse(404, "not_found", "Account not found");
-      // If the updated account is currently active, sync config.plan
+      // If the updated account is currently active, sync config.plan AND
+      // persist to yaml so the change survives restart.
       const cred = await loadCredential();
+      let planSynced = false;
       if (cred && cred.plan && cred.plan !== opts.config.plan) {
         opts.config.plan = cred.plan;
+        planSynced = true;
         appendLog("info", `Plan synced to ${cred.plan} (from account ${body.id})`);
       }
       appendLog("info", `Account ${body.id} plan changed to ${body.plan}`);
+      if (planSynced) {
+        try {
+          const yaml = configToYaml(opts.config);
+          await writeFile(opts.configPath, yaml, "utf-8");
+          appendLog("info", `Persisted plan=${opts.config.plan} to ${opts.configPath}`);
+        } catch (e) {
+          appendLog("error", `Failed to persist plan to config: ${(e as Error).message}`);
+        }
+      }
       return jsonResp({ ok: true, plan: body.plan });
     } catch (err) {
       return errorResponse(500, "update_failed", (err as Error).message);
