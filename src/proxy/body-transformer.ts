@@ -19,6 +19,12 @@
  *      `output_config`) and relocate `role: "system"` messages from the
  *      messages array to the `system` field.
  *      These Claude-Code-specific fields cause upstream 3001 "parameter error".
+ *   5. Anthropic format → strip `thinking` / `redacted_thinking` content
+ *      blocks from `messages[].content`. GLM upstream only accepts the
+ *      top-level `thinking` field — thinking blocks echoed back in assistant
+ *      history (which Claude Code sends on turn 2+) cause 3001 "parameter
+ *      error". Without this, only the first turn of a Claude Code session
+ *      succeeds; every subsequent turn 3001s.
  *
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
  */
@@ -71,6 +77,7 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     }
     modified = transformUnsupportedAnthropicFields(obj) || modified;
     modified = relocateSystemMessages(obj) || modified;
+    modified = stripThinkingBlocksFromMessages(obj) || modified;
     modified = applyAnthropicCacheControl(obj) || modified;
     if (ctx.userId) {
       modified = applyAnthropicUserId(obj, ctx.userId) || modified;
@@ -241,6 +248,85 @@ function relocateSystemMessages(body: Record<string, unknown>): boolean {
   // If system is some other type, overwrite with newBlocks (shouldn't happen)
 
   return true;
+}
+
+/**
+ * Strip `thinking` and `redacted_thinking` content blocks from every message's
+ * `content` array.
+ *
+ * Problem: When the proxy enables thinking (`thinking: {type:"enabled"}`) on
+ * the upstream, GLM returns `thinking_delta` SSE events in the assistant's
+ * response. Claude Code captures these and, on the NEXT turn, echoes the
+ * assistant's prior turn back in `messages[].content` — including the
+ * `thinking` block (with an empty or invalid `signature`, since the proxy's
+ * signature is not a real Anthropic cryptographic signature).
+ *
+ * GLM's Anthropic-compatible endpoint does NOT accept `thinking` /
+ * `redacted_thinking` content blocks inside `messages[].content` — only the
+ * top-level `thinking` field. Sending them produces
+ * `400 {"code":3001,"msg":"parameter error"}` from the upstream, which the
+ * proxy transparently forwards back to Claude Code. This is why the FIRST
+ * turn succeeds (no assistant history yet) but every subsequent turn fails
+ * with 3001 — until the conversation is reset.
+ *
+ * This function strips those blocks before forwarding, so GLM only sees
+ * `text` / `image` / `tool_use` / `tool_result` blocks in message content.
+ *
+ * If stripping leaves a message's content array empty, that message is
+ * removed from `messages` entirely (an empty assistant turn would also
+ * trip GLM's parameter validation).
+ *
+ * No-op for non-array `content` (string content is never a thinking block).
+ */
+function stripThinkingBlocksFromMessages(body: Record<string, unknown>): boolean {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return false;
+
+  let changed = false;
+  const surviving: unknown[] = [];
+
+  for (const msg of messages) {
+    if (!isPlainObject(msg)) {
+      surviving.push(msg);
+      continue;
+    }
+    const content = msg.content;
+    if (!Array.isArray(content)) {
+      surviving.push(msg);
+      continue;
+    }
+
+    const filtered = content.filter((block: unknown) => {
+      if (!isPlainObject(block)) return true;
+      const type = block.type;
+      // Strip both thinking variants. Anthropic's API defines:
+      //   - "thinking"          — {type, thinking, signature}
+      //   - "redacted_thinking" — {type, data}
+      // GLM upstream rejects either as a content block in messages.
+      return type !== "thinking" && type !== "redacted_thinking";
+    });
+
+    if (filtered.length === content.length) {
+      // No thinking blocks found — keep message as-is
+      surviving.push(msg);
+      continue;
+    }
+
+    changed = true;
+    if (filtered.length === 0) {
+      // All blocks were thinking — drop the message entirely to avoid
+      // sending an empty-content assistant turn upstream (which GLM also
+      // rejects with 3001).
+      continue;
+    }
+    msg.content = filtered;
+    surviving.push(msg);
+  }
+
+  if (changed) {
+    body.messages = surviving;
+  }
+  return changed;
 }
 
 /**

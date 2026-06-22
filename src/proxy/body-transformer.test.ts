@@ -326,6 +326,191 @@ describe("transformRequestBody — relocate system messages (Anthropic)", () => 
   });
 });
 
+describe("transformRequestBody — strip thinking blocks from messages (Anthropic)", () => {
+  it("removes thinking content blocks from assistant messages", () => {
+    // Reproduces the exact Claude Code round-2 request that triggers 3001:
+    // assistant history contains a thinking block (with empty signature)
+    // echoed back from the previous turn's thinking_delta SSE events.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [
+        { role: "user", content: "你好啊" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "用户用中文打招呼...", signature: "" },
+            { type: "text", text: "你好!👋..." },
+          ],
+        },
+        { role: "user", content: "帮我看看这个项目是干嘛的" },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.messages[1].role).toBe("assistant");
+    expect(parsed.messages[1].content).toEqual([
+      { type: "text", text: "你好!👋..." },
+    ]);
+  });
+
+  it("also strips redacted_thinking blocks", () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "redacted_thinking", data: "opaque-base64==" },
+            { type: "text", text: "answer" },
+          ],
+        },
+        { role: "user", content: "next" },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    // redacted_thinking stripped; text block kept
+    expect(parsed.messages[0].content).toEqual([{ type: "text", text: "answer" }]);
+  });
+
+  it("drops an assistant message entirely if it contained ONLY thinking blocks", () => {
+    // An empty-content assistant turn would itself trigger 3001, so the
+    // whole message must be removed.
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "q" },
+        {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "internal", signature: "x" }],
+        },
+        { role: "user", content: "follow-up" },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    // Assistant message gone; only the two user messages remain.
+    expect(parsed.messages.length).toBe(2);
+    expect(parsed.messages[0].role).toBe("user");
+    expect(parsed.messages[1].role).toBe("user");
+    expect(parsed.messages.find((m: any) => m.role === "assistant")).toBeUndefined();
+  });
+
+  it("preserves tool_use blocks alongside thinking blocks", () => {
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "plan", signature: "" },
+            { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    // thinking block gone, tool_use preserved
+    expect(parsed.messages[0].content).toEqual([
+      { type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" } },
+    ]);
+    // tool_result preserved (cache_control may be attached — that's a separate transform)
+    expect(parsed.messages[1].content[0].type).toBe("tool_result");
+    expect(parsed.messages[1].content[0].tool_use_id).toBe("t1");
+  });
+
+  it("does NOT touch string content (no thinking blocks possible)", () => {
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi there" },
+        { role: "user", content: "next" },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    // string content on assistant untouched (cache_control lands on last user msg, not assistant)
+    expect(parsed.messages[1].content).toBe("hi there");
+  });
+
+  it("leaves messages without thinking blocks unchanged (apart from other transformations)", () => {
+    const body = JSON.stringify({
+      messages: [
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.messages[0].content.length).toBe(1);
+    expect(parsed.messages[0].content[0].type).toBe("text");
+  });
+
+  it("does NOT strip thinking blocks for openai format", () => {
+    // openai format is forwarded to /chat/completions which has its own
+    // schema; thinking-block stripping is Anthropic-specific.
+    const body = JSON.stringify({
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "x", signature: "" },
+            { type: "text", text: "answer" },
+          ],
+        },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "openai" });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.messages[0].content.length).toBe(2);
+    expect(parsed.messages[0].content[0].type).toBe("thinking");
+  });
+
+  it("handles missing messages field gracefully", () => {
+    const body = JSON.stringify({ model: "glm-5.2" });
+    expect(transformRequestBody(body, { format: "anthropic" })).toBe(body);
+  });
+
+  it("strips thinking from multi-turn conversation (Claude Code regression case)", () => {
+    // End-to-end shape: round-2 request from Claude Code with full history.
+    // Verifies the fix unblocks multi-turn Claude Code sessions.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "你好啊" }] },
+        { role: "system", content: "agent types and skills..." },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "用户用中文打招呼...", signature: "" },
+            { type: "text", text: "你好!👋 我是 ZCode..." },
+          ],
+        },
+        { role: "user", content: [{ type: "text", text: "帮我看看这个项目是干嘛的" }] },
+      ],
+      thinking: { type: "adaptive" },
+      context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] },
+      output_config: { effort: "max" },
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+
+    // Top-level Claude-Code-only fields are stripped/normalized
+    expect(parsed.thinking).toEqual({ type: "enabled" });
+    expect(parsed.context_management).toBeUndefined();
+    expect(parsed.output_config).toBeUndefined();
+
+    // System message relocated
+    expect(parsed.system).toEqual([{ type: "text", text: "agent types and skills..." }]);
+    expect(parsed.messages.find((m: any) => m.role === "system")).toBeUndefined();
+
+    // Thinking block stripped from assistant history
+    const assistant = parsed.messages.find((m: any) => m.role === "assistant");
+    expect(assistant.content).toEqual([{ type: "text", text: "你好!👋 我是 ZCode..." }]);
+  });
+});
+
 describe("transformRequestBody — metadata.user_id (Anthropic)", () => {
   it("injects metadata.user_id when ctx.userId is set", () => {
     const body = JSON.stringify({

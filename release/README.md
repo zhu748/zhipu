@@ -1,5 +1,15 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.3beta0 — 修复 Claude Code 多轮对话 3001 报错**
+> - **修复 Claude Code 第二轮起报 `3001 parameter error`**：代理之前只处理顶层 `thinking` 字段、剥离 `context_management` / `output_config`、迁移 `role:"system"` 消息，但**漏掉了 `messages[].content` 数组里回传的 `thinking` 内容块**。
+>   - 第一轮代理发 `thinking:{type:"enabled"}` → GLM 上游返回 `thinking_delta` SSE 事件
+>   - Claude Code 把 thinking 内容存进对话历史
+>   - 第二轮把含 `thinking` 块的 assistant 历史回传给代理
+>   - GLM 上游不接受 `messages[].content` 里的 `thinking` / `redacted_thinking` 块 → 返回 3001
+>   - 代理把上游错误透传给 Claude Code → 第二轮直接挂掉
+> - **修复方案**：`body-transformer.ts` 新增 `stripThinkingBlocksFromMessages()`，转发给 GLM 之前剥离 `messages[].content` 里的 `thinking` / `redacted_thinking` 块。若剥离后某条消息内容为空（原本只有 thinking），整条消息直接删除（避免空 assistant turn 再次 3001）。
+> - **新增 9 个单元测试**，包含一个完整复现 Claude Code 第二轮请求结构的回归测试；全套 269 测试通过，TypeScript 类型检查零错误。
+>
 > **v2.1.3.3 / v0.1.13 — Dashboard 模型映射 + thinking 无条件注入**
 > - **管理面板新增"模型映射"配置卡片**：在 Settings → 模型路由下面，可配置客户端模型名 → GLM 模型名的重写规则
 >   - 例如 Codex CLI 默认发 `gpt-5.5`，可映射到 `glm-5.2` 或任意 GLM 模型
