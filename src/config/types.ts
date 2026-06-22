@@ -78,6 +78,21 @@ export interface RetryConfig {
   retryableStatuses: number[];
 }
 
+/**
+ * Custom routing rule — overrides the default provider/endpoint for requests
+ * whose model name matches `pattern` (shell-glob style, e.g. "glm-5*").
+ */
+export interface RoutingRule {
+  /** Glob-style model pattern (matched against request body's `model` field). */
+  pattern: string;
+  /** Override provider for matched models. */
+  provider: "zai" | "bigmodel";
+  /** Optional endpoint override (full URL). If empty, the provider's default endpoint is used. */
+  endpoint?: string;
+  /** Optional note for the operator. */
+  note?: string;
+}
+
 /** Top-level proxy configuration. */
 export interface ProxyConfig {
   server: {
@@ -111,4 +126,6 @@ export interface ProxyConfig {
    * When absent, defaults are applied (3 retries, exponential backoff, 529 only).
    */
   retry: RetryConfig;
+  /** Custom per-model routing rules. Empty by default. */
+  routingRules?: RoutingRule[];
 }

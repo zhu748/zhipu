@@ -1,5 +1,12 @@
 # zcode-proxy 使用说明
 
+> **v2.1.1test 新特性**
+> - **多账号管理**：支持同时存储多套凭证（智谱 / Z.AI），运行时一键切换
+> - **OAuth 回调 URL 手动输入**：当自动轮询失败或远程服务器无浏览器时，可手动粘贴回调 URL 完成授权
+> - **路由规则持久化**：dashboard 中的 per-model 路由规则会保存到 config.yaml
+> - **统计重置**：dashboard 支持手动清零请求统计
+> - **修复日志流**：日志面板 WebSocket 改用 SSE (EventSource)，不再断连
+
 ## 快速启动
 
 ### Windows
@@ -66,6 +73,25 @@ zcode-proxy.exe auth login bigmodel --import
 ```
 
 OAuth 凭证加密存储在 `~/.zcode-proxy/credentials.json`。
+
+#### 多账号管理
+
+支持同时存储多套凭证，运行时通过 dashboard 切换：
+
+1. 启动代理后访问 `http://localhost:8080/admin` 进入面板
+2. 进入 **Accounts** 页面，可看到所有已存储的账号
+3. 用 **Add API Key** 添加新账号，或用 **OAuth Login** 走 OAuth 流程
+4. 点击 **Activate** 切换激活账号（运行时热替换，无需重启）
+
+> 凭证存储格式为 v2 多账号格式；旧版本（v1 单账号）的 `credentials.json` 在首次加载时会自动迁移，无需手动操作。
+
+#### OAuth 手动回调（远程/无头环境）
+
+当浏览器自动跳转失效时，可在 dashboard 的 OAuth 页面手动粘贴回调 URL 完成授权：
+
+1. 点击 **Start OAuth Login**，复制 Authorize URL 在浏览器中打开
+2. 完成授权后，浏览器会跳转到形如 `https://zcode.z.ai/api/v1/oauth/cli/callback/zai?code=...&state=...` 的 URL
+3. 复制该完整 URL，粘贴到 **Manual Callback URL** 输入框，点击 **Submit Callback URL**
 
 ---
 

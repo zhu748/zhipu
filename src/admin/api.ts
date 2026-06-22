@@ -4,16 +4,17 @@
  * All routes require the proxy API key (same key used by API clients).
  * Mounted under /admin/api/* in server.ts.
  */
-import type { ProxyConfig } from "../config/types.js";
+import type { ProxyConfig, RoutingRule } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
-import { loadCredential, saveCredential, clearCredential } from "../auth/store.js";
+import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, maskApiKey } from "../auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { errorResponse } from "../proxy/handler.js";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { stringify as stringifyYaml } from "yaml";
 
 export interface AdminOptions {
   config: ProxyConfig;
@@ -89,8 +90,13 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
 
   // Verify auth token for API routes
   if (path.startsWith("/admin/api/") && path !== "/admin/api/verify") {
+    // Allow SSE endpoints to receive the token via query parameter, since
+    // EventSource cannot set custom HTTP headers.
     const authHeader = req.headers.get("authorization") ?? "";
-    const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
+    let token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
+    if (!token && path === "/admin/api/logs/stream") {
+      token = url.searchParams.get("token") ?? "";
+    }
     if (opts.config.auth.proxyApiKey && token !== opts.config.auth.proxyApiKey) {
       return errorResponse(401, "authentication_error", "Invalid admin token");
     }
@@ -127,14 +133,14 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     }
   }
 
-  // Get credentials
+  // Get credentials (active credential summary)
   if (path === "/admin/api/credentials" && method === "GET") {
     const cred = await loadCredential();
     if (!cred) return jsonResp({ credential: null });
     return jsonResp({
       credential: {
         provider: cred.provider,
-        apiKeyMask: cred.apiKey.slice(0, 8) + "..." + cred.apiKey.slice(-4),
+        apiKeyMask: maskApiKey(cred.apiKey),
         hasSecret: !!cred.secret,
         userId: cred.userId,
         expiresAt: cred.expiresAt,
@@ -161,6 +167,57 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     return jsonResp({ ok: true });
   }
 
+  // List all stored accounts (multi-account support)
+  if (path === "/admin/api/accounts" && method === "GET") {
+    const result = await listAccounts();
+    return jsonResp(result);
+  }
+
+  // Switch active account
+  if (path === "/admin/api/accounts/active" && method === "PUT") {
+    try {
+      const body = await req.json() as { id?: string };
+      if (!body.id) return errorResponse(400, "missing_param", "id is required");
+      const ok = await switchAccount(body.id);
+      if (!ok) return errorResponse(404, "not_found", "Account not found");
+      // Hot-swap the in-memory credential
+      const cred = await loadCredential();
+      if (cred) opts.auth.setOAuthCredential(cred);
+      appendLog("info", `Switched active account to ${body.id}`);
+      return jsonResp({ ok: true });
+    } catch (err) {
+      return errorResponse(500, "switch_failed", (err as Error).message);
+    }
+  }
+
+  // Update account label
+  if (path === "/admin/api/accounts/label" && method === "PUT") {
+    try {
+      const body = await req.json() as { id?: string; label?: string };
+      if (!body.id || typeof body.label !== "string") {
+        return errorResponse(400, "missing_param", "id and label are required");
+      }
+      const ok = await setAccountLabel(body.id, body.label);
+      if (!ok) return errorResponse(404, "not_found", "Account not found");
+      return jsonResp({ ok: true });
+    } catch (err) {
+      return errorResponse(500, "update_failed", (err as Error).message);
+    }
+  }
+
+  // Delete an account
+  if (path.startsWith("/admin/api/accounts/") && method === "DELETE") {
+    const id = path.slice("/admin/api/accounts/".length);
+    if (!id) return errorResponse(400, "missing_param", "account id required");
+    const ok = await removeAccount(id);
+    if (!ok) return errorResponse(404, "not_found", "Account not found");
+    // Hot-swap the in-memory credential if active changed
+    const cred = await loadCredential();
+    if (cred) opts.auth.setOAuthCredential(cred);
+    appendLog("info", `Removed account ${id}`);
+    return jsonResp({ ok: true });
+  }
+
   // Import from ZCode
   if (path === "/admin/api/import" && method === "POST") {
     try {
@@ -168,7 +225,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       const provider = body.provider as "zai" | "bigmodel";
       const cred = importFromZCodeConfig(provider);
       await saveCredential(cred);
-      return jsonResp({ ok: true, apiKeyMask: cred.apiKey.slice(0, 8) + "..." + cred.apiKey.slice(-4) });
+      return jsonResp({ ok: true, apiKeyMask: maskApiKey(cred.apiKey) });
     } catch (err) {
       return errorResponse(500, "import_failed", (err as Error).message);
     }
@@ -185,7 +242,15 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         const { authorizeUrl, callbackUrl, state } = await oauth.start();
         // Store flow info for polling
         const flowId = `bm_${state.slice(0, 16)}`;
-        activeFlows.set(flowId, { provider, flowId, pollToken: state, expiresAt: Date.now() + 300_000 });
+        activeFlows.set(flowId, {
+          provider,
+          flowId,
+          pollToken: state,
+          expiresAt: Date.now() + 300_000,
+          // Store the localhost callback URL & state for manual callback exchange path
+          callbackUrl,
+          state,
+        } as any);
         // Start background process to wait for callback
         (async () => {
           try {
@@ -202,7 +267,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
           } catch (err) {
             const flow = activeFlows.get(flowId);
             if (flow) { (flow as any).status = "failed"; (flow as any).error = (err as Error).message; }
-            try { await oauth.close(); } catch {}
+            try { await oauth.close(); } catch (e) { appendLog("debug", `oauth.close() cleanup failed: ${(e as Error).message}`); }
           }
         })();
         return jsonResp({ flowId, authorizeUrl });
@@ -245,6 +310,113 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     return jsonResp({ status });
   }
 
+  // OAuth manual callback URL submission
+  // User pastes the redirected browser URL (containing ?code=...&state=...) after authorizing
+  if (path === "/admin/api/oauth/callback" && method === "POST") {
+    try {
+      const body = await req.json() as { flowId?: string; callbackUrl?: string };
+      const flowId = body.flowId;
+      const callbackUrl = body.callbackUrl ?? "";
+
+      if (!flowId || !callbackUrl) {
+        return errorResponse(400, "missing_param", "flowId and callbackUrl are required");
+      }
+
+      const flow = activeFlows.get(flowId);
+      if (!flow) {
+        return errorResponse(404, "flow_not_found", "Unknown or expired OAuth flow. Please restart the login.");
+      }
+      if (Date.now() > flow.expiresAt) {
+        activeFlows.delete(flowId);
+        return errorResponse(410, "flow_expired", "OAuth flow has expired. Please restart the login.");
+      }
+
+      // Parse the callback URL to extract code & state (used as authorization confirmation)
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(callbackUrl);
+      } catch {
+        return errorResponse(400, "invalid_url", "Callback URL is not a valid URL.");
+      }
+
+      const code = parsedUrl.searchParams.get("code");
+      const state = parsedUrl.searchParams.get("state");
+      if (!code || !state) {
+        return errorResponse(400, "invalid_callback", "Callback URL missing 'code' or 'state' parameter.");
+      }
+
+      // Now poll the Z.AI OAuth endpoint — the flow should be ready since the user has authorized
+      if (flow.provider === "zai") {
+        const oauth = new ZaiOAuthClient();
+        let pollResult;
+        // Try polling a few times in case the server hasn't fully processed the callback yet
+        for (let attempt = 0; attempt < 5; attempt++) {
+          pollResult = await oauth.poll(flow.flowId, flow.pollToken);
+          if (pollResult.status === "ready") break;
+          if (pollResult.status === "failed") {
+            activeFlows.delete(flowId);
+            return errorResponse(400, "oauth_failed", "Authorization was rejected or failed on the server side.");
+          }
+          // pending -> wait briefly and retry
+          await new Promise(r => setTimeout(r, 1500));
+        }
+
+        if (!pollResult || pollResult.status !== "ready") {
+          return errorResponse(408, "oauth_timeout", "Authorization not yet detected. Please verify you completed the authorization in the browser and try again.");
+        }
+
+        const accessToken = pollResult.zai?.access_token ?? pollResult.token;
+        if (!accessToken || typeof accessToken !== "string") {
+          return errorResponse(500, "oauth_no_token", "OAuth completed but no access_token was returned.");
+        }
+
+        const resolver = new KeyResolver();
+        const cred = await resolver.resolveCodingPlanCredential(accessToken, "zai", pollResult.userId);
+        if (pollResult.token) cred.jwt = pollResult.token;
+        await saveCredential(cred);
+
+        activeFlows.delete(flowId);
+        return jsonResp({
+          ok: true,
+          provider: "zai",
+          apiKeyMask: maskApiKey(cred.apiKey),
+          userId: cred.userId,
+        });
+      }
+
+      // For bigmodel: the callback URL points to localhost (which the user can't reach
+      // from a remote browser), so we still need to manually exchange the code via
+      // zcode.z.ai proxy. Extract the code and call exchangeCode with the original
+      // callback URL stored on the flow.
+      if (flow.provider === "bigmodel") {
+        const oauth = new BigmodelOAuthClient();
+        // The original callbackUrl stored on the flow is the localhost URL we
+        // registered at start() time — we need it for the token exchange.
+        const storedCallbackUrl = (flow as any).callbackUrl;
+        if (!storedCallbackUrl) {
+          return errorResponse(500, "missing_callback", "Original localhost callback URL not found. Please restart the login.");
+        }
+        const { accessToken, userId, jwt } = await oauth.exchangeCode(code, storedCallbackUrl, state);
+        const resolver = new KeyResolver();
+        const cred = await resolver.resolveCodingPlanCredential(accessToken, "bigmodel", userId);
+        if (jwt) cred.jwt = jwt;
+        await saveCredential(cred);
+
+        activeFlows.delete(flowId);
+        return jsonResp({
+          ok: true,
+          provider: "bigmodel",
+          apiKeyMask: maskApiKey(cred.apiKey),
+          userId: cred.userId,
+        });
+      }
+
+      return errorResponse(400, "unsupported_provider", `Provider ${flow.provider} does not support callback URL exchange.`);
+    } catch (err) {
+      return errorResponse(500, "oauth_callback_failed", (err as Error).message);
+    }
+  }
+
   // Update endpoints
   if (path === "/admin/api/endpoints" && method === "PUT") {
     try {
@@ -252,6 +424,45 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       if (body.zai) Object.assign(opts.config.providers.zai, body.zai);
       if (body.bigmodel) Object.assign(opts.config.providers.bigmodel, body.bigmodel);
       return jsonResp({ ok: true });
+    } catch (err) {
+      return errorResponse(500, "save_failed", (err as Error).message);
+    }
+  }
+
+  // Get routing rules
+  if (path === "/admin/api/routing-rules" && method === "GET") {
+    return jsonResp({ rules: opts.config.routingRules ?? [] });
+  }
+
+  // Update routing rules (full replace)
+  if (path === "/admin/api/routing-rules" && method === "PUT") {
+    try {
+      const body = await req.json() as { rules?: Array<{ pattern?: string; provider?: string; endpoint?: string; note?: string }> };
+      if (!Array.isArray(body.rules)) {
+        return errorResponse(400, "invalid_request", "rules must be an array");
+      }
+      // Validate & normalize
+      const cleaned: RoutingRule[] = [];
+      for (const r of body.rules) {
+        if (typeof r.pattern !== "string" || r.pattern.trim() === "") {
+          return errorResponse(400, "invalid_rule", "Each rule needs a non-empty 'pattern'");
+        }
+        if (r.provider !== "zai" && r.provider !== "bigmodel") {
+          return errorResponse(400, "invalid_rule", `Rule '${r.pattern}' has invalid provider (must be 'zai' or 'bigmodel')`);
+        }
+        cleaned.push({
+          pattern: r.pattern.trim(),
+          provider: r.provider,
+          endpoint: typeof r.endpoint === "string" && r.endpoint.trim() ? r.endpoint.trim() : undefined,
+          note: typeof r.note === "string" && r.note.trim() ? r.note.trim() : undefined,
+        });
+      }
+      opts.config.routingRules = cleaned;
+      // Persist
+      const yaml = configToYaml(opts.config);
+      writeFileSync(opts.configPath, yaml, "utf-8");
+      appendLog("info", `Routing rules updated (${cleaned.length} rule(s))`);
+      return jsonResp({ ok: true, rules: cleaned });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
     }
@@ -265,29 +476,57 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     });
   }
 
+  // Reset stats
+  if (path === "/admin/api/stats" && method === "DELETE") {
+    stats.total = 0;
+    stats.success = 0;
+    stats.failed = 0;
+    stats.retried = 0;
+    stats.requests = [];
+    stats.models = {};
+    appendLog("info", "Stats reset by admin");
+    return jsonResp({ ok: true });
+  }
+
   // Log stream (SSE)
   if (path === "/admin/api/logs/stream" && method === "GET") {
-    // For WebSocket upgrade, Bun handles it differently; use SSE for simplicity
+    let sentIndex = 0; // Track how many buffered entries we've already sent
     const stream = new ReadableStream({
       async start(controller) {
-        // Send existing logs
-        for (const entry of logBuffer.slice(-100)) {
-          controller.enqueue(`data: ${JSON.stringify(entry)}\n\n`);
-        }
-        // Send new logs as they come
+        const encoder = new TextEncoder();
+        const send = (entry: { time: string; level: string; message: string }) => {
+          try {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(entry)}\n\n`));
+          } catch (e) { /* SSE controller may be closed; safe to ignore */ void e; }
+        };
+
+        // Send existing buffered logs first
+        const initial = logBuffer.slice();
+        sentIndex = logBuffer.length;
+        for (const entry of initial) send(entry);
+
+        // Set up a waiter so new entries are pushed immediately
+        const waiter = { resolve: (value: unknown) => void 0 };
+        logWaiters.push(waiter);
+
+        // Polling fallback: check for any new entries every 500ms
         const interval = setInterval(() => {
-          // Poll for new entries
-          const latest = logBuffer[logBuffer.length - 1];
-          if (latest) {
-            controller.enqueue(`data: ${JSON.stringify(latest)}\n\n`);
+          while (sentIndex < logBuffer.length) {
+            send(logBuffer[sentIndex]);
+            sentIndex++;
           }
-        }, 1000);
-        // Clean up on cancel
-        // Note: SSE stream will be cleaned up when connection closes
+        }, 500);
+
+        // Clean up on cancel (1 hour max lifetime as safety)
         setTimeout(() => {
           clearInterval(interval);
-          try { controller.close(); } catch {}
-        }, 3600000); // 1 hour max
+          const idx = logWaiters.indexOf(waiter);
+          if (idx >= 0) logWaiters.splice(idx, 1);
+          try { controller.close(); } catch (e) { appendLog("debug", `SSE controller.close() failed: ${(e as Error).message}`); }
+        }, 3600000);
+      },
+      cancel() {
+        // Cleanup if the client disconnects early
       },
     });
     return new Response(stream, {
@@ -295,6 +534,8 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         "content-type": "text/event-stream",
         "cache-control": "no-cache",
         "connection": "keep-alive",
+        // Disable Nagle's algorithm for snappier streaming
+        "x-accel-buffering": "no",
       },
     });
   }
@@ -338,54 +579,59 @@ function sanitizeConfig(config: ProxyConfig): Record<string, unknown> {
     identity: config.identity,
     logging: config.logging,
     retry: config.retry,
+    routingRules: config.routingRules ?? [],
   };
 }
 
 function configToYaml(config: ProxyConfig): string {
-  const lines: string[] = [];
-  lines.push(`server:`);
-  lines.push(`  port: ${config.server.port}`);
-  lines.push(`  host: "${config.server.host}"`);
-  lines.push(``);
-  lines.push(`auth:`);
-  lines.push(`  mode: ${config.auth.mode}`);
-  if (config.auth.apiKey) lines.push(`  apiKey: "${config.auth.apiKey}"`);
-  if (config.auth.proxyApiKey) lines.push(`  proxyApiKey: "${config.auth.proxyApiKey}"`);
-  lines.push(``);
-  lines.push(`provider: ${config.provider}`);
-  lines.push(`plan: ${config.plan}`);
-  lines.push(``);
-  lines.push(`providers:`);
-  lines.push(`  zai:`);
-  lines.push(`    anthropicBase: "${config.providers.zai.anthropicBase}"`);
-  lines.push(`    openaiBase: "${config.providers.zai.openaiBase}"`);
-  if (config.providers.zai.credential) lines.push(`    credential: "${config.providers.zai.credential}"`);
-  lines.push(`  bigmodel:`);
-  lines.push(`    anthropicBase: "${config.providers.bigmodel.anthropicBase}"`);
-  lines.push(`    openaiBase: "${config.providers.bigmodel.openaiBase}"`);
-  if (config.providers.bigmodel.credential) lines.push(`    credential: "${config.providers.bigmodel.credential}"`);
-  lines.push(``);
-  lines.push(`defaultModel: ${config.defaultModel}`);
-  lines.push(``);
-  lines.push(`models:`);
-  for (const m of config.models) lines.push(`  - ${m}`);
-  lines.push(``);
-  lines.push(`identity:`);
-  lines.push(`  appVersion: "${config.identity.appVersion}"`);
-  lines.push(`  sourceTitle: "${config.identity.sourceTitle}"`);
-  lines.push(`  refererOrigin: "${config.identity.refererOrigin}"`);
-  lines.push(``);
-  lines.push(`logging:`);
-  lines.push(`  level: ${config.logging.level}`);
-  lines.push(``);
-  lines.push(`retry:`);
-  lines.push(`  maxRetries: ${config.retry.maxRetries}`);
-  lines.push(`  initialDelayMs: ${config.retry.initialDelayMs}`);
-  lines.push(`  maxDelayMs: ${config.retry.maxDelayMs}`);
-  lines.push(`  backoffFactor: ${config.retry.backoffFactor}`);
-  lines.push(`  retryableStatuses:`);
-  for (const s of config.retry.retryableStatuses) lines.push(`    - ${s}`);
-  return lines.join("\n");
+  // Build a plain object preserving insertion order matching config.example.yaml,
+  // then let the `yaml` library handle quoting/indentation/escape correctly.
+  // This keeps values with special chars (colons, leading spaces, quotes) safe
+  // and avoids the brittle manual string concatenation that previously broke on
+  // URLs containing ':' and other reserved characters.
+  const obj: Record<string, unknown> = {
+    server: { port: config.server.port, host: config.server.host },
+    auth: {
+      mode: config.auth.mode,
+      ...(config.auth.apiKey ? { apiKey: config.auth.apiKey } : {}),
+      ...(config.auth.proxyApiKey ? { proxyApiKey: config.auth.proxyApiKey } : {}),
+    },
+    provider: config.provider,
+    plan: config.plan,
+    providers: {
+      zai: {
+        anthropicBase: config.providers.zai.anthropicBase,
+        openaiBase: config.providers.zai.openaiBase,
+        ...(config.providers.zai.credential ? { credential: config.providers.zai.credential } : {}),
+      },
+      bigmodel: {
+        anthropicBase: config.providers.bigmodel.anthropicBase,
+        openaiBase: config.providers.bigmodel.openaiBase,
+        ...(config.providers.bigmodel.credential ? { credential: config.providers.bigmodel.credential } : {}),
+      },
+    },
+    defaultModel: config.defaultModel,
+    models: config.models,
+    identity: { ...config.identity },
+    logging: { ...config.logging },
+    retry: { ...config.retry, retryableStatuses: [...config.retry.retryableStatuses] },
+    ...(config.routingRules && config.routingRules.length > 0
+      ? { routingRules: config.routingRules.map(r => ({
+          pattern: r.pattern,
+          provider: r.provider,
+          ...(r.endpoint ? { endpoint: r.endpoint } : {}),
+          ...(r.note ? { note: r.note } : {}),
+        })) }
+      : {}),
+  };
+
+  return stringifyYaml(obj, {
+    indent: 2,
+    lineWidth: 0,        // Don't wrap long strings (URLs, API keys)
+    defaultKeyType: "PLAIN",
+    defaultStringType: "QUOTE_DOUBLE",
+    nullStr: "",
+  });
 }
 
 function importFromZCodeConfig(provider: string): AppCredential {

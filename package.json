@@ -14,6 +14,7 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "@types/jsdom": "^28.0.3"
+    "@types/jsdom": "^28.0.3",
+    "typescript": "^6.0.3"
   }
 }

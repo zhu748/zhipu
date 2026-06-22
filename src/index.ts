@@ -86,14 +86,19 @@ async function serve(configPath?: string): Promise<void> {
     auth.setOAuthCredential(cred);
   }
 
-  // Intercept console.log for admin dashboard log streaming
+  // Intercept console.log for admin dashboard log streaming.
+  // Wrapped in try/catch so a logging failure never breaks the actual console output.
   const origLog = console.log;
   const origError = console.error;
   const origWarn = console.warn;
   const { appendLog } = await import("./admin/api.js");
-  console.log = (...args: unknown[]) => { origLog(...args); try { appendLog("info", args.map(String).join(" ")); } catch {} };
-  console.error = (...args: unknown[]) => { origError(...args); try { appendLog("error", args.map(String).join(" ")); } catch {} };
-  console.warn = (...args: unknown[]) => { origWarn(...args); try { appendLog("warn", args.map(String).join(" ")); } catch {} };
+  const safeAppend = (level: string, args: unknown[]) => {
+    try { appendLog(level, args.map(a => typeof a === "string" ? a : (a instanceof Error ? a.message : JSON.stringify(a))).join(" ")); }
+    catch (e) { /* appendLog itself may throw if log buffer is full; never let it kill the request */ void e; }
+  };
+  console.log = (...args: unknown[]) => { origLog(...args); safeAppend("info", args); };
+  console.error = (...args: unknown[]) => { origError(...args); safeAppend("error", args); };
+  console.warn = (...args: unknown[]) => { origWarn(...args); safeAppend("warn", args); };
 
   const server = startServer({ config, auth, configPath: path });
   const url = `http://${server.hostname}:${server.port}`;

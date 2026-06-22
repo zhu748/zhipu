@@ -3,7 +3,16 @@
  * @see .omo/plans/zcode-proxy.md Task 14
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { saveCredential, loadCredential, clearCredential } from "./store.js";
+import {
+  saveCredential,
+  loadCredential,
+  clearCredential,
+  listAccounts,
+  switchAccount,
+  removeAccount,
+  setAccountLabel,
+  maskApiKey,
+} from "./store.js";
 import type { Credential } from "./types.js";
 
 const TEST_SECRET = "test-encryption-secret-for-zcode-proxy";
@@ -68,5 +77,107 @@ describe("credential store", () => {
     await saveCredential(cred);
     const loaded = await loadCredential();
     expect(loaded!.expiresAt).toBe(9999999999999);
+  });
+});
+
+describe("multi-account store", () => {
+  beforeEach(() => {
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = TEST_SECRET;
+    clearCredential();
+  });
+
+  afterEach(() => {
+    clearCredential();
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+  });
+
+  it("saveCredential marks new account as active", async () => {
+    await saveCredential({ apiKey: "key1", provider: "zai" });
+    const list = await listAccounts();
+    expect(list.accounts).toHaveLength(1);
+    expect(list.activeId).toBe(list.accounts[0].id);
+    expect(list.accounts[0].apiKeyMask).toBe("key1");
+  });
+
+  it("saving a second, different account keeps both and switches active", async () => {
+    await saveCredential({ apiKey: "key1", provider: "zai" });
+    await saveCredential({ apiKey: "key2", provider: "bigmodel" });
+    const list = await listAccounts();
+    expect(list.accounts).toHaveLength(2);
+    // activeId should now point to the second account (key2/bigmodel)
+    const active = list.accounts.find(a => a.id === list.activeId);
+    expect(active?.provider).toBe("bigmodel");
+    expect(active?.apiKeyMask).toBe("key2");
+  });
+
+  it("saving the same provider+apiKey updates in place without duplicating", async () => {
+    await saveCredential({ apiKey: "key1", provider: "zai", userId: "u1" });
+    await saveCredential({ apiKey: "key1", provider: "zai", userId: "u1-updated", jwt: "jwt-token" });
+    const list = await listAccounts();
+    expect(list.accounts).toHaveLength(1);
+    // loadCredential should reflect the updated fields
+    const loaded = await loadCredential();
+    expect(loaded!.userId).toBe("u1-updated");
+    expect(loaded!.jwt).toBe("jwt-token");
+  });
+
+  it("switchAccount changes the active credential", async () => {
+    await saveCredential({ apiKey: "key1", provider: "zai" });
+    await saveCredential({ apiKey: "key2", provider: "bigmodel" });
+    // After save, key2/bigmodel is active
+    let loaded = await loadCredential();
+    expect(loaded!.provider).toBe("bigmodel");
+
+    // Switch back to first
+    const list = await listAccounts();
+    const firstId = list.accounts.find(a => a.provider === "zai")!.id;
+    const ok = await switchAccount(firstId);
+    expect(ok).toBe(true);
+
+    loaded = await loadCredential();
+    expect(loaded!.provider).toBe("zai");
+    expect(loaded!.apiKey).toBe("key1");
+  });
+
+  it("switchAccount returns false for unknown id", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const ok = await switchAccount("nonexistent-id");
+    expect(ok).toBe(false);
+  });
+
+  it("removeAccount deletes the account and falls back to first remaining", async () => {
+    await saveCredential({ apiKey: "key1", provider: "zai" });
+    await saveCredential({ apiKey: "key2", provider: "bigmodel" });
+
+    const list = await listAccounts();
+    const bigmodelId = list.accounts.find(a => a.provider === "bigmodel")!.id;
+    const ok = await removeAccount(bigmodelId);
+    expect(ok).toBe(true);
+
+    const list2 = await listAccounts();
+    expect(list2.accounts).toHaveLength(1);
+    expect(list2.accounts[0].provider).toBe("zai");
+    // activeId should fall back to the only remaining
+    expect(list2.activeId).toBe(list2.accounts[0].id);
+
+    const loaded = await loadCredential();
+    expect(loaded!.apiKey).toBe("key1");
+  });
+
+  it("setAccountLabel updates the label", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const list = await listAccounts();
+    const id = list.accounts[0].id;
+    const ok = await setAccountLabel(id, "My Custom Label");
+    expect(ok).toBe(true);
+
+    const list2 = await listAccounts();
+    expect(list2.accounts[0].label).toBe("My Custom Label");
+  });
+
+  it("maskApiKey masks long keys correctly", () => {
+    expect(maskApiKey("abcdefgh12345678wxyz")).toBe("abcdefgh...wxyz");
+    expect(maskApiKey("short")).toBe("short");
+    expect(maskApiKey("")).toBe("");
   });
 });

@@ -4,7 +4,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig } from "./types.js";
+import type { ProxyConfig, ProviderEndpoints, ProxyIdentity, RetryConfig, RoutingRule } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -104,6 +104,9 @@ export function loadConfig(path: string): ProxyConfig {
   // --- retry ---
   const retry = resolveRetry(parsed?.retry);
 
+  // --- routing rules ---
+  const routingRules = resolveRoutingRules(parsed?.routingRules);
+
   const config: ProxyConfig = {
     server: { port, host },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
@@ -115,6 +118,7 @@ export function loadConfig(path: string): ProxyConfig {
     identity,
     logging: { level: logLevel },
     retry,
+    routingRules,
   };
 
   validate(config);
@@ -225,6 +229,25 @@ function resolvePositiveFloat(raw: unknown, fallback: number): number {
   if (raw === undefined || raw === null) return fallback;
   const n = typeof raw === "number" ? raw : parseFloat(String(raw));
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** Resolve routing rules from YAML, validating each rule's shape. */
+function resolveRoutingRules(raw: unknown): RoutingRule[] {
+  if (!Array.isArray(raw)) return [];
+  const rules: RoutingRule[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const r = item as Record<string, unknown>;
+    if (typeof r.pattern !== "string" || r.pattern.trim() === "") continue;
+    if (r.provider !== "zai" && r.provider !== "bigmodel") continue;
+    rules.push({
+      pattern: r.pattern.trim(),
+      provider: r.provider,
+      endpoint: typeof r.endpoint === "string" && r.endpoint.trim() ? r.endpoint.trim() : undefined,
+      note: typeof r.note === "string" && r.note.trim() ? r.note.trim() : undefined,
+    });
+  }
+  return rules;
 }
 
 /** Cross-field validation after all fields are resolved. */
