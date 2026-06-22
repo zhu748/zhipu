@@ -1,5 +1,13 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.2 / v0.1.12 — thinking 字段重新启用（按模型能力）**
+> - **修复 thinking 注入逻辑**：v2.1.3.1 过度保守地移除了 thinking 注入，导致所有模型都不思考。现在按模型能力判断：
+>   - **支持 reasoning 的模型**（glm-4.5-air / glm-4.6 / glm-4.7 / glm-5 / glm-5-turbo / glm-5.1 / glm-5.2）：注入 `thinking: {type:"enabled"}`，启用思考
+>   - **不支持 reasoning 的模型**（glm-4.6v / glm-5v-turbo）：不注入，避免 3001
+>   - **未知模型**：默认注入，让 GLM 自己决定
+> - **新增 3 个单元测试**覆盖 thinking 注入的各种场景
+> - **与 Claude Code 路径行为一致**：body-transformer 仍会规范化 thinking 字段为 GLM 接受的 `{type:"enabled"}` 格式
+>
 > **v2.1.3.1 / v0.1.11 — Codex CLI 实战修复**
 > - **修复连续同角色消息合并**：Codex CLI 一次会话会发送多个连续 `user` 消息（每轮一个），Anthropic 上游严格要求 user/assistant 交替，会返回 3001 "parameter error"。代理现在自动合并连续同角色消息
 > - **修复非 GLM 模型 fallback**：Codex 默认发送 `model: "gpt-5.5"`，GLM 上游不识别会 400。代理自动替换为 `config.defaultModel`（默认 `glm-4.6`），并打印日志

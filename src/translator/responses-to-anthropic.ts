@@ -24,6 +24,7 @@ import type {
   AnthropicToolDefinition,
 } from "./types.js";
 import { getTurn } from "./responses-store.js";
+import { getModel } from "../provider/models.js";
 
 const DEFAULT_MAX_TOKENS = 4096;
 
@@ -76,22 +77,25 @@ export function translateRequestResponsesToAnthropic(req: OpenAIResponseRequest)
   if (req.stream !== undefined) result.stream = req.stream;
   if (req.stop) result.stop_sequences = Array.isArray(req.stop) ? req.stop : [req.stop];
 
-  // Forward reasoning.effort → thinking enabled. GLM only supports enabled/disabled,
-  // no effort levels, so any non-null reasoning enables thinking.
+  // Forward reasoning.effort → thinking enabled, but only for models that
+  // actually support reasoning. GLM's older/non-reasoning models (glm-4.6v,
+  // glm-5v-turbo) reject the `thinking` field with 3001 "parameter error".
   //
-  // NOTE: We do NOT inject `thinking` here anymore because:
-  //   1. GLM's older models (glm-4.6, glm-4.5-air, glm-4.6v, glm-5v-turbo) reject
-  //      `thinking` with 3001 "parameter error" — only glm-4.7 / glm-5 / glm-5.x
-  //      accept it.
-  //   2. body-transformer.ts already normalises any client-sent `thinking` field
-  //      into GLM's accepted `{type:"enabled"}` form, so we don't need to add it
-  //      ourselves. The model simply won't reason if it can't.
-  //   3. Codex sends `reasoning.effort:"high"` unconditionally; injecting thinking
-  //      would break all the non-reasoning models listed above.
-  // If a future GLM model accepts thinking universally, re-enable this.
-  // if (req.reasoning && req.reasoning.effort) {
-  //   result.thinking = { type: "enabled" };
-  // }
+  // We look up the model in the catalog; if unknown or marked reasoning:true,
+  // we inject `thinking: {type:"enabled"}`. body-transformer.ts then normalises
+  // it (no-op since it's already in GLM's accepted form) before forwarding.
+  //
+  // Note: by the time we get here, handler.ts has already done model fallback
+  // (gpt-5.5 → config.defaultModel), so result.model is always a GLM id.
+  if (req.reasoning && req.reasoning.effort) {
+    const modelDef = getModel(result.model);
+    // Inject thinking only when the model is known AND supports reasoning,
+    // OR when the model is unknown (let GLM decide — better to try than to
+    // silently drop reasoning on models that might support it).
+    if (!modelDef || modelDef.reasoning === true) {
+      result.thinking = { type: "enabled" };
+    }
+  }
 
   // Filter to only function-type tools (local_shell, web_search etc. are built-in client-side)
   const functionTools = (req.tools ?? []).filter((t) => t && t.type === "function" && t.name);

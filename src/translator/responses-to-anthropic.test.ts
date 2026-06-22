@@ -63,15 +63,42 @@ describe("translateRequestResponsesToAnthropic", () => {
     expect(result.max_tokens).toBe(8192);
   });
 
-  it("does NOT inject thinking from reasoning.effort (older GLM models reject the field)", () => {
+  it("injects thinking enabled from reasoning.effort for reasoning-capable models", () => {
     const req: OpenAIResponseRequest = {
-      model: "glm-4.6",
+      model: "glm-4.6",  // reasoning: true in catalog
       input: "Hi",
       reasoning: { effort: "high" },
     };
     const result = translateRequestResponsesToAnthropic(req);
-    // We intentionally don't inject `thinking` — see comments in the translator.
-    // body-transformer.ts handles any client-sent thinking field separately.
+    expect(result.thinking).toEqual({ type: "enabled" });
+  });
+
+  it("does NOT inject thinking for non-reasoning models (glm-4.6v, glm-5v-turbo)", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-4.6v",  // reasoning: false (no field) in catalog
+      input: "Hi",
+      reasoning: { effort: "high" },
+    };
+    const result = translateRequestResponsesToAnthropic(req);
+    expect(result.thinking).toBeUndefined();
+  });
+
+  it("injects thinking for unknown models (let GLM decide)", () => {
+    const req: OpenAIResponseRequest = {
+      model: "some-future-glm",
+      input: "Hi",
+      reasoning: { effort: "medium" },
+    };
+    const result = translateRequestResponsesToAnthropic(req);
+    expect(result.thinking).toEqual({ type: "enabled" });
+  });
+
+  it("does NOT inject thinking when reasoning is absent", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-4.6",
+      input: "Hi",
+    };
+    const result = translateRequestResponsesToAnthropic(req);
     expect(result.thinking).toBeUndefined();
   });
 
