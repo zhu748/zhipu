@@ -35,7 +35,7 @@ export function translateRequestResponsesToAnthropic(req: OpenAIResponseRequest)
   const systemParts: string[] = [];
   if (req.instructions) systemParts.push(req.instructions);
 
-  const anthropicMessages: AnthropicMessage[] = [];
+  const rawMessages: AnthropicMessage[] = [];
 
   for (const item of inputItems) {
     const translated = translateInputItem(item);
@@ -44,7 +44,24 @@ export function translateRequestResponsesToAnthropic(req: OpenAIResponseRequest)
       if (translated.text) systemParts.push(translated.text);
       continue;
     }
-    anthropicMessages.push(translated.msg);
+    rawMessages.push(translated.msg);
+  }
+
+  // Anthropic Messages API requires strictly alternating user/assistant roles.
+  // Codex CLI frequently sends consecutive user messages (one per turn), so we
+  // merge adjacent same-role messages into one. Content is merged by:
+  //   - two strings → concatenated with "\n\n"
+  //   - string + block[] / block[] + block[] → unified block array
+  //   - empty content is skipped
+  // Without this merge, GLM upstream returns 3001 "parameter error".
+  const anthropicMessages: AnthropicMessage[] = [];
+  for (const msg of rawMessages) {
+    const last = anthropicMessages[anthropicMessages.length - 1];
+    if (last && last.role === msg.role) {
+      last.content = mergeContent(last.content, msg.content);
+    } else {
+      anthropicMessages.push({ ...msg });
+    }
   }
 
   const result: AnthropicMessagesRequest = {
@@ -61,9 +78,20 @@ export function translateRequestResponsesToAnthropic(req: OpenAIResponseRequest)
 
   // Forward reasoning.effort → thinking enabled. GLM only supports enabled/disabled,
   // no effort levels, so any non-null reasoning enables thinking.
-  if (req.reasoning && req.reasoning.effort) {
-    result.thinking = { type: "enabled" };
-  }
+  //
+  // NOTE: We do NOT inject `thinking` here anymore because:
+  //   1. GLM's older models (glm-4.6, glm-4.5-air, glm-4.6v, glm-5v-turbo) reject
+  //      `thinking` with 3001 "parameter error" — only glm-4.7 / glm-5 / glm-5.x
+  //      accept it.
+  //   2. body-transformer.ts already normalises any client-sent `thinking` field
+  //      into GLM's accepted `{type:"enabled"}` form, so we don't need to add it
+  //      ourselves. The model simply won't reason if it can't.
+  //   3. Codex sends `reasoning.effort:"high"` unconditionally; injecting thinking
+  //      would break all the non-reasoning models listed above.
+  // If a future GLM model accepts thinking universally, re-enable this.
+  // if (req.reasoning && req.reasoning.effort) {
+  //   result.thinking = { type: "enabled" };
+  // }
 
   // Filter to only function-type tools (local_shell, web_search etc. are built-in client-side)
   const functionTools = (req.tools ?? []).filter((t) => t && t.type === "function" && t.name);
@@ -105,6 +133,44 @@ function normalizeInput(input: unknown): ResponsesInputItem[] {
   }
   if (Array.isArray(input)) {
     return input as ResponsesInputItem[];
+  }
+  return [];
+}
+
+/** Merge two Anthropic message contents (string | block[]) into one. */
+function mergeContent(
+  a: string | AnthropicContentBlock[],
+  b: string | AnthropicContentBlock[],
+): string | AnthropicContentBlock[] {
+  // Normalize both sides to block arrays, drop empty entries, then concat.
+  const blocksA = toBlockArray(a);
+  const blocksB = toBlockArray(b);
+  const merged = [...blocksA, ...blocksB];
+
+  // Optimization: if every block is text, collapse to a single string.
+  if (merged.length > 0 && merged.every((b) => b.type === "text")) {
+    const text = merged
+      .map((b) => (b as { type: "text"; text: string }).text)
+      .filter((t) => t.length > 0)
+      .join("\n\n");
+    return text;
+  }
+  return merged;
+}
+
+/** Coerce string|block[] to block[], dropping empty content. */
+function toBlockArray(content: string | AnthropicContentBlock[]): AnthropicContentBlock[] {
+  if (typeof content === "string") {
+    return content.length > 0 ? [{ type: "text", text: content }] : [];
+  }
+  if (Array.isArray(content)) {
+    return content.filter((b) => {
+      if (b && b.type === "text") {
+        const text = (b as { text?: string }).text;
+        return typeof text === "string" && text.length > 0;
+      }
+      return Boolean(b);
+    });
   }
   return [];
 }

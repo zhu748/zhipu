@@ -1,5 +1,11 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.1 / v0.1.11 — Codex CLI 实战修复**
+> - **修复连续同角色消息合并**：Codex CLI 一次会话会发送多个连续 `user` 消息（每轮一个），Anthropic 上游严格要求 user/assistant 交替，会返回 3001 "parameter error"。代理现在自动合并连续同角色消息
+> - **修复非 GLM 模型 fallback**：Codex 默认发送 `model: "gpt-5.5"`，GLM 上游不识别会 400。代理自动替换为 `config.defaultModel`（默认 `glm-4.6`），并打印日志
+> - **不再注入 `thinking` 字段**：旧 GLM 模型（glm-4.6 / glm-4.5-air / glm-4.6v / glm-5v-turbo）不接受 `thinking` 字段，会 3001。代理现在只在客户端显式发送 `thinking` 时透传（由 body-transformer 规范化）
+> - **新增 2 个集成测试**：覆盖 Codex CLI 实际请求模式（连续 user 消息 + gpt-5.5 模型）
+>
 > **v2.1.3.0 / v0.1.10 — OpenAI Responses API 适配（Codex CLI 兼容）**
 > - **新增 `/v1/responses` 端点**：完整支持 OpenAI Responses API，可用于 Codex CLI（`wire_api=responses`）
 > - **完整流式事件序列**：`response.created` → `output_item.added` → `content_part.added` → `output_text.delta` * → `output_text.done` → `content_part.done` → `output_item.done` → `response.completed`

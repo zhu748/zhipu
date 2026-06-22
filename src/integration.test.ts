@@ -314,4 +314,43 @@ describe("integration: OpenAI Responses API", () => {
     const body = await resp.json();
     expect(body.object).toBe("response");
   });
+
+  it("falls back to defaultModel when client sends a non-GLM model (Codex CLI gpt-5.5)", async () => {
+    // Codex CLI defaults to "gpt-5.5" which GLM upstream rejects. Proxy should
+    // transparently substitute config.defaultModel ("glm-4.6" in test config).
+    const resp = await fetch(proxyUrl("/v1/responses"), {
+      method: "POST",
+      headers: authHeader(),
+      body: JSON.stringify({
+        model: "gpt-5.5",
+        input: [{ type: "message", role: "user", content: "Hi from Codex" }],
+      }),
+    });
+    expect(resp.status).toBe(200);
+    const body = await resp.json();
+    expect(body.object).toBe("response");
+    // The response should echo the substituted model (or at least be a valid response)
+    expect(body.output.length).toBeGreaterThan(0);
+  });
+
+  it("merges consecutive same-role user messages (Codex sends multiple user turns)", async () => {
+    // Reproduces the original 3001 "parameter error" bug from Codex CLI
+    const resp = await fetch(proxyUrl("/v1/responses"), {
+      method: "POST",
+      headers: authHeader(),
+      body: JSON.stringify({
+        model: "glm-4.6",
+        input: [
+          { type: "message", role: "developer", content: "You are a coding agent." },
+          { type: "message", role: "user", content: "first question" },
+          { type: "message", role: "user", content: "second question" },
+          { type: "message", role: "user", content: "third question" },
+        ],
+        instructions: "Be helpful.",
+      }),
+    });
+    expect(resp.status).toBe(200);
+    const body = await resp.json();
+    expect(body.object).toBe("response");
+  });
 });

@@ -13,6 +13,7 @@ import type { Format } from "../translator/types.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import { getProvider } from "../provider/providers.js";
+import { listModelIds } from "../provider/models.js";
 import { buildUpstreamRequest } from "./upstream.js";
 import { transformRequestBody, transformRequestBodyObj } from "./body-transformer.js";
 import { detectCaptchaChallenge, getCaptchaToken, invalidateCaptchaToken, RETRY_HEADERS } from "./captcha.js";
@@ -97,6 +98,25 @@ export async function proxyRequest(
   // "openai-responses" → Responses API format (used by Codex CLI)
   const translateMode = format === "openai" || format === "openai-responses";
   const upstreamFormat: Format = translateMode ? "anthropic" : format;
+
+  // Model fallback for translation modes: if the client sent a non-GLM model
+  // (e.g. Codex CLI defaults to "gpt-5.5"), substitute config.defaultModel so
+  // GLM upstream doesn't 400 with "parameter error". Original model is preserved
+  // in the response echo for client compatibility.
+  //
+  // This is only applied in translation mode because passthrough mode lets the
+  // upstream decide (matches the original proxy semantics — see README: "the
+  // listing is informational, not a gate").
+  if (translateMode && parsedBody && typeof parsedBody === "object") {
+    const bodyObj = parsedBody as Record<string, unknown>;
+    const clientModel = typeof bodyObj.model === "string" ? bodyObj.model : "";
+    if (clientModel && !isKnownGlmModel(clientModel)) {
+      const fallback = config.defaultModel || "glm-4.6";
+      console.log(`${reqId} model fallback: ${clientModel} → ${fallback} (non-GLM model not accepted upstream)`);
+      bodyObj.model = fallback;
+      meta.model = fallback;
+    }
+  }
 
   let upstreamBodyObj: unknown = parsedBody;
   if (translateMode) {
@@ -562,6 +582,15 @@ function peekParsedBody(parsed: unknown): RequestMeta {
     stream: p.stream === true,
   };
 }
+
+/** Check if a model id is a known GLM model OR a plausible GLM variant (starts with "glm-"). */
+function isKnownGlmModel(model: string): boolean {
+  if (!model) return false;
+  if (model.startsWith("glm-")) return true;
+  return knownGlmModelSet.has(model);
+}
+
+const knownGlmModelSet = new Set(listModelIds());
 
 /** Translate a client request body object to Anthropic JSON. Returns error Response on failure. */
 function translateClientBodyObj(parsed: unknown, format: Format): Response | unknown {

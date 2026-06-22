@@ -63,14 +63,16 @@ describe("translateRequestResponsesToAnthropic", () => {
     expect(result.max_tokens).toBe(8192);
   });
 
-  it("forwards reasoning.effort as thinking enabled", () => {
+  it("does NOT inject thinking from reasoning.effort (older GLM models reject the field)", () => {
     const req: OpenAIResponseRequest = {
       model: "glm-4.6",
       input: "Hi",
       reasoning: { effort: "high" },
     };
     const result = translateRequestResponsesToAnthropic(req);
-    expect(result.thinking).toEqual({ type: "enabled" });
+    // We intentionally don't inject `thinking` — see comments in the translator.
+    // body-transformer.ts handles any client-sent thinking field separately.
+    expect(result.thinking).toBeUndefined();
   });
 
   it("filters to only function-type tools, dropping built-ins", () => {
@@ -100,12 +102,45 @@ describe("translateRequestResponsesToAnthropic", () => {
       ],
     };
     const result = translateRequestResponsesToAnthropic(req);
+    // tool_result (user) and the following user message get merged into one user
+    // message because Anthropic requires strict role alternation.
     expect(result.messages).toEqual([
       { role: "user", content: "list files" },
       { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "shell", input: { cmd: "ls" } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "file1\nfile2" }] },
-      { role: "user", content: "now cat file1" },
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "call_1", content: "file1\nfile2" },
+        { type: "text", text: "now cat file1" },
+      ] },
     ]);
+  });
+
+  it("merges consecutive same-role messages (Codex sends multiple user turns in one input)", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-4.6",
+      input: [
+        { type: "message", role: "user", content: "first question" },
+        { type: "message", role: "user", content: "second question" },
+        { type: "message", role: "user", content: "third question" },
+      ],
+    };
+    const result = translateRequestResponsesToAnthropic(req);
+    expect(result.messages.length).toBe(1);
+    expect(result.messages[0].role).toBe("user");
+    expect(result.messages[0].content).toBe("first question\n\nsecond question\n\nthird question");
+  });
+
+  it("merges mixed string and block content across consecutive same-role messages", () => {
+    const req: OpenAIResponseRequest = {
+      model: "glm-4.6",
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "block text" }] },
+        { type: "message", role: "user", content: "plain string" },
+      ],
+    };
+    const result = translateRequestResponsesToAnthropic(req);
+    expect(result.messages.length).toBe(1);
+    // All text → collapse to a single string
+    expect(result.messages[0].content).toBe("block text\n\nplain string");
   });
 
   it("replays previous_response_id history before current input", () => {
