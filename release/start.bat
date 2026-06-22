@@ -9,10 +9,12 @@ echo   2. OAuth login (Bigmodel) - Coding Plan
 echo   3. OAuth login (Z.AI) - Coding Plan
 echo   4. OAuth login (Bigmodel) - Start Plan
 echo   5. OAuth login (Z.AI) - Start Plan
-echo   6. Import key from ZCode (Bigmodel)
-echo   7. Import key from ZCode (Z.AI)
-echo   8. Check login status
-echo   9. Logout
+echo   6. Import key from ZCode (Bigmodel) - Coding Plan
+echo   7. Import key from ZCode (Z.AI) - Coding Plan
+echo   8. Import key from ZCode (Bigmodel) - Start Plan
+echo   9. Import key from ZCode (Z.AI) - Start Plan
+echo   a. Check login status
+echo   b. Logout
 echo   0. Exit
 echo.
 set /p choice=Select: 
@@ -22,10 +24,12 @@ if "%choice%"=="2" goto login_bigmodel_cp
 if "%choice%"=="3" goto login_zai_cp
 if "%choice%"=="4" goto login_bigmodel_sp
 if "%choice%"=="5" goto login_zai_sp
-if "%choice%"=="6" goto import_bigmodel
-if "%choice%"=="7" goto import_zai
-if "%choice%"=="8" goto status
-if "%choice%"=="9" goto logout
+if "%choice%"=="6" goto import_bigmodel_cp
+if "%choice%"=="7" goto import_zai_cp
+if "%choice%"=="8" goto import_bigmodel_sp
+if "%choice%"=="9" goto import_zai_sp
+if "%choice%"=="a" goto status
+if "%choice%"=="b" goto logout
 if "%choice%"=="0" exit
 goto end
 
@@ -64,17 +68,31 @@ zcode-proxy.exe auth login zai --plan=start-plan
 pause
 goto end
 
-:import_bigmodel
+:import_bigmodel_cp
 echo.
-echo Importing key from ZCode (Bigmodel)...
-zcode-proxy.exe auth login bigmodel --import
+echo Importing key from ZCode (Bigmodel, Coding Plan)...
+zcode-proxy.exe auth login bigmodel --import --plan=coding-plan
 pause
 goto end
 
-:import_zai
+:import_zai_cp
 echo.
-echo Importing key from ZCode (Z.AI)...
-zcode-proxy.exe auth login zai --import
+echo Importing key from ZCode (Z.AI, Coding Plan)...
+zcode-proxy.exe auth login zai --import --plan=coding-plan
+pause
+goto end
+
+:import_bigmodel_sp
+echo.
+echo Importing key from ZCode (Bigmodel, Start Plan)...
+zcode-proxy.exe auth login bigmodel --import --plan=start-plan
+pause
+goto end
+
+:import_zai_sp
+echo.
+echo Importing key from ZCode (Z.AI, Start Plan)...
+zcode-proxy.exe auth login zai --import --plan=start-plan
 pause
 goto end
 

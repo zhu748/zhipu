@@ -10,10 +10,12 @@ echo "  2. OAuth login (Bigmodel) - Coding Plan"
 echo "  3. OAuth login (Z.AI) - Coding Plan"
 echo "  4. OAuth login (Bigmodel) - Start Plan"
 echo "  5. OAuth login (Z.AI) - Start Plan"
-echo "  6. Import key from ZCode (Bigmodel)"
-echo "  7. Import key from ZCode (Z.AI)"
-echo "  8. Check login status"
-echo "  9. Logout"
+echo "  6. Import key from ZCode (Bigmodel) - Coding Plan"
+echo "  7. Import key from ZCode (Z.AI) - Coding Plan"
+echo "  8. Import key from ZCode (Bigmodel) - Start Plan"
+echo "  9. Import key from ZCode (Z.AI) - Start Plan"
+echo "  a. Check login status"
+echo "  b. Logout"
 echo "  0. Exit"
 echo ""
 read -p "Select: " choice
@@ -56,21 +58,33 @@ case $choice in
     ;;
   6)
     echo ""
-    echo "Importing key from ZCode (Bigmodel)..."
+    echo "Importing key from ZCode (Bigmodel, Coding Plan)..."
     echo ""
-    ./zcode-proxy.exe auth login bigmodel --import
+    ./zcode-proxy.exe auth login bigmodel --import --plan=coding-plan
     ;;
   7)
     echo ""
-    echo "Importing key from ZCode (Z.AI)..."
+    echo "Importing key from ZCode (Z.AI, Coding Plan)..."
     echo ""
-    ./zcode-proxy.exe auth login zai --import
+    ./zcode-proxy.exe auth login zai --import --plan=coding-plan
     ;;
   8)
     echo ""
-    ./zcode-proxy.exe auth status
+    echo "Importing key from ZCode (Bigmodel, Start Plan)..."
+    echo ""
+    ./zcode-proxy.exe auth login bigmodel --import --plan=start-plan
     ;;
   9)
+    echo ""
+    echo "Importing key from ZCode (Z.AI, Start Plan)..."
+    echo ""
+    ./zcode-proxy.exe auth login zai --import --plan=start-plan
+    ;;
+  a)
+    echo ""
+    ./zcode-proxy.exe auth status
+    ;;
+  b)
     echo ""
     ./zcode-proxy.exe auth logout
     ;;

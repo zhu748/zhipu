@@ -1,5 +1,9 @@
 # zcode-proxy 使用说明
 
+> **v0.1.3 修复版本**
+> - **修复导入密钥时 plan 默认成 coding-plan 的问题**：start.bat / start.sh 菜单现在拆成 4 个导入选项，明确区分 coding-plan / start-plan，不再静默默认
+> - **CLI 加 hint**：`auth login` 没传 `--plan=` 时会打印提示，避免用户误以为 plan 是机器自动识别的
+>
 > **v0.1.2 修复版本**
 > - **修复导入密钥时 "Failed to decrypt credential store" 报错**：当 `~/.zcode-proxy/credentials.json` 损坏或换机器/换用户名后无法解密时，自动备份旧文件并重新创建，不再阻塞登录
 >

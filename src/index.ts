@@ -191,6 +191,15 @@ async function authLogin(args: string[]): Promise<void> {
     process.exit(1);
   }
 
+  // Warn when plan is not explicitly set — prevents the "why did my start-plan
+  // get imported as coding-plan?" confusion. The default is coding-plan for
+  // backward compat, but the user should be reminded to be explicit.
+  if (!planFlag) {
+    console.log(`[hint] --plan= not specified, defaulting to coding-plan.`);
+    console.log(`[hint] If you meant to use start-plan, re-run with: --plan=start-plan`);
+    console.log();
+  }
+
   console.log(`Logging in: ${provider}${importMode ? " (import)" : " (OAuth)"} [${plan}]\n`);
 
   let cred: Credential;
