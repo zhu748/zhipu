@@ -127,15 +127,43 @@ function defaultLabel(cred: Credential, createdAt: number): string {
 /** Read raw store (migrates v1 if needed). Returns null if file doesn't exist. */
 async function readStore(): Promise<StoreV2 | null> {
   if (!existsSync(STORE_FILE)) return null;
-  const raw = readFileSync(STORE_FILE, "utf-8");
-  const parsed = JSON.parse(raw);
+
+  let raw: string;
+  try {
+    raw = readFileSync(STORE_FILE, "utf-8");
+  } catch {
+    return null;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // File exists but isn't valid JSON — back it up and start fresh.
+    console.warn(`[store] credentials.json is not valid JSON. Backing up and starting fresh.`);
+    backupCorruptedStore(raw);
+    return null;
+  }
 
   // Both v1 and v2 wrap the actual data in an `encrypted` blob.
   // Distinguish by the presence of `version: 2` at the top level.
-  if (parsed && typeof parsed.encrypted === "string") {
-    const json = await decrypt(parsed.encrypted);
+  if (parsed && typeof (parsed as any).encrypted === "string") {
+    let json: string;
+    try {
+      json = await decrypt((parsed as any).encrypted);
+    } catch (err) {
+      // Decryption failed — most common cause is the encryption key changing
+      // (different homedir / username / OS reinstall / file copied from another
+      // machine). Rather than blocking the user from saving new credentials,
+      // back up the unreadable file and treat the store as empty.
+      console.warn(`[store] Failed to decrypt credentials.json: ${(err as Error).message}`);
+      console.warn(`[store] This usually happens after changing username, reinstalling OS, or copying the file from another machine.`);
+      console.warn(`[store] Backing up the unreadable file and starting with an empty store.`);
+      backupCorruptedStore(raw);
+      return null;
+    }
 
-    if (parsed.version === 2) {
+    if ((parsed as any).version === 2) {
       // v2: encrypted blob is the StoreV2 JSON
       return JSON.parse(json) as StoreV2;
     }
@@ -152,11 +180,27 @@ async function readStore(): Promise<StoreV2 | null> {
   }
 
   // Plaintext v2 (used in tests / debugging) — direct parse
-  if (parsed && parsed.version === 2 && Array.isArray(parsed.accounts)) {
+  if (parsed && (parsed as any).version === 2 && Array.isArray((parsed as any).accounts)) {
     return parsed as StoreV2;
   }
 
   return null;
+}
+
+/**
+ * Back up a corrupted / unreadable credentials.json before it gets overwritten.
+ * Writes to `{STORE_FILE}.broken-{timestamp}` so the user can still recover
+ * the original content if needed (e.g. they later remember the old username).
+ */
+function backupCorruptedStore(originalContent: string): void {
+  const backupPath = `${STORE_FILE}.broken-${Date.now()}`;
+  try {
+    writeFileSync(backupPath, originalContent, "utf-8");
+    console.warn(`[store] Unreadable store backed up to: ${backupPath}`);
+  } catch {
+    // Can't even write a backup — nothing more we can do; the next writeStore()
+    // call will still overwrite the broken file with a fresh one.
+  }
 }
 
 async function writeStore(store: StoreV2): Promise<void> {

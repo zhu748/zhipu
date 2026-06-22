@@ -1,5 +1,8 @@
 # zcode-proxy 使用说明
 
+> **v0.1.2 修复版本**
+> - **修复导入密钥时 "Failed to decrypt credential store" 报错**：当 `~/.zcode-proxy/credentials.json` 损坏或换机器/换用户名后无法解密时，自动备份旧文件并重新创建，不再阻塞登录
+>
 > **v0.1.1 修复版本**
 > - **修复 admin 面板 ENOENT 报错**：编译后的 exe 不再因找不到 `dashboard.html` 而崩溃
 > - **修复 start.bat 启动时变成 coding-plan 的问题**：`--config` flag 现在能正确解析
