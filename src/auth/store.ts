@@ -230,7 +230,11 @@ async function readStore(): Promise<StoreV2 | null> {
       return JSON.parse(json) as StoreV2;
     }
 
-    // v1: encrypted blob is a single Credential — migrate to a single-account store
+    // v1: encrypted blob is a single Credential — migrate to a single-account store.
+    // IMPORTANT: persist the migrated v2 form back to disk immediately. Without
+    // this, every readStore() call generates a NEW random id for the migrated
+    // account, so setAccountPlan(id) called after listAccounts(id) would never
+    // find the account (different id on the second read).
     const cred = JSON.parse(json) as Credential;
     const account: StoredAccount = {
       id: genId(),
@@ -238,7 +242,16 @@ async function readStore(): Promise<StoreV2 | null> {
       createdAt: Date.now(),
       credential: cred,
     };
-    return { version: 2, activeId: account.id, accounts: [account] };
+    const migrated: StoreV2 = { version: 2, activeId: account.id, accounts: [account] };
+    try {
+      await writeStore(migrated);
+      console.log(`[store] Migrated v1 credential store to v2 format on disk.`);
+    } catch (e) {
+      // If write fails (e.g. read-only fs), at least return the in-memory copy
+      // so the current request can proceed. Next read will re-migrate.
+      console.warn(`[store] Could not persist v1→v2 migration: ${(e as Error).message}`);
+    }
+    return migrated;
   }
 
   // Plaintext v2 (used in tests / debugging) — direct parse
@@ -368,9 +381,26 @@ export async function listAccounts(): Promise<{
       userId: a.credential.userId,
       expiresAt: a.credential.expiresAt,
       hasJwt: !!a.credential.jwt,
-      plan: a.credential.plan || "coding-plan",
+      // Display plan: explicit field wins; otherwise infer from JWT presence
+      // (v1 credentials from zcode-api-ref have no plan field but carry a
+      // start-plan JWT). Falls back to coding-plan only when neither signal
+      // is present. This keeps the dashboard dropdown in sync with what
+      // serve() will actually do at startup.
+      plan: inferPlan(a.credential),
     })),
   };
+}
+
+/**
+ * Resolve a credential's plan for display/serving purposes.
+ *   1. Explicit cred.plan wins (v0.1.4+ imports, dashboard edits)
+ *   2. JWT presence → start-plan (v1 zcode-api-ref credentials)
+ *   3. Default coding-plan
+ */
+function inferPlan(cred: Credential): "coding-plan" | "start-plan" {
+  if (cred.plan === "start-plan" || cred.plan === "coding-plan") return cred.plan;
+  if (cred.jwt) return "start-plan";
+  return "coding-plan";
 }
 
 /** Switch the active credential by account id. */

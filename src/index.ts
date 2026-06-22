@@ -137,7 +137,7 @@ async function serve(configPath?: string): Promise<void> {
     // because the credential determines which upstream URL and auth headers
     // we use — sending a start-plan JWT to a coding-plan endpoint would
     // fail with 401, and a coding-plan API key to zcode.z.ai would fail too.
-    let effectivePlan: PlanId | undefined;
+    let effectivePlan: PlanId;
     let planSource: string;
     if (cred.plan) {
       effectivePlan = cred.plan;
@@ -146,15 +146,21 @@ async function serve(configPath?: string): Promise<void> {
       effectivePlan = "start-plan";
       planSource = `inferred from JWT presence (v1 credential, no plan field)`;
     } else {
-      effectivePlan = undefined; // fall through to config.yaml
-      planSource = `config.yaml (no plan on credential, no JWT)`;
+      // No plan on credential, no JWT — use config.yaml verbatim.
+      // Don't change config.plan; just log the source.
+      console.log(`  Using plan from config.yaml: ${config.plan}`);
+      effectivePlan = config.plan;
+      planSource = ""; // unused
     }
 
-    if (effectivePlan && effectivePlan !== config.plan) {
-      console.log(`  Overriding plan: ${config.plan} → ${effectivePlan} (source: ${planSource})`);
-      config.plan = effectivePlan;
-    } else if (!effectivePlan) {
-      console.log(`  Using plan from config.yaml: ${config.plan}`);
+    if (cred.plan || cred.jwt) {
+      // We inferred/overrode the plan from the credential
+      if (effectivePlan !== config.plan) {
+        console.log(`  Overriding plan: ${config.plan} → ${effectivePlan} (source: ${planSource})`);
+        config.plan = effectivePlan;
+      } else {
+        console.log(`  Plan: ${effectivePlan} (source: ${planSource})`);
+      }
     }
   }
 

@@ -1,5 +1,10 @@
 # zcode-proxy 使用说明
 
+> **v0.1.7 修复版本**
+> - **修复 v1 凭证无法在 dashboard 修改 plan 的 bug**：v1 凭证（来自 zcode-api-ref）首次加载时自动迁移为 v2 格式并持久化，避免每次读取都生成新 ID 导致 setAccountPlan 找不到账号
+> - **dashboard 修改 plan 后立即生效**：内存里的凭证热替换，无需重启
+> - **dashboard 显示正确的推断 plan**：v1 凭证 + 有 JWT 时显示 "Start Plan"，不再误显示为 "Coding Plan"
+>
 > **v0.1.6 修复版本**
 > - **v1 凭证（来自 zcode-api-ref）自动推断 plan**：加载无 plan 字段的 v1 凭证时，如果带 JWT 则自动推断为 start-plan，否则跟随 config.yaml
 > - **启动日志显示 plan 来源**：清晰说明 plan 是来自凭证显式字段、JWT 推断、还是 config.yaml

@@ -268,24 +268,32 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       }
       const ok = await setAccountPlan(body.id, body.plan);
       if (!ok) return errorResponse(404, "not_found", "Account not found");
-      // If the updated account is currently active, sync config.plan AND
-      // persist to yaml so the change survives restart.
+
+      // If the updated account is the currently active one, hot-swap the
+      // in-memory credential so running requests immediately use the new
+      // plan. Without this, the proxy would keep using the old plan until
+      // restart — defeating the purpose of the dashboard edit.
       const cred = await loadCredential();
       let planSynced = false;
-      if (cred && cred.plan && cred.plan !== opts.config.plan) {
-        opts.config.plan = cred.plan;
-        planSynced = true;
-        appendLog("info", `Plan synced to ${cred.plan} (from account ${body.id})`);
+      if (cred) {
+        opts.auth.setOAuthCredential(cred);
+        if (cred.plan && cred.plan !== opts.config.plan) {
+          opts.config.plan = cred.plan;
+          planSynced = true;
+          appendLog("info", `Plan synced to ${cred.plan} (from account ${body.id})`);
+        }
       }
       appendLog("info", `Account ${body.id} plan changed to ${body.plan}`);
-      if (planSynced) {
-        try {
-          const yaml = configToYaml(opts.config);
-          await writeFile(opts.configPath, yaml, "utf-8");
-          appendLog("info", `Persisted plan=${opts.config.plan} to ${opts.configPath}`);
-        } catch (e) {
-          appendLog("error", `Failed to persist plan to config: ${(e as Error).message}`);
-        }
+      // Persist the (possibly updated) plan to yaml so restart keeps it.
+      // Always write — even if plan matches config, the dashboard edit is
+      // an explicit user action worth persisting (in case config.yaml had
+      // been manually edited out of band).
+      try {
+        const yaml = configToYaml(opts.config);
+        await writeFile(opts.configPath, yaml, "utf-8");
+        appendLog("info", `Persisted plan=${opts.config.plan} to ${opts.configPath}`);
+      } catch (e) {
+        appendLog("error", `Failed to persist plan to config: ${(e as Error).message}`);
       }
       return jsonResp({ ok: true, plan: body.plan });
     } catch (err) {
