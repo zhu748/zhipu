@@ -12,7 +12,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createCipheriv, createDecipheriv, createHash } from "node:crypto";
 import type { Credential } from "./types.js";
 
 const STORE_DIR = join(homedir(), ".zcode-proxy");
@@ -38,67 +38,77 @@ interface StoreV2 {
 }
 
 // ---------------------------------------------------------------------------
-// Encryption (AES-GCM with machine-derived key, identical to v1)
+// Encryption (AES-256-GCM via Node.js crypto — compatible with all platforms)
 // ---------------------------------------------------------------------------
 
 /**
- * Derive an encryption key from a machine-specific seed.
- * Uses SHA-256 for proper key derivation instead of the previous XOR-based
- * approach which produced weak keys (many zero bytes with short seeds).
+ * Derive a 256-bit encryption key from a machine-specific seed using SHA-256.
+ * Same key derivation as before, but uses Node's crypto instead of WebCrypto
+ * to avoid OperationError on Windows compiled binaries.
  */
-async function getEncryptionKey(): Promise<ArrayBuffer> {
+function getEncryptionKeyBuffer(): Buffer {
   const seed = process.env[ENV_SECRET] ?? `${homedir()}-${process.platform}-${process.arch}`;
-  const encoder = new TextEncoder();
-  const seedBytes = encoder.encode(seed);
-  return await crypto.subtle.digest("SHA-256", seedBytes);
+  return createHash("sha256").update(seed).digest();
 }
 
+/**
+ * Encrypt plaintext using AES-256-GCM (Node.js crypto).
+ * Output format: base64( IV[16] + AUTH_TAG[16] + CIPHERTEXT )
+ */
 async function encrypt(plaintext: string): Promise<string> {
-  const keyBytes = await getEncryptionKey();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    keyBytes,
-    { name: "AES-GCM" },
-    false,
-    ["encrypt", "decrypt"],
-  );
-
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoder = new TextEncoder();
-  const encrypted = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    key,
-    encoder.encode(plaintext),
-  );
-
-  const combined = new Uint8Array(iv.length + encrypted.byteLength);
-  combined.set(iv, 0);
-  combined.set(new Uint8Array(encrypted), iv.length);
-
-  return Buffer.from(combined).toString("base64");
+  const key = getEncryptionKeyBuffer();
+  const iv = randomBytes(16);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, encrypted]).toString("base64");
 }
 
+/**
+ * Decrypt ciphertext. Tries the new Node.js crypto format first,
+ * then falls back to the legacy WebCrypto format (IV[12] + encrypted+tag)
+ * for stores created by older versions.
+ */
 async function decrypt(ciphertext: string): Promise<string> {
-  const keyBytes = await getEncryptionKey();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    keyBytes,
-    { name: "AES-GCM" },
-    false,
-    ["encrypt", "decrypt"],
-  );
+  const key = getEncryptionKeyBuffer();
+  const data = Buffer.from(ciphertext, "base64");
 
-  const combined = Buffer.from(ciphertext, "base64");
-  const iv = combined.slice(0, 12);
-  const data = combined.slice(12);
+  // --- Try new format: IV[16] + AUTH_TAG[16] + CIPHERTEXT ---
+  if (data.length >= 32) {
+    try {
+      const iv = data.subarray(0, 16);
+      const tag = data.subarray(16, 32);
+      const encrypted = data.subarray(32);
+      const decipher = createDecipheriv("aes-256-gcm", key, iv);
+      decipher.setAuthTag(tag);
+      return decipher.update(encrypted, undefined, "utf8") + decipher.final("utf8");
+    } catch {
+      // Not new format, try legacy below
+    }
+  }
 
-  const decrypted = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv },
-    key,
-    data,
-  );
+  // --- Fallback: legacy WebCrypto format: IV[12] + (encrypted + tag appended) ---
+  try {
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      new Uint8Array(key),
+      { name: "AES-GCM" },
+      false,
+      ["decrypt"],
+    );
+    const iv = new Uint8Array(data.subarray(0, 12));
+    const encrypted = new Uint8Array(data.subarray(12));
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv },
+      cryptoKey,
+      encrypted,
+    );
+    return new TextDecoder().decode(decrypted);
+  } catch {
+    // Legacy format also failed
+  }
 
-  return new TextDecoder().decode(decrypted);
+  throw new Error("Failed to decrypt credential store (tried both current and legacy formats)");
 }
 
 // ---------------------------------------------------------------------------
