@@ -1,5 +1,9 @@
 # zcode-proxy 使用说明
 
+> **v0.1.6 修复版本**
+> - **v1 凭证（来自 zcode-api-ref）自动推断 plan**：加载无 plan 字段的 v1 凭证时，如果带 JWT 则自动推断为 start-plan，否则跟随 config.yaml
+> - **启动日志显示 plan 来源**：清晰说明 plan 是来自凭证显式字段、JWT 推断、还是 config.yaml
+>
 > **v0.1.5 修复版本**
 > - **跨项目凭证互通**：zhipu 现在能直接读取 zcode-api-ref (TriDefender/zcode-api) 创建的 `credentials.json`，无需重新登录
 > - **解密 fallback 链扩充**：依次尝试 (1) 当前 SHA-256/Node-crypto 格式 → (2) 早期 SHA-256/WebCrypto 格式 → (3) zcode-api-ref 的 XOR-fold/WebCrypto 格式

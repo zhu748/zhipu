@@ -125,16 +125,36 @@ async function serve(configPath?: string): Promise<void> {
       );
     }
     auth.setOAuthCredential(cred);
-    // Sync plan from the stored credential if it has an explicit plan.
-    // The credential's plan wins over config.yaml because the credential
-    // determines which upstream URL and auth headers we use — sending
-    // start-plan JWT to a coding-plan endpoint (or vice versa) would fail.
-    // If the user wants to change plan, they should switch accounts in
-    // the dashboard (each account carries its own plan).
-    if (cred.plan && cred.plan !== config.plan) {
-      console.log(`  Overriding plan from credential: ${config.plan} → ${cred.plan}`);
-      console.log(`  (Account "${cred.provider}" is a ${cred.plan} credential.)`);
-      config.plan = cred.plan;
+    // Resolve the effective plan from the credential. Priority:
+    //   1. cred.plan — explicit (set by v0.1.4+ import or dashboard)
+    //   2. inferred from cred.jwt — if a JWT is present, the credential
+    //      came from start-plan flow (JWTs are start-plan exclusive).
+    //      This handles v1 imports from zcode-api-ref which have no plan
+    //      field but DO carry a start-plan JWT.
+    //   3. config.yaml's plan — final fallback (default coding-plan)
+    //
+    // The credential's plan (explicit or inferred) wins over config.yaml
+    // because the credential determines which upstream URL and auth headers
+    // we use — sending a start-plan JWT to a coding-plan endpoint would
+    // fail with 401, and a coding-plan API key to zcode.z.ai would fail too.
+    let effectivePlan: PlanId | undefined;
+    let planSource: string;
+    if (cred.plan) {
+      effectivePlan = cred.plan;
+      planSource = `explicit on credential`;
+    } else if (cred.jwt) {
+      effectivePlan = "start-plan";
+      planSource = `inferred from JWT presence (v1 credential, no plan field)`;
+    } else {
+      effectivePlan = undefined; // fall through to config.yaml
+      planSource = `config.yaml (no plan on credential, no JWT)`;
+    }
+
+    if (effectivePlan && effectivePlan !== config.plan) {
+      console.log(`  Overriding plan: ${config.plan} → ${effectivePlan} (source: ${planSource})`);
+      config.plan = effectivePlan;
+    } else if (!effectivePlan) {
+      console.log(`  Using plan from config.yaml: ${config.plan}`);
     }
   }
 
