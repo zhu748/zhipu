@@ -1,4 +1,4 @@
-import type { Credential } from "./types.js";
+import type { Credential, PlanId } from "./types.js";
 import type { ProviderId } from "../provider/types.js";
 import type { FetchFn } from "./oauth.js";
 
@@ -122,6 +122,7 @@ export class KeyResolver {
     accessToken: string,
     provider: ProviderId,
     userId?: string,
+    plan: PlanId = "coding-plan",
   ): Promise<Credential> {
     if (provider === "zai") {
       const bizToken = await this.resolveZaiBizToken(accessToken);
@@ -135,7 +136,7 @@ export class KeyResolver {
         secret = await this.getSecretKey(host, authorization, orgId, projectId, apiKey);
       } catch { /* credential will be apiKey-only */ }
 
-      return { apiKey, secret: secret || undefined, provider: "zai", userId };
+      return { apiKey, secret: secret || undefined, provider: "zai", plan, userId };
     }
 
     const host = "https://bigmodel.cn";
@@ -150,6 +151,6 @@ export class KeyResolver {
       if (secret) fullKey = `${apiKey}.${secret}`;
     } catch { /* use apiKey only */ }
 
-    return { apiKey: fullKey, provider: "bigmodel", userId };
+    return { apiKey: fullKey, provider: "bigmodel", plan, userId };
   }
 }

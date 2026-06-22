@@ -45,6 +45,9 @@ export function translateRequestOpenAIToAnthropic(req: OpenAIChatRequest): Anthr
   if (req.tools?.length) {
     result.tools = req.tools.map(translateToolOpenAIToAnthropic);
   }
+  if (req.tool_choice) {
+    result.tool_choice = translateToolChoiceOpenAIToAnthropic(req.tool_choice);
+  }
 
   return result;
 }
@@ -122,6 +125,29 @@ function translateToolOpenAIToAnthropic(tool: OpenAIToolDefinition): AnthropicTo
     ...(tool.function.description ? { description: tool.function.description } : {}),
     ...(tool.function.parameters ? { input_schema: tool.function.parameters } : {}),
   };
+}
+
+/**
+ * Translate OpenAI tool_choice to Anthropic tool_choice format.
+ * OpenAI: "none" | "auto" | "required" | { type: "function", function: { name: string } }
+ * Anthropic: { type: "auto" | "any" | "tool", name?: string }
+ */
+function translateToolChoiceOpenAIToAnthropic(
+  toolChoice: string | { type: "function"; function: { name: string } },
+): { type: "auto" | "any" | "tool"; name?: string } {
+  if (typeof toolChoice === "string") {
+    switch (toolChoice) {
+      case "none": return { type: "any" }; // Anthropic has no "none"; "any" with empty tools effectively disables
+      case "required": return { type: "any" };
+      case "auto":
+      default: return { type: "auto" };
+    }
+  }
+  // Object form: { type: "function", function: { name: "..." } }
+  if (toolChoice.type === "function" && toolChoice.function?.name) {
+    return { type: "tool", name: toolChoice.function.name };
+  }
+  return { type: "auto" };
 }
 
 function mapStopReasonToFinishReason(

@@ -189,7 +189,7 @@ tr:hover td{background:var(--surface2)}
         <h3>Stored Accounts <span class="tag">Multi-account</span></h3>
         <p style="font-size:13px;color:var(--text2);margin-bottom:12px">All credentials saved via OAuth or manual entry. Click <strong>Activate</strong> to switch the active account.</p>
         <table>
-          <thead><tr><th>Label</th><th>Provider</th><th>API Key</th><th>Created</th><th>Status</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Label</th><th>Provider</th><th>Plan</th><th>API Key</th><th>Created</th><th>Status</th><th>Actions</th></tr></thead>
           <tbody id="accountsList"><tr><td colspan="6" class="empty-state">Loading...</td></tr></tbody>
         </table>
       </div>
@@ -197,14 +197,18 @@ tr:hover td{background:var(--surface2)}
         <h3>Add API Key</h3>
         <div class="form-row">
           <div class="form-group"><label>Provider</label><select id="addKeyProvider"><option value="zai">Z.AI (apiKey.secretKey)</option><option value="bigmodel">Bigmodel (apiKey)</option></select></div>
-          <div class="form-group"><label>API Key</label><input id="addKeyValue" placeholder="Enter API key"></div>
+          <div class="form-group"><label>Plan</label><select id="addKeyPlan"><option value="coding-plan">Coding Plan</option><option value="start-plan">Start Plan</option></select></div>
         </div>
+        <div class="form-group"><label>API Key</label><input id="addKeyValue" placeholder="Enter API key"></div>
         <div class="actions"><button class="btn btn-primary" onclick="addApiKey()">Add Key</button></div>
       </div>
       <div class="card">
         <h3>Import from ZCode</h3>
         <p style="font-size:13px;color:var(--text2);margin-bottom:12px">Import API key from ~/.zcode/v2/config.json</p>
-        <div class="form-group"><label>Provider</label><select id="importProvider"><option value="bigmodel">Bigmodel</option><option value="zai">Z.AI</option></select></div>
+        <div class="form-row">
+          <div class="form-group"><label>Provider</label><select id="importProvider"><option value="bigmodel">Bigmodel</option><option value="zai">Z.AI</option></select></div>
+          <div class="form-group"><label>Plan</label><select id="importPlan"><option value="coding-plan">Coding Plan</option><option value="start-plan">Start Plan</option></select></div>
+        </div>
         <div class="actions"><button class="btn btn-primary" onclick="importKey()">Import Key</button></div>
       </div>
     </div>
@@ -217,6 +221,7 @@ tr:hover td{background:var(--surface2)}
         <h3>OAuth Login</h3>
         <div class="form-row">
           <div class="form-group"><label>Provider</label><select id="oauthProvider"><option value="bigmodel">Bigmodel</option><option value="zai">Z.AI</option></select></div>
+          <div class="form-group"><label>Plan</label><select id="oauthPlan"><option value="coding-plan">Coding Plan</option><option value="start-plan">Start Plan</option></select></div>
           <div class="form-group" style="display:flex;align-items:flex-end"><button class="btn btn-primary" onclick="startOAuth()">Start OAuth Login</button></div>
         </div>
         <div id="oauthFlowStatus" style="margin-top:12px;display:none">
@@ -340,6 +345,18 @@ document.getElementById('loginKey').addEventListener('keydown',e=>{if(e.key==='E
 // Auto-login on page load if a token was previously stored
 (async function autoLogin(){
   try{
+    // First check if proxy requires authentication
+    const testR=await fetch(API+'/admin/api/verify');
+    if(testR.ok){
+      const d=await testR.json().catch(()=>({}));
+      if(d.valid){
+        // No auth required — skip login
+        document.getElementById('loginWrap').style.display='none';
+        document.getElementById('app').style.display='flex';
+        initDashboard();
+        return;
+      }
+    }
     const saved=localStorage.getItem('zcodeProxyAuth');
     if(!saved)return;
     const r=await fetch(API+'/admin/api/verify',{headers:{'Authorization':'Bearer '+saved}});
@@ -398,15 +415,17 @@ async function loadOverview(){
       ?'<span class="badge badge-success">Healthy</span> Provider: '+c.provider
       :'<span class="badge badge-danger">Unhealthy</span>';
   }catch(e){console.error('loadOverview failed:',e);document.getElementById('healthInfo').innerHTML='<span class="badge badge-danger">Load failed</span>'}
-  updateUptime();
-  setInterval(updateUptime,1000);
+  loadUptimeFromServer();
+  setInterval(loadUptimeFromServer,1000);
 }
-function updateUptime(){
-  const el=document.getElementById('statUptime');
-  if(!el.dataset.start)el.dataset.start=Date.now();
-  const s=Math.floor((Date.now()-+el.dataset.start)/1000);
-  const h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;
-  el.textContent=`${h}h${String(m).padStart(2,'0')}m${String(ss).padStart(2,'0')}s`;
+async function loadUptimeFromServer(){
+  try{
+    const r=await fetch(API+'/admin/api/stats',{headers:authHeaders()});
+    const d=await r.json();
+    const s=Math.floor((d.uptime||0)/1000);
+    const h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;
+    document.getElementById('statUptime').textContent=`${h}h${String(m).padStart(2,'0')}m${String(ss).padStart(2,'0')}s`;
+  }catch{}
 }
 
 // --- Settings ---
@@ -439,17 +458,22 @@ async function saveSettings(){
     server:{port:+document.getElementById('cfgPort').value,host:document.getElementById('cfgHost').value},
     provider:document.getElementById('cfgProvider').value,
     plan:document.getElementById('cfgPlan').value,
-    auth:{mode:document.getElementById('cfgAuthMode').value,apiKey:document.getElementById('cfgApiKey').value,proxyApiKey:document.getElementById('cfgProxyApiKey').value},
+    auth:{mode:document.getElementById('cfgAuthMode').value},
     defaultModel:document.getElementById('cfgDefaultModel').value,
     models:document.getElementById('cfgModels').value.split('\n').map(s=>s.trim()).filter(Boolean),
     retry:{maxRetries:+document.getElementById('cfgRetryMax').value,initialDelayMs:+document.getElementById('cfgRetryDelay').value,maxDelayMs:+document.getElementById('cfgRetryMaxDelay').value,backoffFactor:+document.getElementById('cfgRetryBackoff').value,retryableStatuses:document.getElementById('cfgRetryStatuses').value.split(',').map(s=>parseInt(s.trim())).filter(n=>n>0)},
     identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
     logging:{level:document.getElementById('cfgLogLevel').value}
   };
+  // Only include apiKey/proxyApiKey if the user explicitly typed a new value
+  const apiKey=document.getElementById('cfgApiKey').value;
+  const proxyApiKey=document.getElementById('cfgProxyApiKey').value;
+  if(apiKey&&apiKey!=='***configured***')cfg.auth.apiKey=apiKey;
+  if(proxyApiKey&&proxyApiKey!=='***configured***')cfg.auth.proxyApiKey=proxyApiKey;
   try{
     const r=await fetch(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify(cfg)});
     if(r.ok)toast('Settings saved (restart required for some changes)','success');
-    else toast('Save failed','error');
+    else{const d=await r.json().catch(()=>({}));toast(d.message||'Save failed','error')}
   }catch{toast('Save failed','error')}
 }
 
@@ -464,6 +488,7 @@ async function loadAccountInfo(){
         <div style="display:grid;grid-template-columns:120px 1fr;gap:8px;font-size:13px">
           <span style="color:var(--text2)">Provider</span><span>${c.provider}</span>
           <span style="color:var(--text2)">API Key</span><span style="font-family:monospace">${c.apiKeyMask}</span>
+          <span style="color:var(--text2)">Plan</span><span>${c.plan==='start-plan'?'<span class="badge badge-warn">Start Plan</span>':'<span class="badge badge-success">Coding Plan</span>'}</span>
           <span style="color:var(--text2)">Auth Mode</span><span>${c.mode||'apikey'}</span>
           <span style="color:var(--text2)">Has Secret</span><span>${c.hasSecret?'<span class="badge badge-success">Yes</span>':'<span class="badge badge-warn">No</span>'}</span>
           ${c.userId?`<span style="color:var(--text2)">User ID</span><span>${c.userId}</span>`:''}
@@ -476,18 +501,20 @@ async function loadAccountInfo(){
 }
 async function addApiKey(){
   const provider=document.getElementById('addKeyProvider').value;
+  const plan=document.getElementById('addKeyPlan').value;
   const key=document.getElementById('addKeyValue').value.trim();
   if(!key)return toast('Enter API key','error');
   try{
-    const r=await fetch(API+'/admin/api/credentials',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,apiKey:key})});
-    if(r.ok){toast('API key added','success');loadAccountInfo();loadAccountsList();loadCredStore()}
+    const r=await fetch(API+'/admin/api/credentials',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,apiKey:key,plan})});
+    if(r.ok){toast('API key added ('+plan+')','success');loadAccountInfo();loadAccountsList();loadCredStore()}
     else toast('Failed to add key','error');
   }catch(e){console.error('addApiKey failed:',e);toast('Failed to add key','error')}
 }
 async function importKey(){
   const provider=document.getElementById('importProvider').value;
+  const plan=document.getElementById('importPlan').value;
   try{
-    const r=await fetch(API+'/admin/api/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider})});
+    const r=await fetch(API+'/admin/api/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,plan})});
     const d=await r.json();
     if(r.ok){toast('Key imported: '+d.apiKeyMask,'success');loadAccountInfo();loadAccountsList();loadCredStore()}
     else toast(d.error||'Import failed','error');
@@ -504,15 +531,17 @@ async function loadAccountsList(){
     const accounts=d.accounts||[];
     const activeId=d.activeId;
     if(!accounts.length){
-      tb.innerHTML='<tr><td colspan="6" class="empty-state">No stored accounts. Use OAuth or "Add API Key" to create one.</td></tr>';
+      tb.innerHTML='<tr><td colspan="7" class="empty-state">No stored accounts. Use OAuth or "Add API Key" to create one.</td></tr>';
       return;
     }
     tb.innerHTML=accounts.map(a=>{
       const isActive=a.id===activeId;
       const created=new Date(a.createdAt).toLocaleString();
+      const planBadge=a.plan==='start-plan'?'<span class="badge badge-warn">Start</span>':'<span class="badge badge-success">Coding</span>';
       return `<tr>
         <td><input value="${escapeHtml(a.label)}" onchange="renameAccount('${a.id}',this.value)" style="width:100%;padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px"></td>
         <td>${a.provider}</td>
+        <td>${planBadge}</td>
         <td style="font-family:monospace;font-size:12px">${a.apiKeyMask}${a.hasSecret?' <span class="badge badge-success">secret</span>':''}${a.hasJwt?' <span class="badge badge-success">jwt</span>':''}</td>
         <td style="font-size:12px;color:var(--text2)">${created}</td>
         <td>${isActive?'<span class="badge badge-success">Active</span>':'<span class="badge badge-warn">Inactive</span>'}</td>
@@ -524,7 +553,7 @@ async function loadAccountsList(){
     }).join('');
   }catch(e){
     console.error('loadAccountsList failed:',e);
-    tb.innerHTML='<tr><td colspan="6" class="empty-state" style="color:var(--danger)">Failed to load accounts</td></tr>';
+    tb.innerHTML='<tr><td colspan="7" class="empty-state" style="color:var(--danger)">Failed to load accounts</td></tr>';
   }
 }
 async function activateAccount(id){
@@ -552,8 +581,9 @@ async function deleteAccount(id,label){
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 
 // --- OAuth ---
-let currentFlowId=null;
+let currentFlowId=sessionStorage.getItem('zcodeOAuthFlowId')||null;
 let oauthExpiryTimer=null;
+let oauthExpiresAt=0;
 async function loadCredStore(){
   try{
     const r=await fetch(API+'/admin/api/credentials',{headers:authHeaders()});
@@ -565,37 +595,40 @@ async function loadCredStore(){
 }
 async function startOAuth(){
   const provider=document.getElementById('oauthProvider').value;
+  const plan=document.getElementById('oauthPlan').value;
   document.getElementById('oauthFlowStatus').style.display='block';
   document.getElementById('oauthDot').className='oauth-dot off';
   document.getElementById('oauthStatusText').textContent='Initializing...';
   document.getElementById('oauthUrlBox').style.display='none';
   document.getElementById('callbackResult').style.display='none';
   try{
-    const r=await fetch(API+'/admin/api/oauth/init',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider})});
+    const r=await fetch(API+'/admin/api/oauth/init',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,plan})});
     const d=await r.json();
     if(!r.ok)throw new Error(d.error||'Init failed');
     currentFlowId=d.flowId;
+    sessionStorage.setItem('zcodeOAuthFlowId',d.flowId);
     document.getElementById('oauthDot').className='oauth-dot on';
     document.getElementById('oauthStatusText').textContent='Waiting for authorization...';
     document.getElementById('oauthUrlBox').style.display='block';
     document.getElementById('oauthUrl').value=d.authorizeUrl;
+    // Use actual expiry from server if available (expiresAt in ms)
+    oauthExpiresAt=d.expiresAt||0;
     startOauthCountdown();
     pollOAuth(d.flowId);
   }catch(e){toast(e.message,'error');document.getElementById('oauthStatusText').textContent='Failed: '+e.message}
 }
 function startOauthCountdown(){
   if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
-  // OAuth flows expire after 5 minutes (300s)
-  let remaining=300;
   const update=()=>{
-    if(remaining<=0){
+    const remainingMs=oauthExpiresAt?oauthExpiresAt-Date.now():0;
+    if(remainingMs<=0){
       document.getElementById('oauthCountdown').textContent='expired';
       clearInterval(oauthExpiryTimer);
       return;
     }
-    const m=Math.floor(remaining/60),s=remaining%60;
-    document.getElementById('oauthCountdown').textContent=`${m}:${String(s).padStart(2,'0')}`;
-    remaining--;
+    const s=Math.floor(remainingMs/1000);
+    const m=Math.floor(s/60),ss=s%60;
+    document.getElementById('oauthCountdown').textContent=`${m}:${String(ss).padStart(2,'0')}`;
   };
   update();
   oauthExpiryTimer=setInterval(update,1000);
@@ -613,6 +646,7 @@ async function pollOAuth(flowId){
         if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
         toast('OAuth login successful','success');
         currentFlowId=null;
+        sessionStorage.removeItem('zcodeOAuthFlowId');
         loadAccountInfo();loadCredStore();
         return;
       }

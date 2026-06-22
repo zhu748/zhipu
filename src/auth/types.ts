@@ -8,6 +8,9 @@ import type { ProviderId } from "../provider/types.js";
 /** How the proxy obtains the upstream credential. */
 export type AuthMode = "apikey" | "oauth";
 
+/** Plan tier the credential is associated with. */
+export type PlanId = "coding-plan" | "start-plan";
+
 /** A resolved credential ready to be injected into upstream requests. */
 export interface Credential {
   /** The API key portion (e.g. Z.AI API key id, or Bigmodel API key). */
@@ -16,6 +19,8 @@ export interface Credential {
   secret?: string;
   /** Which provider this credential is for. */
   provider: ProviderId;
+  /** Which plan tier this credential is for. Determines upstream URL and auth headers. Defaults to "coding-plan" for backward compatibility. */
+  plan?: PlanId;
   /** Unix timestamp (ms) when the credential expires. Present only for OAuth. */
   expiresAt?: number;
   /** Upstream user identifier (OAuth only). Injected as `metadata.user_id` on Anthropic-format requests. */

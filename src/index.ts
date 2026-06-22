@@ -9,7 +9,7 @@ import { startServer } from "./server/server.js";
 import { loadCredential, saveCredential, clearCredential, getStorePath } from "./auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "./auth/oauth.js";
 import { KeyResolver } from "./auth/resolver.js";
-import type { Credential } from "./auth/types.js";
+import type { Credential, PlanId } from "./auth/types.js";
 import type { ProviderId } from "./provider/types.js";
 import { spawn } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
@@ -84,6 +84,11 @@ async function serve(configPath?: string): Promise<void> {
       process.exit(1);
     }
     auth.setOAuthCredential(cred);
+    // Sync plan from the stored credential if it has an explicit plan
+    if (cred.plan && cred.plan !== config.plan) {
+      console.log(`  Overriding plan from credential: ${config.plan} → ${cred.plan}`);
+      config.plan = cred.plan;
+    }
   }
 
   // Intercept console.log for admin dashboard log streaming.
@@ -137,30 +142,33 @@ function authCommand(args: string[]): void {
 async function authLogin(args: string[]): Promise<void> {
   const provider = args[0] as ProviderId | undefined;
   const importMode = args.includes("--import");
+  const planFlag = args.find(a => a.startsWith("--plan="));
+  const plan: PlanId = planFlag === "--plan=start-plan" ? "start-plan" : "coding-plan";
 
   if (!provider || (provider !== "zai" && provider !== "bigmodel")) {
-    console.error("Usage: zcode-proxy auth login <zai|bigmodel> [--import]");
+    console.error("Usage: zcode-proxy auth login <zai|bigmodel> [--import] [--plan=coding-plan|start-plan]");
     process.exit(1);
   }
 
-  console.log(`Logging in: ${provider}${importMode ? " (import)" : " (OAuth)"}\n`);
+  console.log(`Logging in: ${provider}${importMode ? " (import)" : " (OAuth)"} [${plan}]\n`);
 
   let cred: Credential;
 
   if (importMode) {
-    cred = importFromZCodeConfig(provider);
+    cred = importFromZCodeConfig(provider, plan);
   } else {
     const { accessToken, userId, jwt } = await runOAuth(provider);
     console.log("\nResolving API key...");
     const resolver = new KeyResolver();
-    cred = await resolver.resolveCodingPlanCredential(accessToken, provider, userId);
+    cred = await resolver.resolveCodingPlanCredential(accessToken, provider, userId, plan);
     if (jwt) cred.jwt = jwt;
   }
 
   await saveCredential(cred);
-  console.log(`\nLogged in as ${provider}.`);
+  console.log(`\nLogged in as ${provider} (${plan}).`);
   console.log(`  API Key: ${cred.apiKey.substring(0, 12)}...`);
   if (cred.userId) console.log(`  User ID: ${cred.userId}`);
+  console.log(`  Plan:    ${cred.plan}`);
   console.log(`  Stored:  ${getStorePath()}`);
 }
 
@@ -210,7 +218,7 @@ async function runOAuth(provider: ProviderId): Promise<{ accessToken: string; us
   return { accessToken: result.accessToken, userId: result.userId, jwt: result.jwt };
 }
 
-function importFromZCodeConfig(provider: ProviderId): Credential {
+function importFromZCodeConfig(provider: ProviderId, plan: PlanId = "coding-plan"): Credential {
   const configPath = join(homedir(), ".zcode", "v2", "config.json");
   let raw: string;
   try {
@@ -237,9 +245,9 @@ function importFromZCodeConfig(provider: ProviderId): Credential {
   const startPlanKey = `builtin:${provider}-start-plan`;
   const jwt = config.provider?.[startPlanKey]?.options?.apiKey?.trim() || undefined;
 
-  console.log(`Imported from ${configPath}`);
+  console.log(`Imported from ${configPath} (${plan})`);
   if (jwt) console.log(`  Start-plan JWT: ${jwt.slice(0, 12)}...`);
-  return { apiKey, provider, jwt };
+  return { apiKey, provider, plan, jwt };
 }
 
 function openBrowser(url: string): void {

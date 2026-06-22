@@ -488,7 +488,7 @@ describe("proxyRequest — OpenAI translation mode (coding-plan)", () => {
     expect(resp.headers.get("content-encoding")).toBeNull();
   });
 
-  it("returns 400 translation_failed when OpenAI request body is malformed JSON", async () => {
+  it("returns 400 invalid_json when OpenAI request body is malformed JSON", async () => {
     const fetchMock = mock(async (): Promise<Response> => new Response("ok"));
     const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "testkey.testsecret" });
     const clientReq = makeOpenAIReq("not json");
@@ -497,7 +497,7 @@ describe("proxyRequest — OpenAI translation mode (coding-plan)", () => {
     expect(resp.status).toBe(400);
     expect(fetchMock).not.toHaveBeenCalled();
     const body = await resp.json();
-    expect(body.error.type).toBe("translation_failed");
+    expect(body.error.type).toBe("invalid_json");
   });
 
   it("returns 502 translation_failed when upstream returns non-JSON in translation mode", async () => {

@@ -41,22 +41,23 @@ interface StoreV2 {
 // Encryption (AES-GCM with machine-derived key, identical to v1)
 // ---------------------------------------------------------------------------
 
-function getEncryptionKey() {
-  const hash = new Uint8Array(new ArrayBuffer(32));
-  const encoder = new TextEncoder();
-
+/**
+ * Derive an encryption key from a machine-specific seed.
+ * Uses SHA-256 for proper key derivation instead of the previous XOR-based
+ * approach which produced weak keys (many zero bytes with short seeds).
+ */
+async function getEncryptionKey(): Promise<ArrayBuffer> {
   const seed = process.env[ENV_SECRET] ?? `${homedir()}-${process.platform}-${process.arch}`;
+  const encoder = new TextEncoder();
   const seedBytes = encoder.encode(seed);
-  for (let i = 0; i < seedBytes.length; i++) {
-    hash[i % 32] ^= seedBytes[i];
-  }
-  return hash;
+  return await crypto.subtle.digest("SHA-256", seedBytes);
 }
 
 async function encrypt(plaintext: string): Promise<string> {
+  const keyBytes = await getEncryptionKey();
   const key = await crypto.subtle.importKey(
     "raw",
-    getEncryptionKey(),
+    keyBytes,
     { name: "AES-GCM" },
     false,
     ["encrypt", "decrypt"],
@@ -78,9 +79,10 @@ async function encrypt(plaintext: string): Promise<string> {
 }
 
 async function decrypt(ciphertext: string): Promise<string> {
+  const keyBytes = await getEncryptionKey();
   const key = await crypto.subtle.importKey(
     "raw",
-    getEncryptionKey(),
+    keyBytes,
     { name: "AES-GCM" },
     false,
     ["encrypt", "decrypt"],
@@ -232,6 +234,7 @@ export async function listAccounts(): Promise<{
     userId?: string;
     expiresAt?: number;
     hasJwt: boolean;
+    plan: string;
   }>;
   activeId: string | null;
 }> {
@@ -249,6 +252,7 @@ export async function listAccounts(): Promise<{
       userId: a.credential.userId,
       expiresAt: a.credential.expiresAt,
       hasJwt: !!a.credential.jwt,
+      plan: a.credential.plan || "coding-plan",
     })),
   };
 }

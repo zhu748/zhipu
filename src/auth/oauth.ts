@@ -7,6 +7,7 @@
 import type { ProviderId } from "../provider/types.js";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
+import { sleep } from "../utils/sleep.js";
 
 // ---------------------------------------------------------------------------
 // Constants (from bundle)
@@ -416,10 +417,6 @@ export class BigmodelOAuthClient {
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
 
 function safeJsonParse(text: string): unknown {
   try {

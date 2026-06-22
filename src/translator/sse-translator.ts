@@ -28,8 +28,8 @@ function parseSSEChunk(raw: string): ParsedSSE[] {
     for (const line of lines) {
       if (line.startsWith("event: ")) {
         eventType = line.slice(7).trim();
-      } else if (line.startsWith("data: ")) {
-        dataStr = line.slice(6);
+      } else if (line.startsWith("data:")) {
+        dataStr = line.slice(5).trimStart();
       }
     }
 

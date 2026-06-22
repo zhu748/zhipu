@@ -2,7 +2,7 @@
  * API-key-mode credential factory.
  * @see .omo/plans/zcode-proxy.md Task 4
  */
-import type { Credential } from "./types.js";
+import type { Credential, PlanId } from "./types.js";
 import type { ProviderId } from "../provider/types.js";
 
 /**
@@ -14,7 +14,7 @@ import type { ProviderId } from "../provider/types.js";
  *
  * @throws Error if `key` is empty.
  */
-export function createApiKeyCredential(provider: ProviderId, key: string): Credential {
+export function createApiKeyCredential(provider: ProviderId, key: string, plan: PlanId = "coding-plan"): Credential {
   if (!key || key.trim().length === 0) {
     throw new Error("API key must not be empty");
   }
@@ -28,8 +28,8 @@ export function createApiKeyCredential(provider: ProviderId, key: string): Crede
   if (dotIdx > 0 && dotIdx < trimmed.length - 1) {
     const apiKey = trimmed.slice(0, dotIdx);
     const secret = trimmed.slice(dotIdx + 1);
-    return { apiKey, secret, provider };
+    return { apiKey, secret, provider, plan };
   }
 
-  return { apiKey: trimmed, provider };
+  return { apiKey: trimmed, provider, plan };
 }

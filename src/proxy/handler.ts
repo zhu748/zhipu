@@ -14,11 +14,13 @@ import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import { getProvider } from "../provider/providers.js";
 import { buildUpstreamRequest } from "./upstream.js";
-import { transformRequestBody } from "./body-transformer.js";
+import { transformRequestBody, transformRequestBodyObj } from "./body-transformer.js";
 import { detectCaptchaChallenge, getCaptchaToken, invalidateCaptchaToken, RETRY_HEADERS } from "./captcha.js";
 import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
 import { anthropicSseToOpenaiSse } from "../translator/sse-translator.js";
 import type { OpenAIChatRequest, AnthropicMessagesResponse } from "../translator/types.js";
+import { recordStat } from "../admin/api.js";
+import { sleep } from "../utils/sleep.js";
 
 /** Options for the proxy handler. */
 export interface ProxyHandlerOptions {
@@ -51,7 +53,21 @@ export async function proxyRequest(
 
   const body = await readBody(clientReq);
 
-  const meta = peekBody(body);
+  // Parse the body once and reuse the parsed object throughout the pipeline.
+  // Previously the body string was JSON.parse'd up to 3 times (peekBody,
+  // translateOpenAIBody, transformRequestBody) — now we parse once.
+  let parsedBody: unknown;
+  if (body && body.length > 0) {
+    try {
+      parsedBody = JSON.parse(body);
+    } catch (err) {
+      const meta: RequestMeta = { model: "-", stream: false };
+      printRow(reqId, format, meta, 400, started, Date.now(), 0, 0, 0);
+      return errorResponse(400, "invalid_json", `Request body is not valid JSON: ${(err as Error).message}`);
+    }
+  }
+
+  const meta = peekParsedBody(parsedBody);
 
   const staticProvider = getProvider(config.provider);
   const provider = {
@@ -75,14 +91,15 @@ export async function proxyRequest(
   const translateMode = format === "openai";
   const upstreamFormat: Format = translateMode ? "anthropic" : format;
 
-  let upstreamBody = body;
+  let upstreamBodyObj: unknown = parsedBody;
   if (translateMode) {
-    const translated = translateOpenAIBody(body);
+    const translated = translateOpenAIBodyObj(parsedBody);
     if (translated instanceof Response) return translated;
-    upstreamBody = translated;
+    upstreamBodyObj = translated;
   }
 
-  const transformedBody = transformRequestBody(upstreamBody, { format: upstreamFormat, userId: cred.userId, startPlan: config.plan === "start-plan" });
+  const transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: config.plan === "start-plan" });
+  const transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
 
   let captchaHeaders: Record<string, string> | undefined;
   if (config.plan === "start-plan") {
@@ -230,11 +247,6 @@ async function readBody(req: Request): Promise<string | undefined> {
   return text;
 }
 
-/** Sleep for the specified number of milliseconds. */
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 /**
  * Create a passthrough response that streams the upstream body to the client.
  * Preserves status, headers, and body stream.
@@ -275,25 +287,6 @@ export function errorResponse(status: number, type: string, message: string): Re
     status,
     headers: { "content-type": "application/json" },
   });
-}
-
-/** Translate an OpenAI request body string to Anthropic JSON. Returns error Response on failure. */
-function translateOpenAIBody(body: string | undefined): Response | string | undefined {
-  if (body === undefined || body.length === 0) {
-    return errorResponse(400, "translation_failed", "OpenAI request body is empty; cannot translate.");
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch (err) {
-    return errorResponse(400, "translation_failed", `OpenAI request body is not valid JSON: ${(err as Error).message}`);
-  }
-  try {
-    const translated = translateRequestOpenAIToAnthropic(parsed as OpenAIChatRequest);
-    return JSON.stringify(translated);
-  } catch (err) {
-    return errorResponse(400, "translation_failed", `OpenAI→Anthropic translation failed: ${(err as Error).message}`);
-  }
 }
 
 /** True when the client request explicitly accepts gzip (and has not disabled it via q=0). */
@@ -375,16 +368,25 @@ interface RequestMeta {
   stream: boolean;
 }
 
-function peekBody(body: string | undefined): RequestMeta {
-  if (!body) return { model: "-", stream: false };
+function peekParsedBody(parsed: unknown): RequestMeta {
+  if (!parsed || typeof parsed !== "object") return { model: "-", stream: false };
+  const p = parsed as Record<string, unknown>;
+  return {
+    model: typeof p.model === "string" ? p.model : "-",
+    stream: p.stream === true,
+  };
+}
+
+/** Translate an OpenAI request body object to Anthropic JSON. Returns error Response on failure. */
+function translateOpenAIBodyObj(parsed: unknown): Response | unknown {
+  if (parsed === undefined || parsed === null) {
+    return errorResponse(400, "translation_failed", "OpenAI request body is empty; cannot translate.");
+  }
   try {
-    const p = JSON.parse(body) as Record<string, unknown>;
-    return {
-      model: typeof p.model === "string" ? p.model : "-",
-      stream: p.stream === true,
-    };
-  } catch {
-    return { model: "-", stream: false };
+    const translated = translateRequestOpenAIToAnthropic(parsed as OpenAIChatRequest);
+    return translated;
+  } catch (err) {
+    return errorResponse(400, "translation_failed", `OpenAI→Anthropic translation failed: ${(err as Error).message}`);
   }
 }
 
@@ -416,6 +418,7 @@ function printRow(
   tokens: number,
   avgTps: number,
   streamEndAt: number,
+  retried: boolean = false,
 ): void {
   printHeader();
   const ts = new Date(started).toISOString().slice(11, 19);
@@ -428,6 +431,16 @@ function printRow(
   console.log(
     `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |`,
   );
+  // Record stats for the admin dashboard
+  recordStat({
+    id: reqId,
+    time: ts,
+    model: meta.model,
+    status,
+    ttfb: String(headersAt - started),
+    tokens: String(tokens),
+    retried,
+  });
 }
 
 function observeStream(
@@ -446,9 +459,12 @@ function observeStream(
 
   function parseSse(text: string): void {
     for (const line of text.split("\n")) {
-      if (!line.startsWith("data:") || line.includes("[DONE]")) continue;
+      if (!line.startsWith("data:")) continue;
+      const dataStr = line.slice(5).trimStart();
+      if (!dataStr || dataStr === "[DONE]") continue;
       try {
-        const j = JSON.parse(line.slice(5).trim());
+        const j = JSON.parse(dataStr);
+        // Prefer authoritative usage fields over event counting
         if (j.usage?.completion_tokens) { tokens = j.usage.completion_tokens; continue; }
         if (j.usage?.output_tokens) { tokens = j.usage.output_tokens; continue; }
         // OpenAI content delta: choices[0].delta.content

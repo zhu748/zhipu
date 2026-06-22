@@ -2,61 +2,75 @@
 
 echo ""
 echo "============================================"
-echo "         zcode-proxy 管理工具"
+echo "         zcode-proxy Manager"
 echo "============================================"
 echo ""
-echo "  1. 启动代理服务"
-echo "  2. OAuth 登录 (智谱 Bigmodel)"
-echo "  3. OAuth 登录 (Z.AI)"
-echo "  4. 从 ZCode 导入密钥 (智谱)"
-echo "  5. 从 ZCode 导入密钥 (Z.AI)"
-echo "  6. 查看登录状态"
-echo "  7. 退出登录"
-echo "  0. 退出"
+echo "  1. Start proxy server"
+echo "  2. OAuth login (Bigmodel) - Coding Plan"
+echo "  3. OAuth login (Z.AI) - Coding Plan"
+echo "  4. OAuth login (Bigmodel) - Start Plan"
+echo "  5. OAuth login (Z.AI) - Start Plan"
+echo "  6. Import key from ZCode (Bigmodel)"
+echo "  7. Import key from ZCode (Z.AI)"
+echo "  8. Check login status"
+echo "  9. Logout"
+echo "  0. Exit"
 echo ""
-read -p "请输入选项: " choice
+read -p "Select: " choice
 
 case $choice in
   1)
     echo ""
-    echo "=============================="
-    echo "  zcode-proxy 启动中..."
-    echo "=============================="
+    echo "Starting proxy server..."
     echo ""
     chmod +x zcode-proxy.exe
     ./zcode-proxy.exe serve --config config.yaml
     ;;
   2)
     echo ""
-    echo "正在启动智谱 OAuth 登录..."
-    echo "将自动打开浏览器，请完成授权..."
+    echo "Starting Bigmodel OAuth login (Coding Plan)..."
+    echo "Browser will open automatically for authorization..."
     echo ""
-    ./zcode-proxy.exe auth login bigmodel
+    ./zcode-proxy.exe auth login bigmodel --plan=coding-plan
     ;;
   3)
     echo ""
-    echo "正在启动 Z.AI OAuth 登录..."
-    echo "将自动打开浏览器，请完成授权..."
+    echo "Starting Z.AI OAuth login (Coding Plan)..."
+    echo "Browser will open automatically for authorization..."
     echo ""
-    ./zcode-proxy.exe auth login zai
+    ./zcode-proxy.exe auth login zai --plan=coding-plan
     ;;
   4)
     echo ""
-    echo "正在从 ZCode 导入智谱密钥..."
+    echo "Starting Bigmodel OAuth login (Start Plan)..."
+    echo "Browser will open automatically for authorization..."
     echo ""
-    ./zcode-proxy.exe auth login bigmodel --import
+    ./zcode-proxy.exe auth login bigmodel --plan=start-plan
     ;;
   5)
     echo ""
-    echo "正在从 ZCode 导入 Z.AI 密钥..."
+    echo "Starting Z.AI OAuth login (Start Plan)..."
+    echo "Browser will open automatically for authorization..."
     echo ""
-    ./zcode-proxy.exe auth login zai --import
+    ./zcode-proxy.exe auth login zai --plan=start-plan
     ;;
   6)
     echo ""
-    ./zcode-proxy.exe auth status
+    echo "Importing key from ZCode (Bigmodel)..."
+    echo ""
+    ./zcode-proxy.exe auth login bigmodel --import
     ;;
   7)
+    echo ""
+    echo "Importing key from ZCode (Z.AI)..."
+    echo ""
+    ./zcode-proxy.exe auth login zai --import
+    ;;
+  8)
+    echo ""
+    ./zcode-proxy.exe auth status
+    ;;
+  9)
     echo ""
     ./zcode-proxy.exe auth logout
     ;;
@@ -64,6 +78,6 @@ case $choice in
     exit 0
     ;;
   *)
-    echo "无效选项"
+    echo "Invalid option"
     ;;
 esac

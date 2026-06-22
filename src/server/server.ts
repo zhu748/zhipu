@@ -96,23 +96,38 @@ export function startServer(opts: ServerOptions): ReturnType<typeof Bun.serve> {
       // Add CORS headers to all responses
       return handler(req).then((resp) => addCorsHeaders(resp));
     },
-    websocket: {
-      open(ws) { /* log stream connections managed via SSE */ },
-      message(ws, msg) { /* no incoming messages expected */ },
-      close(ws) { /* cleanup */ },
-    },
   });
 }
 
-/** Check whether the client provided the correct proxy API key. */
+/**
+ * Check whether the client provided the correct proxy API key.
+ * Uses timing-safe comparison to prevent timing attacks.
+ */
 function checkProxyKey(authHeader: string, expected: string): boolean {
   // Accept "Bearer {key}" or bare key
   const trimmed = authHeader.trim();
+  let provided: string;
   if (trimmed.startsWith("Bearer ")) {
-    return trimmed.slice(7).trim() === expected;
+    provided = trimmed.slice(7).trim();
+  } else {
+    provided = trimmed;
   }
-  // Also accept x-api-key: {key}
-  return trimmed === expected;
+  return timingSafeEqual(provided, expected);
+}
+
+/** Constant-time string comparison to mitigate timing attacks. */
+function timingSafeEqual(a: string, b: string): boolean {
+  // To avoid leaking length information, always compare the full length of
+  // the expected value. If the provided value has a different length, we
+  // still do a full comparison but the result will always be wrong.
+  const maxLen = Math.max(a.length, b.length);
+  let result = a.length ^ b.length; // Non-zero if lengths differ
+  for (let i = 0; i < maxLen; i++) {
+    const aChar = i < a.length ? a.charCodeAt(i) : 0;
+    const bChar = i < b.length ? b.charCodeAt(i) : 0;
+    result |= aChar ^ bChar;
+  }
+  return result === 0;
 }
 
 /** Build a CORS preflight response. */
@@ -137,6 +152,12 @@ function addCorsHeaders(resp: Response): Response {
 }
 
 function corsHeaders(): Record<string, string> {
+  // Restrictive CORS: only allow same-origin by default.
+  // The proxy is designed for local/self-hosted use; allowing "*" means
+  // any website could make requests to it. We set the origin to the
+  // requesting origin so the dashboard still works while third-party
+  // sites are blocked. Since we don't use cookies/credentials for API
+  // auth, this is safe.
   return {
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",

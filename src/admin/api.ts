@@ -11,7 +11,8 @@ import { loadCredential, saveCredential, clearCredential, listAccounts, switchAc
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { errorResponse } from "../proxy/handler.js";
-import { readFileSync, existsSync, writeFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { stringify as stringifyYaml } from "yaml";
@@ -50,28 +51,39 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
 }
 
 // Active OAuth flows (in-memory)
-const activeFlows = new Map<string, { provider: string; flowId: string; pollToken: string; expiresAt: number }>();
+const activeFlows = new Map<string, { provider: string; flowId: string; pollToken: string; expiresAt: number; plan?: string }>();
 
-// Log buffer for streaming
+// Log buffer for streaming — uses a fixed-size ring buffer to avoid
+// expensive splice(0, N) operations on large arrays.
+const LOG_BUFFER_SIZE = 2000;
+const LOG_BUFFER_TRIM = 1000; // trim to this size when capacity is reached
 const logBuffer: Array<{ time: string; level: string; message: string }> = [];
+let logBufferStart = 0; // virtual start index for tracking client positions
 const logWaiters: Array<{ resolve: (value: unknown) => void }> = [];
 
 /** Add a log entry to the buffer (called by intercepting console.log). */
 export function appendLog(level: string, message: string) {
   const entry = { time: new Date().toISOString().slice(11, 19), level, message: message.slice(0, 500) };
   logBuffer.push(entry);
-  if (logBuffer.length > 2000) logBuffer.splice(0, 1000);
+  if (logBuffer.length > LOG_BUFFER_SIZE) {
+    // Efficient: remove in bulk instead of one-by-one splice
+    logBuffer.splice(0, logBuffer.length - LOG_BUFFER_TRIM);
+    logBufferStart += LOG_BUFFER_SIZE - LOG_BUFFER_TRIM;
+  }
   // Wake up any waiting SSE connections
   while (logWaiters.length > 0) {
     logWaiters.shift()!.resolve(entry);
   }
 }
 
-/** Read the bundled dashboard HTML. */
+/** Read the bundled dashboard HTML (cached after first read). */
+let _dashboardHtml: string | null = null;
 export function getDashboardHTML(): string {
-  // Use import.meta to resolve the path relative to this module
-  const htmlPath = join(import.meta.dir, "dashboard.html");
-  return readFileSync(htmlPath, "utf-8");
+  if (!_dashboardHtml) {
+    const htmlPath = join(import.meta.dir, "dashboard.html");
+    _dashboardHtml = readFileSync(htmlPath, "utf-8");
+  }
+  return _dashboardHtml;
 }
 
 /** Handle admin API routes. Returns null if the path doesn't match. */
@@ -123,10 +135,25 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   if (path === "/admin/api/config" && method === "PUT") {
     try {
       const body = await req.json() as Record<string, unknown>;
+      // Prevent masked placeholder values from overwriting real secrets.
+      // The sanitizeConfig() GET endpoint returns "***configured***" for
+      // secret fields; if the dashboard sends those back unchanged we skip them.
+      const MASK = "***configured***";
+      const authBody = body.auth as Record<string, unknown> | undefined;
+      if (authBody) {
+        if (authBody.apiKey === MASK || authBody.apiKey === "") delete authBody.apiKey;
+        if (authBody.proxyApiKey === MASK || authBody.proxyApiKey === "") delete authBody.proxyApiKey;
+      }
       const newConfig = { ...opts.config, ...body };
-      // Persist to YAML (simplified: write as JSON-compatible YAML)
-      const yaml = configToYaml(newConfig);
-      writeFileSync(opts.configPath, yaml, "utf-8");
+      // Merge auth separately to avoid losing fields not sent by the dashboard
+      if (authBody) {
+        newConfig.auth = { ...opts.config.auth, ...authBody };
+      }
+      // Validate the merged config before persisting
+      validateConfigForSave(newConfig);
+      const yaml = configToYaml(newConfig as ProxyConfig);
+      await writeFile(opts.configPath, yaml, "utf-8");
+      appendLog("info", "Configuration updated via admin dashboard");
       return jsonResp({ ok: true });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
@@ -145,6 +172,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         userId: cred.userId,
         expiresAt: cred.expiresAt,
         mode: opts.config.auth.mode,
+        plan: cred.plan || "coding-plan",
       },
     });
   }
@@ -152,8 +180,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Add API key
   if (path === "/admin/api/credentials" && method === "POST") {
     try {
-      const body = await req.json() as { provider: string; apiKey: string };
-      const cred = { apiKey: body.apiKey, provider: body.provider as "zai" | "bigmodel" } as AppCredential;
+      const body = await req.json() as { provider: string; apiKey: string; plan?: string };
+      const plan = (body.plan === "start-plan" ? "start-plan" : "coding-plan") as "coding-plan" | "start-plan";
+      const cred = { apiKey: body.apiKey, provider: body.provider as "zai" | "bigmodel", plan } as AppCredential;
       await saveCredential(cred);
       return jsonResp({ ok: true });
     } catch (err) {
@@ -180,11 +209,18 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       if (!body.id) return errorResponse(400, "missing_param", "id is required");
       const ok = await switchAccount(body.id);
       if (!ok) return errorResponse(404, "not_found", "Account not found");
-      // Hot-swap the in-memory credential
+      // Hot-swap the in-memory credential and sync plan
       const cred = await loadCredential();
-      if (cred) opts.auth.setOAuthCredential(cred);
+      if (cred) {
+        opts.auth.setOAuthCredential(cred);
+        // Sync config.plan to match the account's plan
+        if (cred.plan && cred.plan !== opts.config.plan) {
+          opts.config.plan = cred.plan;
+          appendLog("info", `Plan synced to ${cred.plan} (from account ${body.id})`);
+        }
+      }
       appendLog("info", `Switched active account to ${body.id}`);
-      return jsonResp({ ok: true });
+      return jsonResp({ ok: true, plan: cred?.plan || opts.config.plan });
     } catch (err) {
       return errorResponse(500, "switch_failed", (err as Error).message);
     }
@@ -221,11 +257,12 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Import from ZCode
   if (path === "/admin/api/import" && method === "POST") {
     try {
-      const body = await req.json() as { provider: string };
+      const body = await req.json() as { provider: string; plan?: string };
       const provider = body.provider as "zai" | "bigmodel";
-      const cred = importFromZCodeConfig(provider);
+      const plan = (body.plan === "start-plan" ? "start-plan" : "coding-plan") as "coding-plan" | "start-plan";
+      const cred = importFromZCodeConfig(provider, plan);
       await saveCredential(cred);
-      return jsonResp({ ok: true, apiKeyMask: maskApiKey(cred.apiKey) });
+      return jsonResp({ ok: true, apiKeyMask: maskApiKey(cred.apiKey), plan: cred.plan });
     } catch (err) {
       return errorResponse(500, "import_failed", (err as Error).message);
     }
@@ -234,8 +271,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // OAuth init
   if (path === "/admin/api/oauth/init" && method === "POST") {
     try {
-      const body = await req.json() as { provider: string };
+      const body = await req.json() as { provider: string; plan?: string };
       const provider = body.provider as "zai" | "bigmodel";
+      const oauthPlan = (body.plan === "start-plan" ? "start-plan" : "coding-plan") as "coding-plan" | "start-plan";
 
       if (provider === "bigmodel") {
         const oauth = new BigmodelOAuthClient();
@@ -250,6 +288,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
           // Store the localhost callback URL & state for manual callback exchange path
           callbackUrl,
           state,
+          plan: oauthPlan,
         } as any);
         // Start background process to wait for callback
         (async () => {
@@ -257,7 +296,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
             const authCode = await oauth.waitForCallback(300_000);
             const { accessToken, userId, jwt } = await oauth.exchangeCode(authCode, callbackUrl, state);
             const resolver = new KeyResolver();
-            const cred = await resolver.resolveCodingPlanCredential(accessToken, provider, userId);
+            const cred = await resolver.resolveCodingPlanCredential(accessToken, provider, userId, oauthPlan);
             if (jwt) cred.jwt = jwt;
             await saveCredential(cred);
             // Mark flow as ready
@@ -276,13 +315,13 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       // Z.AI OAuth
       const oauth = new ZaiOAuthClient();
       const init = await oauth.init("zai");
-      activeFlows.set(init.flowId, { provider, flowId: init.flowId, pollToken: init.pollToken, expiresAt: init.expiresAt });
+      activeFlows.set(init.flowId, { provider, flowId: init.flowId, pollToken: init.pollToken, expiresAt: init.expiresAt, plan: oauthPlan });
       // Background poll
       (async () => {
         try {
           const result = await oauth.waitForAuth(init);
           const resolver = new KeyResolver();
-          const cred = await resolver.resolveCodingPlanCredential(result.accessToken, provider, result.userId);
+          const cred = await resolver.resolveCodingPlanCredential(result.accessToken, provider, result.userId, oauthPlan);
           if (result.jwt) cred.jwt = result.jwt;
           await saveCredential(cred);
           const flow = activeFlows.get(init.flowId);
@@ -371,7 +410,8 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         }
 
         const resolver = new KeyResolver();
-        const cred = await resolver.resolveCodingPlanCredential(accessToken, "zai", pollResult.userId);
+        const flowPlan = (flow as any).plan as "coding-plan" | "start-plan" | undefined;
+        const cred = await resolver.resolveCodingPlanCredential(accessToken, "zai", pollResult.userId, flowPlan);
         if (pollResult.token) cred.jwt = pollResult.token;
         await saveCredential(cred);
 
@@ -398,7 +438,8 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         }
         const { accessToken, userId, jwt } = await oauth.exchangeCode(code, storedCallbackUrl, state);
         const resolver = new KeyResolver();
-        const cred = await resolver.resolveCodingPlanCredential(accessToken, "bigmodel", userId);
+        const flowPlan = (flow as any).plan as "coding-plan" | "start-plan" | undefined;
+        const cred = await resolver.resolveCodingPlanCredential(accessToken, "bigmodel", userId, flowPlan);
         if (jwt) cred.jwt = jwt;
         await saveCredential(cred);
 
@@ -460,7 +501,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       opts.config.routingRules = cleaned;
       // Persist
       const yaml = configToYaml(opts.config);
-      writeFileSync(opts.configPath, yaml, "utf-8");
+      await writeFile(opts.configPath, yaml, "utf-8");
       appendLog("info", `Routing rules updated (${cleaned.length} rule(s))`);
       return jsonResp({ ok: true, rules: cleaned });
     } catch (err) {
@@ -491,13 +532,14 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Log stream (SSE)
   if (path === "/admin/api/logs/stream" && method === "GET") {
     let sentIndex = 0; // Track how many buffered entries we've already sent
+    let cleanup: (() => void) | null = null;
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
         const send = (entry: { time: string; level: string; message: string }) => {
           try {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(entry)}\n\n`));
-          } catch (e) { /* SSE controller may be closed; safe to ignore */ void e; }
+          } catch { /* SSE controller may be closed; safe to ignore */ }
         };
 
         // Send existing buffered logs first
@@ -517,16 +559,23 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
           }
         }, 500);
 
-        // Clean up on cancel (1 hour max lifetime as safety)
-        setTimeout(() => {
+        // Safety timeout: close after 1 hour
+        const maxTimeout = setTimeout(() => {
+          doCleanup();
+          try { controller.close(); } catch { /* already closed */ }
+        }, 3600000);
+
+        const doCleanup = () => {
           clearInterval(interval);
+          clearTimeout(maxTimeout);
           const idx = logWaiters.indexOf(waiter);
           if (idx >= 0) logWaiters.splice(idx, 1);
-          try { controller.close(); } catch (e) { appendLog("debug", `SSE controller.close() failed: ${(e as Error).message}`); }
-        }, 3600000);
+        };
+        cleanup = doCleanup;
       },
       cancel() {
         // Cleanup if the client disconnects early
+        cleanup?.();
       },
     });
     return new Response(stream, {
@@ -634,7 +683,7 @@ function configToYaml(config: ProxyConfig): string {
   });
 }
 
-function importFromZCodeConfig(provider: string): AppCredential {
+function importFromZCodeConfig(provider: string, plan: "coding-plan" | "start-plan" = "coding-plan"): AppCredential {
   const configPath = join(homedir(), ".zcode", "v2", "config.json");
   if (!existsSync(configPath)) throw new Error("ZCode config not found at " + configPath);
   const raw = readFileSync(configPath, "utf-8");
@@ -647,5 +696,24 @@ function importFromZCodeConfig(provider: string): AppCredential {
   if (!apiKey) throw new Error(`No API key for ${providerKey} in ZCode config`);
   const startPlanKey = `builtin:${provider}-start-plan`;
   const jwt = config.provider?.[startPlanKey]?.options?.apiKey?.trim() || undefined;
-  return { apiKey, provider: provider as "zai" | "bigmodel", jwt };
+  return { apiKey, provider: provider as "zai" | "bigmodel", plan, jwt };
+}
+
+/** Basic validation for config saves from the dashboard. Throws on invalid input. */
+function validateConfigForSave(cfg: Record<string, unknown>): void {
+  const server = cfg.server as Record<string, unknown> | undefined;
+  if (server) {
+    const port = typeof server.port === "number" ? server.port : parseInt(String(server.port), 10);
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
+      throw new Error(`server.port ${port} is out of range (1-65535)`);
+    }
+  }
+  const provider = cfg.provider as string | undefined;
+  if (provider && provider !== "zai" && provider !== "bigmodel") {
+    throw new Error(`Invalid provider "${provider}": must be "zai" or "bigmodel"`);
+  }
+  const plan = cfg.plan as string | undefined;
+  if (plan && plan !== "coding-plan" && plan !== "start-plan") {
+    throw new Error(`Invalid plan "${plan}": must be "coding-plan" or "start-plan"`);
+  }
 }

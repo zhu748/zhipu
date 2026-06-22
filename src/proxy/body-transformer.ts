@@ -48,6 +48,17 @@ export function transformRequestBody(body: string | undefined, ctx: TransformCon
   }
   if (typeof parsed !== "object" || parsed === null) return body;
 
+  const result = transformRequestBodyObj(parsed, ctx);
+  return result !== undefined ? JSON.stringify(result) : body;
+}
+
+/**
+ * Apply body transformations on a pre-parsed object. Returns the transformed
+ * object (mutated in place for efficiency), or undefined if nothing changed.
+ */
+export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext): unknown | undefined {
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+
   let modified = false;
 
   if (ctx.format === "openai") {
@@ -66,7 +77,7 @@ export function transformRequestBody(body: string | undefined, ctx: TransformCon
     }
   }
 
-  return modified ? JSON.stringify(parsed) : body;
+  return modified ? parsed : undefined;
 }
 
 /** OpenAI streaming: ensure `stream_options.include_usage: true`. */
