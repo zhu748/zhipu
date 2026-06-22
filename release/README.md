@@ -1,5 +1,30 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.9beta0 — start-plan 剥离所有 cache_control + tool_result 标准化**
+> - **根因定位**：v2.1.3.8beta0 已正确过滤 `anthropic-beta` header（只剩 `claude-code-20250219`），但用户反馈第 4 轮仍报 3001：
+>   ```
+>   msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,
+>        [3]assistant/{text+cc,tool_use,tool_use},[4]user/{tool_result,tool_result}]
+>   anthropic-beta sent: claude-code-20250219
+>   ```
+>   header 已对，但请求体里 `[3]assistant/{text+cc, ...}` 的 **text 块上还带着 `cache_control`**！
+> - **核心问题**：v2.1.3.5/6/7beta0 一直假设 "text 块上的 cache_control 是 OK 的，只有非 text 块上的 cc 才会触发 3001"——**这是未经验证的推测**。ZCode 网关很可能完全不接受 cache_control 字段（无论在哪种块上）。
+> - **修复 1：start-plan 模式下剥离所有 cache_control**
+>   - `sanitizeContentBlocks()` 在 start-plan 模式下剥离**所有块**（包括 text 块）上的 `cache_control`
+>   - `applyAnthropicCacheControl()` 在 start-plan 模式下变成 no-op，不再添加新的 cache_control
+>   - coding-plan 模式（直连 GLM 官方 API）保留原有行为，text 块上的 cc 仍可用于 prompt caching
+> - **修复 2：tool_result.content 标准化为数组**
+>   - 新增 `normalizeToolResultContent()`，把 `tool_result.content` 从 string 转成 array `[{type:"text", text:"..."}]`
+>   - Anthropic 官方 API 接受 string 和 array 两种格式，但 ZCode 网关只接受 array——这是非常常见的兼容性问题
+>   - Claude Code 发的是 string 格式（如 `content: "file1\nfile2"`），网关收到直接 3001
+> - **修复 3：剥离 tool_result.is_error 字段**
+>   - Claude Code 在 tool_result 上加 `is_error: false`，Anthropic 接受但 ZCode 网关不接受
+>   - `sanitizeContentBlocks()` 现在也剥离 tool_result 块上的 `is_error` 字段（两种模式都剥）
+> - **诊断日志增强**：`transformed request summary` 现在显示 tool_result 块的 content 类型（`/str` vs `/arr`）和 is_error 状态（`/+err`）
+>   - 例如 `[4]user/{tool_result/str/+err, tool_result/str/+err}` 表示 string content + is_error 字段
+>   - 修复后应该看到 `[4]user/{tool_result/arr, tool_result/arr}` （已标准化、is_error 已剥离）
+> - **新增 7 个测试**，包括完整复现 v2.1.3.8beta0 #004 场景的回归测试；全套 291 测试通过，TypeScript 类型检查零错误
+>
 > **v2.1.3.8beta0 — 过滤 anthropic-beta header 中网关不支持的 flag**
 > - **根因定位**：v2.1.3.7beta0 诊断日志显示第二轮就 3001，请求体结构完全正确（assistant 有 text 块、cache_control 只在 text 上、角色交替正确、thinking 已剥离）。问题不在 body，在 **header**。
 > - **原因**：Claude Code 发送的 `anthropic-beta` header 包含 7 个 feature flag：

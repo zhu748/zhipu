@@ -79,8 +79,9 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     modified = relocateSystemMessages(obj) || modified;
     modified = stripThinkingBlocksFromMessages(obj) || modified;
     modified = ensureAssistantTextBlock(obj) || modified;
-    modified = sanitizeContentBlocks(obj) || modified;
-    modified = applyAnthropicCacheControl(obj) || modified;
+    modified = normalizeToolResultContent(obj) || modified;
+    modified = sanitizeContentBlocks(obj, ctx.startPlan) || modified;
+    modified = applyAnthropicCacheControl(obj, ctx.startPlan) || modified;
     if (ctx.userId) {
       modified = applyAnthropicUserId(obj, ctx.userId) || modified;
     }
@@ -111,21 +112,27 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  * block of the last non-system message. Mirrors ZCode's `HLr` algorithm.
  * Idempotent — skips if any block on that message already carries cache_control.
  *
- * IMPORTANT: ZCode's start-plan gateway ONLY accepts `cache_control` on `text`
- * blocks. Attaching it to `tool_use`, `tool_result`, `image`, or any other
- * block type causes 3001 "parameter error". This function therefore ONLY
- * attaches cache_control to `text` blocks. If the last non-system message has
- * no text block (e.g. it's all tool_results, or all tool_use blocks), it walks
- * backwards to previous messages looking for a text block. If none is found,
- * cache_control is skipped entirely — better to miss the cache optimization
- * than to 3001.
+ * IMPORTANT: In **start-plan mode**, this function is a no-op. The ZCode
+ * gateway rejects `cache_control` on ALL block types — including `text`
+ * blocks — with 3001 "parameter error". (v2.1.3.5/6/7beta0 incorrectly
+ * assumed text-block cache_control was safe; v2.1.3.9beta0 corrected this
+ * by stripping all cache_control in start-plan mode and not adding new ones.)
  *
- * The `sanitizeContentBlocks()` function runs BEFORE this and strips any
- * cache_control that Claude Code put on non-text blocks, so even if this
- * function somehow attached to a non-text block, sanitize would catch it.
- * But we also guard here to avoid relying on the safety net.
+ * In **coding-plan mode** (direct GLM API), the previous behavior is preserved:
+ * cache_control is attached only to `text` blocks (skipping tool_use /
+ * tool_result / image etc.). If no text block is found in the last non-system
+ * message, the function walks backwards; if still none, it skips cache_control
+ * entirely — better to miss the cache optimization than to risk 3001.
+ *
+ * The `sanitizeContentBlocks()` function runs BEFORE this and strips cache_control
+ * from non-text blocks (coding-plan) or ALL blocks (start-plan), so even if this
+ * function somehow attached to a disallowed block, sanitize would catch it.
  */
-function applyAnthropicCacheControl(body: Record<string, unknown>): boolean {
+function applyAnthropicCacheControl(body: Record<string, unknown>, startPlan?: boolean): boolean {
+  // In start-plan mode, do NOT add any cache_control. The ZCode gateway is
+  // stricter than Anthropic's official API and rejects cache_control on ALL
+  // block types, including text blocks. Adding it would trigger 3001.
+  if (startPlan) return false;
   const messages = body.messages;
   if (!Array.isArray(messages) || messages.length === 0) return false;
 
@@ -437,28 +444,32 @@ function ensureAssistantTextBlock(body: Record<string, unknown>): boolean {
  * Sanitize content blocks in `messages[].content` to remove fields that GLM
  * upstream / ZCode gateway reject with 3001 "parameter error".
  *
- * Currently strips:
- *   - `cache_control` from ALL non-text blocks (tool_result, tool_use, image, etc.)
+ * Strips the following fields:
  *
- * ZCode's start-plan gateway ONLY accepts `cache_control` on `text` blocks.
- * Claude Code attaches `cache_control: {type:"ephemeral"}` to the last block
- * of the last user message — when that block is a tool_result, it 3001s.
- * The proxy's own `applyAnthropicCacheControl` was also attaching cache_control
- * to `tool_use` blocks (when the last user message was all tool_results and it
- * walked backwards) — that also 3001s.
+ * 1. `cache_control`:
+ *    - **start-plan mode**: stripped from ALL blocks (including text). The
+ *      ZCode gateway rejects cache_control on every block type, not just
+ *      non-text. v2.1.3.9beta0 fix — prior versions incorrectly assumed
+ *      text-block cache_control was safe.
+ *    - **coding-plan mode**: stripped from non-text blocks only (tool_result,
+ *      tool_use, image, etc.). Direct GLM API accepts cache_control on text
+ *      blocks, so we keep it for prompt caching.
  *
- * This function strips cache_control from every block whose type is not "text",
- * regardless of who put it there (Claude Code or the proxy itself). This is
- * the safety net that guarantees no cache_control ever reaches the gateway on
- * a non-text block.
+ * 2. `is_error` (tool_result blocks only):
+ *    - Stripped in BOTH modes. Anthropic's official API accepts `is_error` on
+ *      tool_result blocks, but the ZCode gateway does not — it returns 3001.
+ *      This field is informational (Claude Code sets it to `false` on success)
+ *      and the upstream infers success/failure from the content, so removing
+ *      it is safe.
  *
  * Root cause history:
  *   - v2.1.3.3beta0: stripped thinking blocks (round-2 3001)
  *   - v2.1.3.5beta0: stripped cache_control from tool_result (round-3 3001)
- *   - this fix: strip cache_control from tool_use too (round-3 3001 variant
- *     where assistant called 2 tools, proxy attached cc to tool_use)
+ *   - v2.1.3.6beta0: stripped cache_control from tool_use (round-3 3001 variant)
+ *   - v2.1.3.9beta0: strip cache_control from text too in start-plan;
+ *                    strip is_error from tool_result in both modes
  */
-function sanitizeContentBlocks(body: Record<string, unknown>): boolean {
+function sanitizeContentBlocks(body: Record<string, unknown>, startPlan?: boolean): boolean {
   const messages = body.messages;
   if (!Array.isArray(messages)) return false;
 
@@ -470,10 +481,65 @@ function sanitizeContentBlocks(body: Record<string, unknown>): boolean {
 
     for (const block of content) {
       if (!isPlainObject(block)) continue;
-      // Strip cache_control from ANY block that is not type:"text".
-      // ZCode gateway only accepts cache_control on text blocks.
-      if (block.type !== "text" && "cache_control" in block) {
-        delete block.cache_control;
+
+      // cache_control stripping — see function header for mode logic.
+      if ("cache_control" in block) {
+        const shouldStrip = startPlan
+          ? true // start-plan: strip from ALL blocks (including text)
+          : block.type !== "text"; // coding-plan: strip from non-text only
+        if (shouldStrip) {
+          delete block.cache_control;
+          changed = true;
+        }
+      }
+
+      // is_error stripping on tool_result blocks (both modes).
+      // ZCode gateway doesn't accept this field — it's Claude Code metadata
+      // that the upstream doesn't need.
+      if (block.type === "tool_result" && "is_error" in block) {
+        delete block.is_error;
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+/**
+ * Normalize `tool_result.content` from string to array format.
+ *
+ * Anthropic's official API accepts both formats for `tool_result.content`:
+ *   - string:  `{ type: "tool_result", content: "result text" }`
+ *   - array:   `{ type: "tool_result", content: [{ type: "text", text: "..." }] }`
+ *
+ * Claude Code sends the **string** format. However, the ZCode gateway (and
+ * some other Anthropic-compatible upstreams) ONLY accepts the **array** format
+ * and rejects the string format with 3001 "parameter error".
+ *
+ * This function converts string content to the array format by wrapping it in
+ * a single text block. Array content is left untouched. Non-tool_result blocks
+ * are not affected.
+ *
+ * No-op if `messages` is missing or not an array.
+ */
+function normalizeToolResultContent(body: Record<string, unknown>): boolean {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return false;
+
+  let changed = false;
+  for (const msg of messages) {
+    if (!isPlainObject(msg)) continue;
+    const content = msg.content;
+    if (!Array.isArray(content)) continue;
+
+    for (const block of content) {
+      if (!isPlainObject(block)) continue;
+      if (block.type !== "tool_result") continue;
+
+      // Convert string content to array format.
+      // Anthropic accepts both, but ZCode gateway requires array.
+      if (typeof block.content === "string") {
+        block.content = [{ type: "text", text: block.content }];
         changed = true;
       }
     }

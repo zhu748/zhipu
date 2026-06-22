@@ -529,7 +529,15 @@ function summarizeBody(body: unknown): string {
         const t = blk.type ?? "?";
         // Annotate cache_control presence so tool_result+cache_control is visible
         const cc = blk.cache_control ? "+cc" : "";
-        return `${t}${cc}`;
+        // For tool_result blocks, show content format (str vs arr) and is_error
+        // presence — these are common 3001 triggers on ZCode gateway.
+        let suffix = "";
+        if (t === "tool_result") {
+          if (typeof blk.content === "string") suffix = "/str";
+          else if (Array.isArray(blk.content)) suffix = "/arr";
+          if ("is_error" in blk) suffix += "/+err";
+        }
+        return `${t}${cc}${suffix}`;
       });
       return `[${i}]${role}/{${types.join(",")}}`;
     });
