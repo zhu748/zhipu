@@ -1,5 +1,15 @@
 # zcode-proxy 使用说明
 
+> **v2.1.3.4beta0 — 增加 3001 诊断日志**
+> - 上一版 `v2.1.3.3beta0` 修复了 thinking 块剥离，但用户反馈第二轮仍报 3001。这次增加诊断日志，帮助定位真正原因：
+> - **启动时打印版本号**：`zcode-proxy 2.1.3.4beta0 listening on http://...`，用户可一眼确认运行的是新版
+> - **thinking 块剥离计数日志**：每次请求打印 `${reqId} thinking blocks: N → M (stripped K)`，确认剥离逻辑生效
+> - **3001 错误时打印转换后请求体摘要**：上游返回 4xx 时打印 `transformed request summary: ...`，包含：
+>   - 顶层 `thinking` / `context_management` / `output_config` / `metadata` 字段状态
+>   - 每条消息的 `role` + content block 类型列表（如 `[0]user/{text,text}, [1]assistant/{text,tool_use}, [2]user/{tool_result}`）
+>   - `system` 块数量、`tools` 数量
+> - **升级方式**：下载新版 exe 替换旧的，重启代理。如果第二轮仍报 3001，请把代理控制台的日志（含 `transformed request summary` 那行）发回来，就能精确定位是哪个字段触发了 GLM 的参数校验。
+>
 > **v2.1.3.3beta0 — 修复 Claude Code 多轮对话 3001 报错**
 > - **修复 Claude Code 第二轮起报 `3001 parameter error`**：代理之前只处理顶层 `thinking` 字段、剥离 `context_management` / `output_config`、迁移 `role:"system"` 消息，但**漏掉了 `messages[].content` 数组里回传的 `thinking` 内容块**。
 >   - 第一轮代理发 `thinking:{type:"enabled"}` → GLM 上游返回 `thinking_delta` SSE 事件

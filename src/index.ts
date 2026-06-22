@@ -16,7 +16,7 @@ import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const VERSION = "2.1.3";
+const VERSION = "2.1.3.4beta0";
 
 main();
 
@@ -180,7 +180,7 @@ async function serve(configPath?: string): Promise<void> {
 
   const server = startServer({ config, auth, configPath: path });
   const url = `http://${server.hostname}:${server.port}`;
-  console.log(`zcode-proxy listening on ${url}`);
+  console.log(`zcode-proxy ${VERSION} listening on ${url}`);
   console.log(`  provider: ${config.provider}`);
   console.log(`  plan: ${config.plan}`);
   console.log(`  auth mode: ${config.auth.mode}`);

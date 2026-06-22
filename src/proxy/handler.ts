@@ -137,6 +137,17 @@ export async function proxyRequest(
   const transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: config.plan === "start-plan" });
   const transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
 
+  // Diagnostic: log thinking-block strip counts so users can verify the fix
+  // is actually running. If the count goes from N → 0, the strip worked.
+  // If N > 0 in the transformed body, something is wrong.
+  if (format === "anthropic") {
+    const before = countThinkingBlocks(parsedBody);
+    const after = countThinkingBlocks(transformedObj);
+    if (before > 0 || after > 0) {
+      console.log(`${reqId} thinking blocks: ${before} → ${after} (stripped ${before - after})`);
+    }
+  }
+
   let captchaHeaders: Record<string, string> | undefined;
   if (config.plan === "start-plan") {
     try {
@@ -355,6 +366,23 @@ export async function proxyRequest(
 
   const isSSE = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;
 
+  // Diagnostic: when the upstream rejects with 4xx (especially 3001 "parameter
+  // error" from GLM), dump a summary of the TRANSFORMED request body so we can
+  // see exactly what was sent. This is the single most useful artifact for
+  // debugging 3001 — without it we can only guess what GLM disliked.
+  if (!upstreamResp.ok && upstreamResp.status >= 400 && upstreamResp.status < 500) {
+    const errPeek = await upstreamResp.text().catch(() => "");
+    console.log(`${reqId} upstream ${upstreamResp.status} ${errPeek.slice(0, 200)}`);
+    console.log(`${reqId} transformed request summary: ${summarizeBody(transformedObj ?? parsedBody)}`);
+    // Reconstruct the response with the peeked body so the passthrough below
+    // still has something to send. upstreamResp.text() consumed the body.
+    upstreamResp = new Response(errPeek, {
+      status: upstreamResp.status,
+      statusText: upstreamResp.statusText,
+      headers: upstreamResp.headers,
+    });
+  }
+
   if (translateMode) {
     if (!upstreamResp.ok) {
       const errBody = await upstreamResp.text().catch(() => "");
@@ -401,6 +429,84 @@ async function readBody(req: Request): Promise<string | undefined> {
   const text = await req.text();
   if (text.length === 0) return undefined;
   return text;
+}
+
+/**
+ * Count `thinking` / `redacted_thinking` content blocks across all messages.
+ * Used for diagnostic logging so users can verify the strip-thinking-blocks
+ * transform actually fired.
+ */
+function countThinkingBlocks(body: unknown): number {
+  if (!body || typeof body !== "object") return 0;
+  const messages = (body as Record<string, unknown>).messages;
+  if (!Array.isArray(messages)) return 0;
+  let count = 0;
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+    const content = (msg as Record<string, unknown>).content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block && typeof block === "object") {
+        const t = (block as Record<string, unknown>).type;
+        if (t === "thinking" || t === "redacted_thinking") count++;
+      }
+    }
+  }
+  return count;
+}
+
+/**
+ * Build a one-line summary of the transformed request body for diagnostic
+ * logging on upstream 4xx. Shows top-level fields that GLM commonly rejects
+ * (thinking, context_management, output_config), the message role/content-type
+ * sequence (so role-alternation issues are visible), and the system block count.
+ *
+ * The full body can be 90KB+; this summary is <500 chars and surfaces exactly
+ * the fields that cause GLM 3001 "parameter error".
+ */
+function summarizeBody(body: unknown): string {
+  if (!body || typeof body !== "object") return "(empty)";
+  const b = body as Record<string, unknown>;
+  const parts: string[] = [];
+
+  // Top-level fields GLM cares about
+  if (b.model) parts.push(`model=${b.model}`);
+  parts.push(`thinking=${JSON.stringify(b.thinking)}`);
+  if (b.context_management) parts.push("context_management=present");
+  if (b.output_config) parts.push("output_config=present");
+  if (b.metadata) parts.push(`metadata=${JSON.stringify(b.metadata).slice(0, 80)}`);
+
+  // Messages — role + content block types per message
+  const messages = b.messages;
+  if (Array.isArray(messages)) {
+    const msgSummary = messages.map((m: unknown, i: number) => {
+      if (!m || typeof m !== "object") return `[${i}]?`;
+      const msg = m as Record<string, unknown>;
+      const role = msg.role ?? "?";
+      const content = msg.content;
+      if (typeof content === "string") return `[${i}]${role}/str`;
+      if (!Array.isArray(content)) return `[${i}]${role}/?`;
+      const types = content.map((c: unknown) =>
+        (c && typeof c === "object") ? (c as Record<string, unknown>).type ?? "?" : "?"
+      );
+      return `[${i}]${role}/{${types.join(",")}}`;
+    });
+    parts.push(`msgs[${msgSummary.join(",")}]`);
+  }
+
+  // System block count (relocation may have changed it)
+  if (Array.isArray(b.system)) {
+    parts.push(`system=${b.system.length} blocks`);
+  } else if (typeof b.system === "string") {
+    parts.push("system=string");
+  }
+
+  // Tool count
+  if (Array.isArray(b.tools)) {
+    parts.push(`tools=${b.tools.length}`);
+  }
+
+  return parts.join(" | ");
 }
 
 /**
