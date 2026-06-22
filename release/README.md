@@ -1,238 +1,121 @@
 # zcode-proxy 使用说明
 
-> **v2.1.3.11beta0 — 修复 Responses API (Codex CLI) 空 string content 触发 3001**
-> - **根因定位**：v2.1.3.10beta0 修复了 Claude Code 的 3001，但 Codex CLI 走 `/v1/responses` 接口仍有同样问题。Responses API 翻译层 (`responses-to-anthropic.ts`) 会在多个场景产生**空 string content**：
->   - `translateMessageContent()` 对空/缺失 content 返回 `""`
->   - `mergeContent()` 把全空 text 块合并成 `""`
->   - `function_call_output` 的 output 为空时 `content: ""`
-> - **问题**：这些空 string 经 `normalizeAllMessageContent` 转成 `[{type:"text", text:""}]` — **空 text 块**！这正是 v2.1.3.10beta0 修复的同一问题，但翻译层产生的空 string **绕过了** `ensureAssistantTextBlock`（因为该函数只检查"有没有 text 块"，不检查"text 是否为空"）。
-> - **修复**：`normalizeAllMessageContent()` 和 `normalizeToolResultContent()` 现在把**空 string** 转成 `text:" "`（单空格），跟 `ensureAssistantTextBlock` 的非空占位符策略一致。
->   - 空 string content → `[{type:"text", text:" "}]`（非空）
->   - 非空 string content → `[{type:"text", text:"原内容"}]`（不变）
-> - **影响范围**：Claude Code 和 Codex CLI 路径都受益——任何来源的空 string content 都会被标准化为非空
-> - **新增 4 个测试**：覆盖空 user content、空 assistant content、非空 string 保留、Codex CLI 的 `function_call_output` 空输出场景；全套 295 测试通过
+> **v2.1.3.4 — 正式版（Claude Code + Codex CLI 双客户端适配）**
 >
-> **v2.1.3.10beta0 — 非空 text 占位符 + 全消息 content 标准化 + 4xx 完整 body dump**
-> - **根因定位**：v2.1.3.9beta0 已修复 text+cc / tool_result string / is_error，但用户反馈第 3 轮（首次 tool 调用后）仍报 3001：
->   ```
->   msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,
->        [3]assistant/{text,tool_use},[4]user/{tool_result/arr}]
->   ```
->   所有之前修复的字段都正确了（text 无 cc、tool_result 是 arr、无 is_error）。#001/#002（无 tool）成功，#004（有 tool）失败——问题在 `[3]assistant/{text,tool_use}` 或 `[4]user/{tool_result/arr}`。
-> - **核心推理**：`[3]` 的 text 块是 `ensureAssistantTextBlock` 在 thinking 剥离后插入的——之前插入的是 **空字符串** `text:""`。**ZCode 网关可能不接受空 text 块**。
-> - **修复 1：空 text 块 → 非空占位符**
->   - `ensureAssistantTextBlock()` 和 `stripThinkingBlocksFromMessages()` 现在插入 `text:" "`（单空格）而不是 `text:""`
->   - 单空格在对话中渲染为不可见，但技术上是"非空"的，满足可能存在的"非空 text"校验
-> - **修复 2：标准化所有消息 content 为 array 格式**
->   - 新增 `normalizeAllMessageContent()`，把所有 user/assistant 消息的 string content 转为 array `[{type:"text", text:"..."}]`
->   - 之前只标准化了 `tool_result.content`，现在 user/assistant 的 string content 也统一转 array
->   - 日志中 `[2]user/str` 会变成 `[2]user/{text}` — 更统一的格式
-> - **修复 3：4xx 时 dump 完整 transformed body 到文件**
->   - 3001 时把实际发送的请求体写入 `zcode-proxy-debug-<reqId>.json`（在代理工作目录下）
->   - 日志会打印 `full transformed body dumped to: /path/to/zcode-proxy-debug-004.json`
->   - 用户可以把这个文件发回来，我能看到 EXACT 的请求内容（不再只是 summary）
-> - **测试更新**：5 个现有测试更新以匹配新的非空 text 和 array content 行为；全套 291 测试通过，TypeScript 类型检查零错误
+> 经过 11 个 beta 版本迭代验证，现已稳定支持 Claude Code（`/v1/messages`）和 Codex CLI（`/v1/responses`）在 start-plan 模式下多轮对话 + 工具调用。
 >
-> **如果 v2.1.3.10beta0 仍 3001**：请把代理目录下新生成的 `zcode-proxy-debug-XXX.json` 文件发回来——这次能看到完整请求体，精确定位是哪个字段
+> **正式版包含的关键修复**（按重要性排序）：
+> 1. **请求体 content 全标准化**：所有 string content → array `[{type:"text", text:"..."}]`，空 string → 非空 `" "` 占位
+> 2. **start-plan 模式剥离所有 cache_control**：ZCode 网关不接受任何块上的 cache_control（包括 text 块）
+> 3. **剥离 tool_result.is_error**：ZCode 网关不接受该字段
+> 4. **assistant 消息非空 text 占位**：thinking 剥离后插入 `text:" "` 而非 `text:""`
+> 5. **过滤 anthropic-beta header**：start-plan 模式只保留 `claude-code-*` flag，剥离所有其它
+> 6. **剥离 thinking 内容块**：messages[].content 里的 thinking/redacted_thinking 块全部移除
+> 7. **剥离顶层 unsupported 字段**：context_management、output_config 移除；thinking.adaptive → enabled
+> 8. **迁移 role:system 消息**：从 messages 数组移到顶层 system 字段
+> 9. **4xx 完整 body dump**：3001 时把实际请求体写入 `zcode-proxy-debug-<reqId>.json`
 >
-> **v2.1.3.9beta0 — start-plan 剥离所有 cache_control + tool_result 标准化**
-> - **根因定位**：v2.1.3.8beta0 已正确过滤 `anthropic-beta` header（只剩 `claude-code-20250219`），但用户反馈第 4 轮仍报 3001：
->   ```
->   msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,
->        [3]assistant/{text+cc,tool_use,tool_use},[4]user/{tool_result,tool_result}]
->   anthropic-beta sent: claude-code-20250219
->   ```
->   header 已对，但请求体里 `[3]assistant/{text+cc, ...}` 的 **text 块上还带着 `cache_control`**！
-> - **核心问题**：v2.1.3.5/6/7beta0 一直假设 "text 块上的 cache_control 是 OK 的，只有非 text 块上的 cc 才会触发 3001"——**这是未经验证的推测**。ZCode 网关很可能完全不接受 cache_control 字段（无论在哪种块上）。
-> - **修复 1：start-plan 模式下剥离所有 cache_control**
->   - `sanitizeContentBlocks()` 在 start-plan 模式下剥离**所有块**（包括 text 块）上的 `cache_control`
->   - `applyAnthropicCacheControl()` 在 start-plan 模式下变成 no-op，不再添加新的 cache_control
->   - coding-plan 模式（直连 GLM 官方 API）保留原有行为，text 块上的 cc 仍可用于 prompt caching
-> - **修复 2：tool_result.content 标准化为数组**
->   - 新增 `normalizeToolResultContent()`，把 `tool_result.content` 从 string 转成 array `[{type:"text", text:"..."}]`
->   - Anthropic 官方 API 接受 string 和 array 两种格式，但 ZCode 网关只接受 array——这是非常常见的兼容性问题
->   - Claude Code 发的是 string 格式（如 `content: "file1\nfile2"`），网关收到直接 3001
-> - **修复 3：剥离 tool_result.is_error 字段**
->   - Claude Code 在 tool_result 上加 `is_error: false`，Anthropic 接受但 ZCode 网关不接受
->   - `sanitizeContentBlocks()` 现在也剥离 tool_result 块上的 `is_error` 字段（两种模式都剥）
-> - **诊断日志增强**：`transformed request summary` 现在显示 tool_result 块的 content 类型（`/str` vs `/arr`）和 is_error 状态（`/+err`）
->   - 例如 `[4]user/{tool_result/str/+err, tool_result/str/+err}` 表示 string content + is_error 字段
->   - 修复后应该看到 `[4]user/{tool_result/arr, tool_result/arr}` （已标准化、is_error 已剥离）
-> - **新增 7 个测试**，包括完整复现 v2.1.3.8beta0 #004 场景的回归测试；全套 291 测试通过，TypeScript 类型检查零错误
->
-> **v2.1.3.8beta0 — 过滤 anthropic-beta header 中网关不支持的 flag**
-> - **根因定位**：v2.1.3.7beta0 诊断日志显示第二轮就 3001，请求体结构完全正确（assistant 有 text 块、cache_control 只在 text 上、角色交替正确、thinking 已剥离）。问题不在 body，在 **header**。
-> - **原因**：Claude Code 发送的 `anthropic-beta` header 包含 7 个 feature flag：
->   ```
->   claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,
->   context-management-2025-06-27,prompt-caching-scope-2026-01-05,
->   mid-conversation-system-2026-04-07,effort-2025-11-24
->   ```
->   代理之前原样透传这个 header，但同时从 body 里剥离了 `context_management`、`output_config`、thinking 块等。**ZCode 网关校验 header 和 body 的一致性**——header 声明支持这些 feature，但 body 里没有对应字段，网关返回 3001。
-> - **修复**：`collectPassthroughHeaders()` 现在过滤 `anthropic-beta` header，只保留 `claude-code-*` flag（客户端标识，不对应 body 字段），剥离所有其它 flag（因为对应的 body 字段已被代理剥离）。
-> - **诊断日志增强**：3001 时额外打印 `anthropic-beta sent: ...`，显示实际发送的 beta flag
-> - **新增 3 个测试**覆盖 header 过滤；全套 284 测试通过
->
-> **v2.1.3.7beta0 — 修复 assistant 消息只有 tool_use 块（无 text）触发 3001**
-> - **根因定位**：v2.1.3.6beta0 诊断日志显示跑了 6 轮才挂，第 7 轮 3001：
->   ```
->   msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,
->        [3]assistant/{tool_use},[4]user/{tool_result},
->        [5]assistant/{tool_use},[6]user/{tool_result},
->        [7]assistant/{tool_use},[8]user/{tool_result},
->        [9]assistant/{text+cc,tool_use},[10]user/{tool_result}]
->   ```
->   所有 `tool_use` 和 `tool_result` 都没有 `+cc` ✅，cache_control 只在 text 块上 ✅，角色交替正确 ✅。
->   **但 [3]、[5]、[7] 这三条 assistant 消息只有 `tool_use` 块，没有 `text` 块！**
-> - **原因**：这些 assistant 消息原本是 `[thinking, tool_use]`，thinking 块被剥离后只剩 `[tool_use]`。**ZCode 网关要求 assistant 消息必须有至少一个 text 块**——Anthropic 官方 API 接受只有 tool_use 的 assistant 消息，但 ZCode 网关更严格。
-> - **为什么前 6 轮能跑**：前几轮的 assistant 消息要么有 text 块，要么 thinking 还没被剥离（第一轮无历史）。随着对话累积，越来越多的 text-less assistant 消息堆积，最终触发网关校验。
-> - **修复**：新增 `ensureAssistantTextBlock()` — 检查每条 assistant 消息，如果没有 text 块就在 content 数组开头插入一个空 text 块 `{type:"text", text:""}`。空 text 块在对话中渲染为空，但满足网关要求。
-> - **新增 5 个测试**，包括完整复现 v2.1.3.6beta0 第 7 轮场景的回归测试；全套 282 测试通过
->
-> **v2.1.3.6beta0 — 修复 tool_use 块上的 cache_control 也触发 3001**
-> - **根因定位**：v2.1.3.5beta0 修复了 tool_result 上的 cache_control，但诊断日志显示新的 3001：
->   ```
->   msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,[3]assistant/{tool_use,tool_use+cc},[4]user/{tool_result,tool_result}]
->   ```
->   `tool_result+cc` 消失了 ✅，但 `[3]assistant/{tool_use,tool_use+cc}` — 第二个 tool_use 块被加上了 cache_control！
-> - **原因**：v2.1.3.5beta0 的 `applyAnthropicCacheControl` 在最后一条消息全是 tool_result 时，往前找上一个消息，把 cache_control 加到了 tool_use 块上。但 **ZCode 网关同样不接受 tool_use 块上的 cache_control**——只接受 text 块上的。
-> - **修复**：
->   1. `sanitizeContentBlocks()` 现在剥离**所有非 text 块**上的 cache_control（tool_use、tool_result、image 等），不管是谁加的
->   2. `applyAnthropicCacheControl()` 现在只把 cache_control 加到 **text 块**上；如果最后几条消息都没有 text 块，就跳过 cache_control（宁可不要 cache 优化也不能 3001）
-> - **新增 3 个测试**，包括复现 v2.1.3.5beta0 回归的多 tool_use 场景；全套 277 测试通过
->
-> **v2.1.3.5beta0 — 修复 start-plan 模式 tool_result+cache_control 触发 3001**
-> - **根因定位**：上一版 `v2.1.3.4beta0` 的诊断日志显示 start-plan 模式下第三轮请求报 3001，转换后的请求体摘要为：
->   ```
->   msgs[[0]user/{text,text},[1]assistant/{text},[2]user/str,[3]assistant/{text,tool_use},[4]user/{tool_result}] | system=6 blocks | tools=27
->   ```
->   thinking 块已正确剥离，角色交替正确，但 `[4]user/{tool_result}` 这个 tool_result 块上带着 `cache_control: {type:"ephemeral"}`（Claude Code 自动加的）。
-> - **ZCode start-plan 网关不接受 tool_result 块上的 cache_control**（只在 text 块上接受），直接返回 3001 "parameter error"。Anthropic 官方 API 接受，但 GLM 网关更严格。
-> - **修复**：
->   1. 新增 `sanitizeContentBlocks()` — 剥离 `tool_result` 块上的 `cache_control` 字段
->   2. 修复 `applyAnthropicCacheControl()` — 不再把 `cache_control` 加到 `tool_result` 块上；如果最后一条消息只有 tool_result 块，往前找 text 块附着；找不到就跳过（宁可不要 cache 优化也不能 3001）
->   3. 诊断日志增强 — `transformed request summary` 现在显示每个块的 cache_control 状态（如 `tool_result+cc` 表示有 cache_control），新增 `tool_result+cache_control: N → M` 计数日志
-> - **新增 6 个测试**，包括一个完整复现 start-plan 第三轮请求结构的回归测试；全套 274 测试通过
->
-> **v2.1.3.4beta0 — 增加 3001 诊断日志**
-> - 上一版 `v2.1.3.3beta0` 修复了 thinking 块剥离，但用户反馈第二轮仍报 3001。这次增加诊断日志，帮助定位真正原因：
-> - **启动时打印版本号**：`zcode-proxy 2.1.3.4beta0 listening on http://...`，用户可一眼确认运行的是新版
-> - **thinking 块剥离计数日志**：每次请求打印 `${reqId} thinking blocks: N → M (stripped K)`，确认剥离逻辑生效
-> - **3001 错误时打印转换后请求体摘要**：上游返回 4xx 时打印 `transformed request summary: ...`，包含：
->   - 顶层 `thinking` / `context_management` / `output_config` / `metadata` 字段状态
->   - 每条消息的 `role` + content block 类型列表（如 `[0]user/{text,text}, [1]assistant/{text,tool_use}, [2]user/{tool_result}`）
->   - `system` 块数量、`tools` 数量
-> - **升级方式**：下载新版 exe 替换旧的，重启代理。如果第二轮仍报 3001，请把代理控制台的日志（含 `transformed request summary` 那行）发回来，就能精确定位是哪个字段触发了 GLM 的参数校验。
->
-> **v2.1.3.3beta0 — 修复 Claude Code 多轮对话 3001 报错**
-> - **修复 Claude Code 第二轮起报 `3001 parameter error`**：代理之前只处理顶层 `thinking` 字段、剥离 `context_management` / `output_config`、迁移 `role:"system"` 消息，但**漏掉了 `messages[].content` 数组里回传的 `thinking` 内容块**。
->   - 第一轮代理发 `thinking:{type:"enabled"}` → GLM 上游返回 `thinking_delta` SSE 事件
->   - Claude Code 把 thinking 内容存进对话历史
->   - 第二轮把含 `thinking` 块的 assistant 历史回传给代理
->   - GLM 上游不接受 `messages[].content` 里的 `thinking` / `redacted_thinking` 块 → 返回 3001
->   - 代理把上游错误透传给 Claude Code → 第二轮直接挂掉
-> - **修复方案**：`body-transformer.ts` 新增 `stripThinkingBlocksFromMessages()`，转发给 GLM 之前剥离 `messages[].content` 里的 `thinking` / `redacted_thinking` 块。若剥离后某条消息内容为空（原本只有 thinking），整条消息直接删除（避免空 assistant turn 再次 3001）。
-> - **新增 9 个单元测试**，包含一个完整复现 Claude Code 第二轮请求结构的回归测试；全套 269 测试通过，TypeScript 类型检查零错误。
->
-> **v2.1.3.3 / v0.1.13 — Dashboard 模型映射 + thinking 无条件注入**
-> - **管理面板新增"模型映射"配置卡片**：在 Settings → 模型路由下面，可配置客户端模型名 → GLM 模型名的重写规则
->   - 例如 Codex CLI 默认发 `gpt-5.5`，可映射到 `glm-5.2` 或任意 GLM 模型
->   - 大小写不敏感精确匹配，`from` 字段去重校验
->   - 持久化到 `config.yaml` 的 `modelMappings` 字段
->   - GLM 模型输入框带 datalist 自动补全（来自当前 models 列表）
-> - **thinking 注入改为无条件**：只要客户端发 `reasoning.effort`，就注入 `thinking: {type:"enabled"}`
->   - 不再按模型 catalog 判断（之前 glm-4.6v / glm-5v-turbo 被跳过）
->   - 用户要开就开，GLM 不支持时由上游自己处理
-> - **模型 rewrite 逻辑升级**：先查 modelMappings，命中就用映射；未命中且非 GLM 模型才 fallback 到 defaultModel
-> - **新增 5 个测试**：3 个 config loader 测试 + 3 个集成测试覆盖映射命中、大小写不敏感、未命中 fallback
->
-> **v2.1.3.2 / v0.1.12 — thinking 字段重新启用（按模型能力）**
-> - **修复 thinking 注入逻辑**：v2.1.3.1 过度保守地移除了 thinking 注入，导致所有模型都不思考。现在按模型能力判断：
->   - **支持 reasoning 的模型**（glm-4.5-air / glm-4.6 / glm-4.7 / glm-5 / glm-5-turbo / glm-5.1 / glm-5.2）：注入 `thinking: {type:"enabled"}`，启用思考
->   - **不支持 reasoning 的模型**（glm-4.6v / glm-5v-turbo）：不注入，避免 3001
->   - **未知模型**：默认注入，让 GLM 自己决定
-> - **新增 3 个单元测试**覆盖 thinking 注入的各种场景
-> - **与 Claude Code 路径行为一致**：body-transformer 仍会规范化 thinking 字段为 GLM 接受的 `{type:"enabled"}` 格式
->
-> **v2.1.3.1 / v0.1.11 — Codex CLI 实战修复**
-> - **修复连续同角色消息合并**：Codex CLI 一次会话会发送多个连续 `user` 消息（每轮一个），Anthropic 上游严格要求 user/assistant 交替，会返回 3001 "parameter error"。代理现在自动合并连续同角色消息
-> - **修复非 GLM 模型 fallback**：Codex 默认发送 `model: "gpt-5.5"`，GLM 上游不识别会 400。代理自动替换为 `config.defaultModel`（默认 `glm-4.6`），并打印日志
-> - **不再注入 `thinking` 字段**：旧 GLM 模型（glm-4.6 / glm-4.5-air / glm-4.6v / glm-5v-turbo）不接受 `thinking` 字段，会 3001。代理现在只在客户端显式发送 `thinking` 时透传（由 body-transformer 规范化）
-> - **新增 2 个集成测试**：覆盖 Codex CLI 实际请求模式（连续 user 消息 + gpt-5.5 模型）
->
-> **v2.1.3.0 / v0.1.10 — OpenAI Responses API 适配（Codex CLI 兼容）**
-> - **新增 `/v1/responses` 端点**：完整支持 OpenAI Responses API，可用于 Codex CLI（`wire_api=responses`）
-> - **完整流式事件序列**：`response.created` → `output_item.added` → `content_part.added` → `output_text.delta` * → `output_text.done` → `content_part.done` → `output_item.done` → `response.completed`
-> - **`previous_response_id` 链式续聊**：内存 LRU 存储 256 轮对话，自动重放历史 input + output
-> - **工具调用双向翻译**：Responses `function_call` / `function_call_output` ↔ Anthropic `tool_use` / `tool_result`，`call_id` 直接复用
-> - **内置工具过滤**：Codex CLI 的 `local_shell` / `web_search` 等自动过滤，只转发 `type:"function"` 工具
-> - **`reasoning.effort` 透传**：映射为 GLM `thinking: { type: "enabled" }`
-> - **零侵入**：对原有 `/v1/chat/completions` 和 `/v1/messages` 链路无影响
-> - **新增 24 个测试**：单元 + 集成 + E2E 全部通过，类型检查零错误
->
-> **Codex CLI 接入方式**：
-> ```bash
-> export OPENAI_API_KEY="your-proxy-secret"
-> export OPENAI_BASE_URL="http://localhost:8080/v1"
-> codex --model glm-4.6
-> ```
->
-> **v2.1.3 / v0.1.9 — 流式重试三连修复（正式版）**
-> - **修复 SSE 错误检测**：GLM 网关在流式请求失败时会返回 HTTP 200 + SSE 流，把 529 错误藏在流里。代理现在能识别这种"隐身错误"并触发重试
-> - **修复重试时 Request body 复用 bug**：之前每次重试都复用同一个 Request 对象，导致 body 已被消耗，所有重试都失败。现在每次重试都构建全新的 Request
-> - **修复重试时 captcha token 过期 bug**：start-plan 模式下 captcha token 只有 45 秒有效期，重试等待期间容易过期导致 403。现在每次重试前都会刷新 token，遇到 403 自动重新求解
-> - **改进错误日志**：catch 块现在会打印实际错误信息（之前只打 "network error"）
-> - **新增 16 个单元测试**：完整测试套件 224/224 通过
->
-> **v2.1.2 / v0.1.8 — Dashboard UI 全面重构**
-> - **设计令牌系统**：完整的 spacing / radius / shadow / typography / motion 令牌，更柔和的深色配色（4 级文本灰度）
-> - **侧边栏重构**：导航分组（监控 / 配置 / 凭证）+ SVG 图标 + 修复 footer `margin-top:auto` + `margin-top:24px` 冲突
-> - **概览页**：新增 Hero 状态卡（运行/异常带不同颜色）+ 统计卡带分类色图标 + 悬浮抬升动画
-> - **设置页（最大改动）**：长表单拆成 7 个 tab（服务器/提供商/认证/模型/重试/身份/日志），底部 sticky 保存栏，每个字段加 help 文案
-> - **表格升级**：sticky header、uppercase 字段名、空状态带 SVG 图标
-> - **统计页**：新增成功率进度条（绿/红/黄三段）
-> - **日志页**：按级别着色（error 红 / warn 黄 / info 蓝 / debug 灰），顶部"实时"状态徽章
-> - **Toast 重写**：顶部居中、带图标、可点击关闭、滑入/滑出动画
-> - **OAuth 等待状态**：脉冲点动画
-> - **响应式**：1100/900/600px 三档断点，900px 以下侧边栏自动折叠为图标栏
-> - **完全向后兼容**：所有 JS 函数名与 DOM ID 保留
->
-> **v0.1.7 修复版本**
-> - **修复 v1 凭证无法在 dashboard 修改 plan 的 bug**：v1 凭证（来自 zcode-api-ref）首次加载时自动迁移为 v2 格式并持久化，避免每次读取都生成新 ID 导致 setAccountPlan 找不到账号
-> - **dashboard 修改 plan 后立即生效**：内存里的凭证热替换，无需重启
-> - **dashboard 显示正确的推断 plan**：v1 凭证 + 有 JWT 时显示 "Start Plan"，不再误显示为 "Coding Plan"
->
-> **v0.1.6 修复版本**
-> - **v1 凭证（来自 zcode-api-ref）自动推断 plan**：加载无 plan 字段的 v1 凭证时，如果带 JWT 则自动推断为 start-plan，否则跟随 config.yaml
-> - **启动日志显示 plan 来源**：清晰说明 plan 是来自凭证显式字段、JWT 推断、还是 config.yaml
->
-> **v0.1.5 修复版本**
-> - **跨项目凭证互通**：zhipu 现在能直接读取 zcode-api-ref (TriDefender/zcode-api) 创建的 `credentials.json`，无需重新登录
-> - **解密 fallback 链扩充**：依次尝试 (1) 当前 SHA-256/Node-crypto 格式 → (2) 早期 SHA-256/WebCrypto 格式 → (3) zcode-api-ref 的 XOR-fold/WebCrypto 格式
->
-> **v0.1.4 修复版本**
-> - **导入密钥时自动识别 plan**：从 ZCode config 导入时，自动检测 `enabled: true` 的那个 plan 作为账号的 plan，无需用户手动选择
-> - **`--plan=` 改为可选的强制覆盖**：默认走自动识别，加 `--plan=` 可强制指定
-> - **多账户场景完整支持**：可以多次 `--import` 导入不同 plan 的账号（自动 + 强制组合），dashboard 切换账号时各自带各自的 plan
->
-> **v0.1.3 修复版本**
-> - **修复 start.bat 导入菜单静默默认 coding-plan 的问题**：菜单 6/7 拆成 4 项 (Bigmodel/Z.AI × Coding/Start Plan)，每项都明确传 `--plan=` flag
->
-> **v0.1.2 修复版本**
-> - **修复导入密钥时 "Failed to decrypt credential store" 报错**：当 `~/.zcode-proxy/credentials.json` 损坏或换机器/换用户名后无法解密时，自动备份旧文件并重新创建，不再阻塞登录
->
-> **v0.1.1 修复版本**
-> - **修复 admin 面板 ENOENT 报错**：编译后的 exe 不再因找不到 `dashboard.html` 而崩溃
-> - **修复 start.bat 启动时变成 coding-plan 的问题**：`--config` flag 现在能正确解析
-> - **修复双击 exe 切换 start-plan 时闪退**：错误信息现在会清晰显示并暂停 15 秒
-> - **修复 dashboard 切换 plan 后重启丢失**：plan 变更会持久化到 config.yaml
->
-> **v0.1.0 新特性**
-> - **多账号管理**：支持同时存储多套凭证（智谱 / Z.AI），运行时一键切换
-> - **OAuth 回调 URL 手动输入**：当自动轮询失败或远程服务器无浏览器时，可手动粘贴回调 URL 完成授权
-> - **路由规则持久化**：dashboard 中的 per-model 路由规则会保存到 config.yaml
-> - **统计重置**：dashboard 支持手动清零请求统计
-> - **修复日志流**：日志面板 WebSocket 改用 SSE (EventSource)，不再断连
+> 全套 295 测试通过，TypeScript 类型检查零错误。
+
+---
+
+## 客户端适配性
+
+| 客户端 | 接入路径 | 状态 | 备注 |
+|--------|---------|------|------|
+| **Claude Code** (Anthropic CLI) | `/v1/messages` (Anthropic 原生格式) | ✅ 完全适配 | 多轮对话 + 27 工具 + thinking 已验证 |
+| **Codex CLI** (OpenAI Responses) | `/v1/responses` (翻译到 Anthropic) | ✅ 完全适配 | 工具调用 + 链式续聊已验证 |
+| **OpenAI 兼容客户端** | `/v1/chat/completions` (翻译到 Anthropic) | ✅ 兼容 | 早期版本已支持，未做改动 |
+| **Anthropic SDK 直连** | `/v1/messages` (透传) | ✅ 兼容 | coding-plan/start-plan 均可 |
+
+### Claude Code 接入
+
+在 `~/.claude/settings.json` 中配置：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "你的proxyApiKey（config.yaml中配置的）",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8080",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.7",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.2",
+    "API_TIMEOUT_MS": "3000000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
+}
+```
+
+> 如果 `config.yaml` 中没有设置 `proxyApiKey`，则 `ANTHROPIC_AUTH_TOKEN` 可以填任意值。
+
+### Codex CLI 接入
+
+```bash
+export OPENAI_API_KEY="your-proxy-secret"
+export OPENAI_BASE_URL="http://localhost:8080/v1"
+codex --model glm-5.2
+```
+
+---
+
+## ⚠️ 维护者必读 — body-transformer 逻辑说明
+
+**这个文件是经过 ~10 次 3001 报错迭代调试出来的，每个 transform 都是为了解决 ZCode start-plan 网关的特定拒绝场景。不要盲目简化、合并、重排序！**
+
+完整逻辑说明在 `src/proxy/body-transformer.ts` 文件顶部的注释里（约 90 行），这里是要点摘要：
+
+### 每个 transform 存在的原因
+
+| Transform | 解决的问题 | 移除会怎样 |
+|-----------|-----------|-----------|
+| `transformUnsupportedAnthropicFields` | Claude Code 发 `thinking:{type:"adaptive"}`、`context_management`、`output_config`，GLM 不接受 | 3001 |
+| `relocateSystemMessages` | Claude Code 把 system 放 `messages[].role:"system"`，Anthropic 要求放顶层 `system` | 3001 |
+| `stripThinkingBlocksFromMessages` | GLM 返回 thinking_delta，Claude Code 回传时含 `thinking`/`redacted_thinking` 内容块，GLM 不接受 | 第二轮起 3001 |
+| `ensureAssistantTextBlock` | thinking 剥离后 assistant 只剩 tool_use 块，网关要求 assistant 必须有 text 块 | 多轮后 3001 |
+| `normalizeAllMessageContent` | string content 必须转 array；空 string 必须转非空占位 `" "` | 3001（Codex CLI 路径关键） |
+| `normalizeToolResultContent` | tool_result.content 同上，string → array，空 → 非空 | 3001 |
+| `sanitizeContentBlocks` | 剥离 cache_control（start-plan 全剥）+ is_error（两种模式都剥） | 3001 |
+| `applyAnthropicCacheControl` | start-plan 模式下 no-op（不添加 cc）；coding-plan 给 text 块加 cc | start-plan 添加 cc 会 3001 |
+
+### Transform 执行顺序（不能乱）
+
+```
+1. transformUnsupportedAnthropicFields    # 顶层字段清理
+2. relocateSystemMessages                  # system 消息迁移
+3. stripThinkingBlocksFromMessages         # 剥离 thinking 块
+4. ensureAssistantTextBlock                # 补非空 text 块
+5. normalizeAllMessageContent              # string content → array
+6. normalizeToolResultContent              # tool_result content → array
+7. sanitizeContentBlocks                   # 剥 cache_control + is_error
+8. applyAnthropicCacheControl              # coding-plan 才加 cc
+```
+
+### 3001 排查指南
+
+如果 3001 复现，按以下顺序检查代理控制台日志：
+
+1. **`transformed request summary:`** — 查看每条消息的块类型
+   - 任何 `+cc` 在非 text 块上 → `sanitizeContentBlocks` 回归
+   - 任何 `tool_result/str` → `normalizeToolResultContent` 回归
+   - 任何 `/+err` → `is_error` 剥离回归
+   - 任何 `[N]user/str` → `normalizeAllMessageContent` 回归
+
+2. **`anthropic-beta sent:`** — 应该只有 `claude-code-*` flag
+   - 有其它 flag → `collectPassthroughHeaders` 回归
+
+3. **`full transformed body dumped to: zcode-proxy-debug-XXX.json`** — 完整请求体
+   - 把这个文件发回开发者精确分析
+
+### ⚠️ 不要做的事
+
+- ❌ **不要** 在 start-plan 模式添加 cache_control — 网关会 3001
+- ❌ **不要** 把空 text 块改回 `text:""` — 网关会 3001
+- ❌ **不要** 保留 `is_error` 字段 — 网关会 3001
+- ❌ **不要** 让 string content 透传 — 网关会 3001
+- ❌ **不要** 重排 transform 顺序 — `sanitizeContentBlocks` 必须在 `applyAnthropicCacheControl` 之前
+- ❌ **不要** 在 `anthropic-beta` header 保留非 `claude-code-*` flag — header/body 不一致会 3001
+
+---
 
 ## 快速启动
 
@@ -411,28 +294,6 @@ retry:
 
 ---
 
-## Claude Code 对接
-
-在 `~/.claude/settings.json` 中配置：
-
-```json
-{
-  "env": {
-    "ANTHROPIC_AUTH_TOKEN": "你的proxyApiKey（config.yaml中配置的）",
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8080",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.7",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.2",
-    "API_TIMEOUT_MS": "3000000",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
-  }
-}
-```
-
-> 如果 `config.yaml` 中没有设置 `proxyApiKey`，则 `ANTHROPIC_AUTH_TOKEN` 可以填任意值。
-
----
-
 ## 支持的模型
 
 | 模型 | 上下文 | 最大输出 | 推理模式 |
@@ -446,3 +307,26 @@ retry:
 | glm-5v-turbo | 200K | 128K | — |
 | glm-5.1 | 200K | 128K | ✅ |
 | glm-5.2 | **1M** | 128K | ✅ |
+
+---
+
+## 版本演进历史（精简）
+
+正式版 v2.1.3.4 整合了以下 beta 版本的修复：
+
+- **v2.1.3.11beta0** — Responses API 空 string content → 非空占位（Codex CLI 关键修复）
+- **v2.1.3.10beta0** — 非空 text 占位符 + 全消息 content 标准化 + 4xx 完整 body dump
+- **v2.1.3.9beta0** — start-plan 剥离所有 cache_control + tool_result content 标准化 + is_error 剥离
+- **v2.1.3.8beta0** — 过滤 anthropic-beta header（只保留 claude-code-* flag）
+- **v2.1.3.7beta0** — assistant 消息必须有 text 块
+- **v2.1.3.6beta0** — tool_use 块上的 cache_control 剥离
+- **v2.1.3.5beta0** — tool_result 块上的 cache_control 剥离
+- **v2.1.3.4beta0** — 增加 3001 诊断日志
+- **v2.1.3.3beta0** — 剥离 messages[].content 里的 thinking 块
+- **v2.1.3.3** — Dashboard 模型映射 + thinking 无条件注入
+- **v2.1.3.2** — thinking 字段重新启用（按模型能力）
+- **v2.1.3.1** — Codex CLI 实战修复（连续同角色消息合并 + 非 GLM 模型 fallback）
+- **v2.1.3.0** — OpenAI Responses API 适配（Codex CLI 兼容）
+- **v2.1.3** — 流式重试三连修复（SSE 错误检测 + Request body 复用 + captcha token 过期）
+- **v2.1.2** — Dashboard UI 全面重构
+- **v0.1.x** — 多账号管理 / OAuth 回调 / 跨项目凭证互通 / 导入密钥 plan 自动识别

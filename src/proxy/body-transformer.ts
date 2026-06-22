@@ -4,27 +4,91 @@
  * original body is returned unchanged) so a malformed body never breaks the
  * proxy: it just loses the optimization.
  *
- * Transformations applied:
- *   1. OpenAI + `stream: true` → inject `stream_options.include_usage: true`
- *      (matches `@ai-sdk/openai-compatible` default in `_reverse/zcode.cjs`).
- *   2. Anthropic format → add `cache_control: { type: "ephemeral" }` to the
- *      last non-system message (mirrors `HLr` ("finalizeLatestNonSystemCacheControl")
- *      at offset ~636888 in the bundle). Anthropic's API silently ignores
- *      `cache_control` below the per-model token floor, so unconditional add
- *      is safe and matches ZCode's `applyCacheControl: true` default.
- *   3. Anthropic format + `ctx.userId` set → inject `metadata: { user_id }`.
- *      Mirrors `user_id: B.metadata.userId` at bundle offset ~4760586.
- *   4. Anthropic format → transform fields unsupported by GLM upstream
- *      (convert `thinking` to GLM format, strip `context_management`,
- *      `output_config`) and relocate `role: "system"` messages from the
- *      messages array to the `system` field.
- *      These Claude-Code-specific fields cause upstream 3001 "parameter error".
- *   5. Anthropic format → strip `thinking` / `redacted_thinking` content
- *      blocks from `messages[].content`. GLM upstream only accepts the
- *      top-level `thinking` field — thinking blocks echoed back in assistant
- *      history (which Claude Code sends on turn 2+) cause 3001 "parameter
- *      error". Without this, only the first turn of a Claude Code session
- *      succeeds; every subsequent turn 3001s.
+ * ⚠️⚠️⚠️ READ BEFORE MODIFYING — DO NOT BLINDLY REMOVE TRANSFORMS ⚠️⚠️⚠️
+ *
+ * This file is the result of ~10 iterations of debugging 3001 "parameter
+ * error" from the ZCode start-plan gateway. Every transformation here exists
+ * because the gateway REJECTED the request without it. Removing any of them
+ * WILL reintroduce 3001 in some scenario. If you're tempted to "simplify"
+ * or "clean up" this file, READ THE HISTORY BELOW FIRST.
+ *
+ * === WHY EACH TRANSFORM EXISTS ===
+ *
+ * 1. `transformUnsupportedAnthropicFields` — Claude Code sends
+ *    `thinking:{type:"adaptive"}`, `context_management`, `output_config`.
+ *    GLM only accepts `thinking:{type:"enabled"|"disabled"}` and has no
+ *    equivalent for the other two. Sending them → 3001.
+ *
+ * 2. `relocateSystemMessages` — Claude Code puts system text in
+ *    `messages[].role:"system"`. Anthropic API requires system in top-level
+ *    `system` field. GLM rejects `role:"system"` in messages → 3001.
+ *
+ * 3. `stripThinkingBlocksFromMessages` — When thinking is enabled, GLM
+ *    returns thinking_delta SSE events. Claude Code captures these and
+ *    echoes them back as `thinking`/`redacted_thinking` content blocks in
+ *    the NEXT turn's assistant message. GLM does NOT accept these as
+ *    content blocks → 3001 on turn 2+. Without this, only turn 1 succeeds.
+ *
+ * 4. `ensureAssistantTextBlock` — After #3 strips thinking blocks, an
+ *    assistant message may be left with ONLY tool_use blocks. ZCode gateway
+ *    requires every assistant message to have at least one text block → 3001
+ *    if missing. We insert `text:" "` (single space, NOT empty — empty text
+ *    also 3001s) at the front.
+ *
+ * 5. `normalizeAllMessageContent` — Claude Code and the Responses API
+ *    translator both produce `content: "string"` for simple text. ZCode
+ *    gateway ONLY accepts array format `content:[{type:"text",text}]` → 3001
+ *    on string content. EMPTY strings become empty text blocks → also 3001,
+ *    so empty strings are converted to `text:" "` (non-empty placeholder).
+ *
+ * 6. `normalizeToolResultContent` — Same as #5 but for `tool_result.content`.
+ *    Claude Code sends `content:"file1\nfile2"` (string). ZCode gateway
+ *    requires array → 3001. Empty output → `text:" "`.
+ *
+ * 7. `sanitizeContentBlocks` — Strips two fields:
+ *    a. `cache_control` — In start-plan mode, stripped from ALL blocks
+ *       (including text). ZCode gateway rejects cache_control on ANY block.
+ *       In coding-plan mode, stripped from non-text blocks only (direct GLM
+ *       API accepts cache_control on text for prompt caching).
+ *       DO NOT re-add cache_control in start-plan — it WILL 3001.
+ *    b. `is_error` (tool_result only) — Claude Code adds `is_error:false`.
+ *       ZCode gateway doesn't accept this field → 3001. Strip in both modes.
+ *
+ * 8. `applyAnthropicCacheControl` — In coding-plan mode, adds cache_control
+ *    to the last text block of the last non-system message (for prompt
+ *    caching). In start-plan mode, this is a NO-OP — see #7a above.
+ *
+ * 9. `applyAnthropicUserId` — In OAuth mode, injects `metadata.user_id`.
+ *    ZCode gateway expects this for tracking. No-op in apikey mode.
+ *
+ * === TRANSFORM ORDER MATTERS ===
+ *
+ * The transforms run in a specific order (see `transformRequestBodyObj`):
+ *   thinking fields → system relocation → thinking block strip →
+ *   assistant text ensure → content normalize → tool_result normalize →
+ *   sanitize (cc + is_error) → cache_control add
+ *
+ * Reordering will break things. For example, `sanitizeContentBlocks` MUST
+ * run AFTER `applyAnthropicCacheControl` would have run (it's the safety
+ * net), but since `applyAnthropicCacheControl` is no-op in start-plan,
+ * `sanitizeContentBlocks` is the only cc authority there. In coding-plan,
+ * `sanitizeContentBlocks` strips non-text cc first, then
+ * `applyAnthropicCacheControl` adds cc to text only — so even if a future
+ * edit accidentally adds cc to a non-text block, sanitize would catch it
+ * on the NEXT request (but not this one, since sanitize runs before add).
+ *
+ * === DEBUGGING 3001 ===
+ *
+ * If 3001 still occurs:
+ *   1. Check the proxy console for `transformed request summary:` line.
+ *      It shows every message's role + block types + cc markers + tool_result
+ *      content format. ANY `+cc` on non-text blocks, ANY `/str` on tool_result,
+ *      ANY `/+err` on tool_result indicates a regression.
+ *   2. Check the dumped `zcode-proxy-debug-<reqId>.json` file in the proxy's
+ *      working directory — it contains the FULL transformed request body.
+ *   3. The `anthropic-beta sent:` line should show ONLY `claude-code-*` flags
+ *      in start-plan mode. Other flags reference features we strip from the
+ *      body, causing header/body mismatch → 3001.
  *
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
  */
