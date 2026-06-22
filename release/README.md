@@ -1,8 +1,12 @@
 # zcode-proxy 使用说明
 
+> **v0.1.4 修复版本**
+> - **导入密钥时自动识别 plan**：从 ZCode config 导入时，自动检测 `enabled: true` 的那个 plan 作为账号的 plan，无需用户手动选择
+> - **`--plan=` 改为可选的强制覆盖**：默认走自动识别，加 `--plan=` 可强制指定
+> - **多账户场景完整支持**：可以多次 `--import` 导入不同 plan 的账号（自动 + 强制组合），dashboard 切换账号时各自带各自的 plan
+>
 > **v0.1.3 修复版本**
-> - **修复导入密钥时 plan 默认成 coding-plan 的问题**：start.bat / start.sh 菜单现在拆成 4 个导入选项，明确区分 coding-plan / start-plan，不再静默默认
-> - **CLI 加 hint**：`auth login` 没传 `--plan=` 时会打印提示，避免用户误以为 plan 是机器自动识别的
+> - **修复 start.bat 导入菜单静默默认 coding-plan 的问题**：菜单 6/7 拆成 4 项 (Bigmodel/Z.AI × Coding/Start Plan)，每项都明确传 `--plan=` flag
 >
 > **v0.1.2 修复版本**
 > - **修复导入密钥时 "Failed to decrypt credential store" 报错**：当 `~/.zcode-proxy/credentials.json` 损坏或换机器/换用户名后无法解密时，自动备份旧文件并重新创建，不再阻塞登录

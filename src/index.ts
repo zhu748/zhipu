@@ -125,9 +125,15 @@ async function serve(configPath?: string): Promise<void> {
       );
     }
     auth.setOAuthCredential(cred);
-    // Sync plan from the stored credential if it has an explicit plan
+    // Sync plan from the stored credential if it has an explicit plan.
+    // The credential's plan wins over config.yaml because the credential
+    // determines which upstream URL and auth headers we use — sending
+    // start-plan JWT to a coding-plan endpoint (or vice versa) would fail.
+    // If the user wants to change plan, they should switch accounts in
+    // the dashboard (each account carries its own plan).
     if (cred.plan && cred.plan !== config.plan) {
       console.log(`  Overriding plan from credential: ${config.plan} → ${cred.plan}`);
+      console.log(`  (Account "${cred.provider}" is a ${cred.plan} credential.)`);
       config.plan = cred.plan;
     }
   }
@@ -191,10 +197,11 @@ async function authLogin(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Warn when plan is not explicitly set — prevents the "why did my start-plan
-  // get imported as coding-plan?" confusion. The default is coding-plan for
-  // backward compat, but the user should be reminded to be explicit.
-  if (!planFlag) {
+  // Helpful hint when --plan= is omitted. For --import mode, the proxy
+  // auto-detects the active plan from ZCode config, so no hint needed.
+  // For OAuth mode, plan determines which credential structure to build,
+  // so we remind the user to be explicit if they omit it.
+  if (!planFlag && !importMode) {
     console.log(`[hint] --plan= not specified, defaulting to coding-plan.`);
     console.log(`[hint] If you meant to use start-plan, re-run with: --plan=start-plan`);
     console.log();
@@ -205,7 +212,10 @@ async function authLogin(args: string[]): Promise<void> {
   let cred: Credential;
 
   if (importMode) {
-    cred = importFromZCodeConfig(provider, plan);
+    // For --import: pass undefined when --plan= was NOT specified, so
+    // importFromZCodeConfig can auto-detect from ZCode config's enabled flag.
+    // Only pass plan when user explicitly set --plan= (forced override).
+    cred = importFromZCodeConfig(provider, planFlag ? plan : undefined);
   } else {
     const { accessToken, userId, jwt } = await runOAuth(provider);
     console.log("\nResolving API key...");
@@ -215,10 +225,13 @@ async function authLogin(args: string[]): Promise<void> {
   }
 
   await saveCredential(cred);
-  console.log(`\nLogged in as ${provider} (${plan}).`);
+  // Use cred.plan (auto-detected) instead of the local `plan` variable,
+  // because import mode may have auto-detected a different plan than the default.
+  const actualPlan = cred.plan || plan;
+  console.log(`\nLogged in as ${provider} (${actualPlan}).`);
   console.log(`  API Key: ${cred.apiKey.substring(0, 12)}...`);
   if (cred.userId) console.log(`  User ID: ${cred.userId}`);
-  console.log(`  Plan:    ${cred.plan}`);
+  console.log(`  Plan:    ${actualPlan}`);
   console.log(`  Stored:  ${getStorePath()}`);
 }
 
@@ -271,7 +284,16 @@ async function runOAuth(provider: ProviderId): Promise<{ accessToken: string; us
   return { accessToken: result.accessToken, userId: result.userId, jwt: result.jwt };
 }
 
-function importFromZCodeConfig(provider: ProviderId, plan: PlanId = "coding-plan"): Credential {
+function importFromZCodeConfig(provider: ProviderId, forcedPlan?: PlanId): Credential {
+  // Auto-detect the active plan from ZCode config:
+  //   - The plan with `enabled: true` in ZCode config is the user's currently
+  //     subscribed plan. Use that as the imported credential's plan.
+  //   - `--plan=` flag (forcedPlan) overrides auto-detection — useful when the
+  //     user wants to import a specific plan even if it's not the active one.
+  //
+  // This preserves multi-account support: if ZCode config has both plans
+  // enabled (rare but possible), the user can run `--import` twice with
+  // `--plan=coding-plan` and `--plan=start-plan` to get two separate accounts.
   const configPath = join(homedir(), ".zcode", "v2", "config.json");
   let raw: string;
   try {
@@ -283,44 +305,63 @@ function importFromZCodeConfig(provider: ProviderId, plan: PlanId = "coding-plan
   }
 
   const config = JSON.parse(raw) as {
-    provider?: Record<string, { options?: { apiKey?: string }; enabled?: boolean }>;
+    provider?: Record<string, {
+      options?: { apiKey?: string };
+      enabled?: boolean;
+      systemDisabledReason?: string;
+    }>;
   };
 
-  // Read both plan keys from ZCode config
   const codingPlanKey = `builtin:${provider}-coding-plan`;
   const startPlanKey = `builtin:${provider}-start-plan`;
-  const codingPlanApiKey = config.provider?.[codingPlanKey]?.options?.apiKey?.trim() || "";
-  const startPlanToken = config.provider?.[startPlanKey]?.options?.apiKey?.trim() || "";
+  const codingEntry = config.provider?.[codingPlanKey];
+  const startEntry = config.provider?.[startPlanKey];
+  const codingPlanApiKey = codingEntry?.options?.apiKey?.trim() || "";
+  const startPlanToken = startEntry?.options?.apiKey?.trim() || "";
 
-  if (plan === "start-plan") {
-    // For start-plan: the primary credential is the JWT from start-plan key.
-    // The coding-plan API key is still useful as a fallback identifier.
-    if (!startPlanToken && !codingPlanApiKey) {
-      console.error(`No credential found for ${provider} in ZCode config.`);
-      console.error(`Tried: ${codingPlanKey}, ${startPlanKey}`);
-      process.exit(1);
-    }
-    const apiKey = codingPlanApiKey || startPlanToken; // fallback if no coding-plan key
-    const jwt = startPlanToken || undefined;
-    console.log(`Imported from ${configPath} (start-plan)`);
-    if (jwt) console.log(`  Start-plan JWT: ${jwt.slice(0, 12)}...`);
-    if (codingPlanApiKey) console.log(`  Coding-plan API Key: ${codingPlanApiKey.slice(0, 8)}...`);
-    return { apiKey, provider, plan, jwt };
+  // Auto-detect: which plan is actually enabled in ZCode config?
+  // `enabled: true` means the user is actively subscribed to that plan.
+  let detectedPlan: PlanId | null = null;
+  if (codingEntry?.enabled === true && codingPlanApiKey) detectedPlan = "coding-plan";
+  else if (startEntry?.enabled === true && startPlanToken) detectedPlan = "start-plan";
+
+  // User-supplied --plan= overrides detection
+  const plan: PlanId = forcedPlan ?? detectedPlan ?? "coding-plan";
+
+  if (forcedPlan) {
+    console.log(`[import] --plan=${forcedPlan} specified, overriding auto-detected plan (${detectedPlan ?? "none"})`);
+  } else if (detectedPlan) {
+    console.log(`[import] Auto-detected active plan: ${detectedPlan}`);
+  } else {
+    console.log(`[import] No 'enabled: true' plan found in ZCode config — defaulting to coding-plan.`);
+    console.log(`[import] If this is wrong, re-run with --plan=start-plan`);
   }
 
-  // For coding-plan: the primary credential is the API key.
-  // Also capture start-plan JWT if available (stored for potential plan switch later).
+  if (plan === "start-plan") {
+    // start-plan: primary credential is the JWT
+    if (!startPlanToken) {
+      console.error(`No start-plan JWT in ZCode config (looked for ${startPlanKey}).`);
+      console.error(`Available: coding-plan API key=${codingPlanApiKey ? "yes" : "no"}`);
+      process.exit(1);
+    }
+    console.log(`Imported from ${configPath} (start-plan)`);
+    console.log(`  Start-plan JWT:     ${startPlanToken.slice(0, 12)}...`);
+    if (codingPlanApiKey) console.log(`  Coding-plan API Key (captured for fallback): ${codingPlanApiKey.slice(0, 12)}...`);
+    return { apiKey: codingPlanApiKey || startPlanToken, provider, plan, jwt: startPlanToken };
+  }
+
+  // coding-plan: primary credential is the API key
   if (!codingPlanApiKey) {
-    console.error(`No API key for ${codingPlanKey} in ZCode config.`);
+    console.error(`No coding-plan API key in ZCode config (looked for ${codingPlanKey}).`);
     if (startPlanToken) {
-      console.error(`Hint: Found a start-plan token. Use --plan=start-plan to import it instead.`);
+      console.error(`Found a start-plan JWT — re-run with --plan=start-plan to import that instead.`);
     }
     process.exit(1);
   }
-
   const jwt = startPlanToken || undefined;
   console.log(`Imported from ${configPath} (coding-plan)`);
-  if (jwt) console.log(`  Start-plan JWT also captured: ${jwt.slice(0, 12)}...`);
+  console.log(`  Coding-plan API Key: ${codingPlanApiKey.slice(0, 12)}...`);
+  if (jwt) console.log(`  Start-plan JWT (also captured): ${jwt.slice(0, 12)}...`);
   return { apiKey: codingPlanApiKey, provider, plan, jwt };
 }
 
