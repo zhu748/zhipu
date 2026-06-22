@@ -1,5 +1,6 @@
 /**
  * Bun.serve server setup with routing and proxy API key auth.
+ * Includes admin dashboard routes.
  * @see .omo/plans/zcode-proxy.md Task 7
  */
 import type { ProxyConfig } from "../config/types.js";
@@ -7,18 +8,28 @@ import type { AuthManager } from "../auth/manager.js";
 import { handleChatCompletions, handleListModels } from "./routes-openai.js";
 import { handleMessages } from "./routes-anthropic.js";
 import { errorResponse } from "../proxy/handler.js";
+import { handleAdminRoute, type AdminOptions } from "../admin/api.js";
 
 export interface ServerOptions {
   config: ProxyConfig;
   auth: AuthManager;
   /** Override fetch for testing. */
   fetchImpl?: typeof fetch;
+  /** Path to the config file (for admin dashboard save). */
+  configPath?: string;
 }
 
 /** Create a Bun.serve-compatible fetch handler. */
 export function createFetchHandler(opts: ServerOptions): (req: Request) => Promise<Response> {
   const { config, auth } = opts;
   const proxyOpts = { config, auth, fetchImpl: opts.fetchImpl };
+
+  const adminOpts: AdminOptions = {
+    config,
+    auth,
+    configPath: opts.configPath ?? "config.yaml",
+    startTime: Date.now(),
+  };
 
   return async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
@@ -28,6 +39,13 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
     // CORS preflight
     if (method === "OPTIONS") {
       return corsResponse();
+    }
+
+    // Admin dashboard routes (handled before proxy API key auth)
+    // The admin page itself uses cookie/session auth; API routes use proxyApiKey
+    if (path === "/admin" || path === "/admin/" || path.startsWith("/admin/api/")) {
+      const adminResp = await handleAdminRoute(req, adminOpts);
+      if (adminResp) return adminResp;
     }
 
     // Proxy API key auth (if configured)
@@ -78,6 +96,11 @@ export function startServer(opts: ServerOptions): ReturnType<typeof Bun.serve> {
       // Add CORS headers to all responses
       return handler(req).then((resp) => addCorsHeaders(resp));
     },
+    websocket: {
+      open(ws) { /* log stream connections managed via SSE */ },
+      message(ws, msg) { /* no incoming messages expected */ },
+      close(ws) { /* cleanup */ },
+    },
   });
 }
 
@@ -116,7 +139,7 @@ function addCorsHeaders(resp: Response): Response {
 function corsHeaders(): Record<string, string> {
   return {
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
     "access-control-allow-headers": "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta",
     "access-control-max-age": "86400",
   };

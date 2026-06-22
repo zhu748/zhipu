@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>zcode-proxy Dashboard</title>
+<style>
+:root{--bg:#0f172a;--surface:#1e293b;--surface2:#334155;--border:#475569;--text:#e2e8f0;--text2:#94a3b8;--primary:#3b82f6;--primary-h:#2563eb;--success:#22c55e;--warn:#f59e0b;--danger:#ef4444;--radius:8px;--shadow:0 4px 6px -1px rgba(0,0,0,.3)}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+.login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh}
+.login-box{background:var(--surface);padding:40px;border-radius:12px;box-shadow:var(--shadow);width:380px;text-align:center}
+.login-box h1{font-size:24px;margin-bottom:8px}
+.login-box p{color:var(--text2);margin-bottom:24px;font-size:14px}
+.login-box input{width:100%;padding:12px 16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-size:14px;outline:none;margin-bottom:16px}
+.login-box input:focus{border-color:var(--primary)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:10px 20px;border:none;border-radius:var(--radius);font-size:14px;font-weight:500;cursor:pointer;transition:all .15s}
+.btn-primary{background:var(--primary);color:#fff}.btn-primary:hover{background:var(--primary-h)}
+.btn-success{background:var(--success);color:#fff}.btn-danger{background:var(--danger);color:#fff}
+.btn-ghost{background:transparent;color:var(--text2);border:1px solid var(--border)}.btn-ghost:hover{background:var(--surface2)}
+.btn-sm{padding:6px 12px;font-size:12px}
+.app{display:none;height:100vh;overflow:hidden}
+.sidebar{width:220px;background:var(--surface);height:100vh;padding:16px 0;position:fixed;left:0;top:0;border-right:1px solid var(--border);overflow-y:auto}
+.sidebar h2{font-size:16px;padding:0 20px 16px;color:var(--primary);border-bottom:1px solid var(--border);margin-bottom:8px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 20px;cursor:pointer;color:var(--text2);font-size:14px;transition:all .15s;border-left:3px solid transparent}
+.nav-item:hover{background:var(--surface2);color:var(--text)}
+.nav-item.active{background:var(--surface2);color:var(--primary);border-left-color:var(--primary)}
+.nav-item .icon{width:18px;text-align:center;font-size:16px}
+.main{margin-left:220px;height:100vh;overflow-y:auto;padding:24px 32px}
+.page{display:none}.page.active{display:block}
+.page h2{font-size:22px;margin-bottom:4px}.page .subtitle{color:var(--text2);font-size:13px;margin-bottom:20px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
+.card h3{font-size:15px;margin-bottom:12px;color:var(--text);display:flex;align-items:center;gap:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
+.form-group{margin-bottom:14px}
+.form-group label{display:block;font-size:13px;color:var(--text2);margin-bottom:4px}
+.form-group input,.form-group select,.form-group textarea{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:13px;outline:none}
+.form-group input:focus,.form-group select:focus,.form-group textarea:focus{border-color:var(--primary)}
+.form-group textarea{resize:vertical;min-height:60px;font-family:monospace}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;text-align:center}
+.stat-card .value{font-size:28px;font-weight:700;color:var(--primary)}
+.stat-card .label{font-size:12px;color:var(--text2);margin-top:4px}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.badge-success{background:rgba(34,197,94,.15);color:var(--success)}
+.badge-warn{background:rgba(245,158,11,.15);color:var(--warn)}
+.badge-danger{background:rgba(239,68,68,.15);color:var(--danger)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border)}
+th{color:var(--text2);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+tr:hover td{background:var(--surface2)}
+.log-box{background:#000;color:#0f0;font-family:monospace;font-size:12px;padding:16px;border-radius:var(--radius);height:400px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;border:1px solid var(--border)}
+.log-controls{display:flex;gap:8px;margin-bottom:12px;align-items:center}
+.log-controls select,.log-controls input{padding:6px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:12px}
+.actions{display:flex;gap:8px;margin-top:12px}
+.oauth-status{display:flex;align-items:center;gap:8px;padding:12px 0}
+.oauth-dot{width:10px;height:10px;border-radius:50%}
+.oauth-dot.on{background:var(--success)}.oauth-dot.off{background:var(--danger)}
+.tag{display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;background:var(--surface2);color:var(--text2);margin-left:4px}
+.toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:var(--radius);font-size:13px;z-index:9999;animation:slideIn .3s}
+.toast-success{background:var(--success);color:#fff}
+.toast-error{background:var(--danger);color:#fff}
+@keyframes slideIn{from{transform:translateX(100px);opacity:0}to{transform:translateX(0);opacity:1}}
+.switch{position:relative;width:40px;height:22px;display:inline-block}
+.switch input{opacity:0;width:0;height:0}
+.switch .slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:var(--border);border-radius:22px;transition:.2s}
+.switch .slider:before{content:"";position:absolute;height:16px;width:16px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
+.switch input:checked+.slider{background:var(--primary)}
+.switch input:checked+.slider:before{transform:translateX(18px)}
+.empty-state{text-align:center;padding:40px;color:var(--text2)}
+.empty-state .icon{font-size:40px;margin-bottom:12px;opacity:.5}
+</style>
+</head>
+<body>
+
+<!-- Login -->
+<div class="login-wrap" id="loginWrap">
+  <div class="login-box">
+    <h1>zcode-proxy</h1>
+    <p>Enter proxy API key to access dashboard</p>
+    <input type="password" id="loginKey" placeholder="Proxy API Key" autocomplete="off">
+    <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Login</button>
+  </div>
+</div>
+
+<!-- App -->
+<div class="app" id="app">
+  <div class="sidebar">
+    <h2>zcode-proxy</h2>
+    <div class="nav-item active" data-page="overview"><span class="icon">&#9776;</span> Overview</div>
+    <div class="nav-item" data-page="settings"><span class="icon">&#9881;</span> Settings</div>
+    <div class="nav-item" data-page="accounts"><span class="icon">&#128100;</span> Accounts</div>
+    <div class="nav-item" data-page="oauth"><span class="icon">&#128274;</span> OAuth</div>
+    <div class="nav-item" data-page="logs"><span class="icon">&#128220;</span> Logs</div>
+    <div class="nav-item" data-page="proxy"><span class="icon">&#127760;</span> Proxy Rules</div>
+    <div class="nav-item" data-page="stats"><span class="icon">&#128202;</span> Statistics</div>
+    <div style="margin-top:auto;padding:16px 20px;border-top:1px solid var(--border);margin-top:24px">
+      <div style="font-size:12px;color:var(--text2)">zcode-proxy v2.1.1</div>
+      <div style="font-size:11px;color:var(--text2);margin-top:4px;cursor:pointer" onclick="doLogout()">Logout</div>
+    </div>
+  </div>
+  <div class="main">
+
+    <!-- Overview -->
+    <div class="page active" id="page-overview">
+      <h2>Overview</h2>
+      <p class="subtitle">System status and quick actions</p>
+      <div class="grid" style="margin-bottom:20px">
+        <div class="stat-card"><div class="value" id="statProvider">-</div><div class="label">Provider</div></div>
+        <div class="stat-card"><div class="value" id="statPlan">-</div><div class="label">Plan</div></div>
+        <div class="stat-card"><div class="value" id="statModels">-</div><div class="label">Models</div></div>
+        <div class="stat-card"><div class="value" id="statUptime">-</div><div class="label">Uptime</div></div>
+        <div class="stat-card"><div class="value" id="statRequests">0</div><div class="label">Total Requests</div></div>
+        <div class="stat-card"><div class="value" id="statRetries">0</div><div class="label">Total Retries</div></div>
+      </div>
+      <div class="card">
+        <h3>Health Check</h3>
+        <div id="healthInfo">Loading...</div>
+      </div>
+    </div>
+
+    <!-- Settings -->
+    <div class="page" id="page-settings">
+      <h2>Global Settings</h2>
+      <p class="subtitle">Configure proxy server behavior</p>
+      <div class="card">
+        <h3>Server</h3>
+        <div class="form-row">
+          <div class="form-group"><label>Port</label><input id="cfgPort" type="number"></div>
+          <div class="form-group"><label>Host</label><input id="cfgHost"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Provider</h3>
+        <div class="form-row">
+          <div class="form-group"><label>Provider</label><select id="cfgProvider"><option value="zai">Z.AI</option><option value="bigmodel">Bigmodel</option></select></div>
+          <div class="form-group"><label>Plan</label><select id="cfgPlan"><option value="coding-plan">Coding Plan</option><option value="start-plan">Start Plan</option></select></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Authentication</h3>
+        <div class="form-row">
+          <div class="form-group"><label>Auth Mode</label><select id="cfgAuthMode"><option value="apikey">API Key</option><option value="oauth">OAuth</option></select></div>
+          <div class="form-group"><label>API Key</label><input id="cfgApiKey" type="password"></div>
+        </div>
+        <div class="form-group"><label>Proxy API Key (client auth)</label><input id="cfgProxyApiKey" type="password" placeholder="Leave empty to disable"></div>
+      </div>
+      <div class="card">
+        <h3>Default Model</h3>
+        <div class="form-group"><label>Default Model</label><input id="cfgDefaultModel"></div>
+        <div class="form-group"><label>Models (one per line)</label><textarea id="cfgModels" rows="6"></textarea></div>
+      </div>
+      <div class="card">
+        <h3>Retry Configuration</h3>
+        <div class="form-row">
+          <div class="form-group"><label>Max Retries</label><input id="cfgRetryMax" type="number"></div>
+          <div class="form-group"><label>Initial Delay (ms)</label><input id="cfgRetryDelay" type="number"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>Max Delay (ms)</label><input id="cfgRetryMaxDelay" type="number"></div>
+          <div class="form-group"><label>Backoff Factor</label><input id="cfgRetryBackoff" type="number" step="0.1"></div>
+        </div>
+        <div class="form-group"><label>Retryable Status Codes (comma separated)</label><input id="cfgRetryStatuses" placeholder="529,429,503"></div>
+      </div>
+      <div class="card">
+        <h3>Identity</h3>
+        <div class="form-row">
+          <div class="form-group"><label>App Version</label><input id="cfgAppVer"></div>
+          <div class="form-group"><label>Source Title</label><input id="cfgSrcTitle"></div>
+        </div>
+        <div class="form-group"><label>Referer Origin</label><input id="cfgReferer"></div>
+      </div>
+      <div class="card">
+        <h3>Logging</h3>
+        <div class="form-group"><label>Log Level</label><select id="cfgLogLevel"><option value="debug">Debug</option><option value="info">Info</option><option value="warn">Warn</option><option value="error">Error</option></select></div>
+      </div>
+      <div class="actions"><button class="btn btn-primary" onclick="saveSettings()">Save Settings</button><button class="btn btn-ghost" onclick="loadSettings()">Reset</button></div>
+    </div>
+
+    <!-- Accounts -->
+    <div class="page" id="page-accounts">
+      <h2>Account Management</h2>
+      <p class="subtitle">Manage API keys and credentials</p>
+      <div class="card">
+        <h3>Current Credential</h3>
+        <div id="currentCred">Loading...</div>
+      </div>
+      <div class="card">
+        <h3>Add API Key</h3>
+        <div class="form-row">
+          <div class="form-group"><label>Provider</label><select id="addKeyProvider"><option value="zai">Z.AI (apiKey.secretKey)</option><option value="bigmodel">Bigmodel (apiKey)</option></select></div>
+          <div class="form-group"><label>API Key</label><input id="addKeyValue" placeholder="Enter API key"></div>
+        </div>
+        <div class="actions"><button class="btn btn-primary" onclick="addApiKey()">Add Key</button></div>
+      </div>
+      <div class="card">
+        <h3>Import from ZCode</h3>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">Import API key from ~/.zcode/v2/config.json</p>
+        <div class="form-group"><label>Provider</label><select id="importProvider"><option value="bigmodel">Bigmodel</option><option value="zai">Z.AI</option></select></div>
+        <div class="actions"><button class="btn btn-primary" onclick="importKey()">Import Key</button></div>
+      </div>
+    </div>
+
+    <!-- OAuth -->
+    <div class="page" id="page-oauth">
+      <h2>OAuth Authorization</h2>
+      <p class="subtitle">Login via OAuth browser flow</p>
+      <div class="card">
+        <h3>OAuth Login</h3>
+        <div class="form-row">
+          <div class="form-group"><label>Provider</label><select id="oauthProvider"><option value="bigmodel">Bigmodel</option><option value="zai">Z.AI</option></select></div>
+          <div class="form-group" style="display:flex;align-items:flex-end"><button class="btn btn-primary" onclick="startOAuth()">Start OAuth Login</button></div>
+        </div>
+        <div id="oauthFlowStatus" style="margin-top:12px;display:none">
+          <div class="oauth-status"><div class="oauth-dot off" id="oauthDot"></div><span id="oauthStatusText">Waiting...</span></div>
+          <div id="oauthUrlBox" style="display:none;margin-top:8px">
+            <p style="font-size:13px;color:var(--text2);margin-bottom:8px">Open this URL to authorize:</p>
+            <div style="display:flex;gap:8px"><input id="oauthUrl" readonly style="flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font-size:12px"><button class="btn btn-ghost btn-sm" onclick="copyOauthUrl()">Copy</button></div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Credential Store</h3>
+        <div id="credStoreInfo">Loading...</div>
+        <div class="actions"><button class="btn btn-danger btn-sm" onclick="clearCredentials()">Clear Credentials</button></div>
+      </div>
+    </div>
+
+    <!-- Logs -->
+    <div class="page" id="page-logs">
+      <h2>Logs</h2>
+      <p class="subtitle">Real-time server logs</p>
+      <div class="log-controls">
+        <select id="logLevel"><option value="">All Levels</option><option value="error">Error</option><option value="warn">Warn</option><option value="info">Info</option><option value="debug">Debug</option></select>
+        <input id="logSearch" placeholder="Search logs..." style="flex:1">
+        <label class="switch"><input type="checkbox" id="logAutoScroll" checked><span class="slider"></span></label><span style="font-size:12px;color:var(--text2)">Auto-scroll</span>
+        <button class="btn btn-ghost btn-sm" onclick="clearLogs()">Clear</button>
+      </div>
+      <div class="log-box" id="logBox"></div>
+    </div>
+
+    <!-- Proxy Rules -->
+    <div class="page" id="page-proxy">
+      <h2>Proxy Rules</h2>
+      <p class="subtitle">Configure per-model and per-route proxy behavior</p>
+      <div class="card">
+        <h3>Provider Endpoints</h3>
+        <div class="form-group"><label>Z.AI Anthropic Base</label><input id="proxyZaiAnthropic"></div>
+        <div class="form-group"><label>Z.AI OpenAI Base</label><input id="proxyZaiOpenai"></div>
+        <div class="form-group"><label>Bigmodel Anthropic Base</label><input id="proxyBmAnthropic"></div>
+        <div class="form-group"><label>Bigmodel OpenAI Base</label><input id="proxyBmOpenai"></div>
+        <div class="actions"><button class="btn btn-primary" onclick="saveProxyEndpoints()">Save Endpoints</button></div>
+      </div>
+      <div class="card">
+        <h3>Model Routing <span class="tag">Advanced</span></h3>
+        <p style="font-size:13px;color:var(--text2);margin-bottom:12px">Route specific models to different providers or endpoints</p>
+        <table>
+          <thead><tr><th>Model Pattern</th><th>Provider</th><th>Endpoint Override</th><th>Actions</th></tr></thead>
+          <tbody id="routingRules"><tr><td colspan="4" class="empty-state">No custom routing rules</td></tr></tbody>
+        </table>
+        <div class="actions" style="margin-top:12px"><button class="btn btn-ghost btn-sm" onclick="addRoutingRule()">+ Add Rule</button></div>
+      </div>
+    </div>
+
+    <!-- Statistics -->
+    <div class="page" id="page-stats">
+      <h2>Statistics</h2>
+      <p class="subtitle">Request metrics and performance data</p>
+      <div class="grid" style="margin-bottom:20px">
+        <div class="stat-card"><div class="value" id="statTotal">0</div><div class="label">Total Requests</div></div>
+        <div class="stat-card"><div class="value" id="statSuccess">0</div><div class="label">Successful</div></div>
+        <div class="stat-card"><div class="value" id="statFailed">0</div><div class="label">Failed</div></div>
+        <div class="stat-card"><div class="value" id="statRetried">0</div><div class="label">Retried</div></div>
+      </div>
+      <div class="card">
+        <h3>Recent Requests</h3>
+        <table><thead><tr><th>#</th><th>Time</th><th>Model</th><th>Status</th><th>TTFB</th><th>Tokens</th></tr></thead><tbody id="recentRequests"></tbody></table>
+      </div>
+      <div class="card">
+        <h3>Model Usage</h3>
+        <table><thead><tr><th>Model</th><th>Requests</th><th>Avg TTFB</th><th>Total Tokens</th></tr></thead><tbody id="modelUsage"></tbody></table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const API=location.origin;
+let authToken='';
+let logWs=null;
+let logLines=[];
+let statsData={total:0,success:0,failed:0,retried:0,requests:[],models:{}};
+let routingRules=[];
+
+// --- Login ---
+async function doLogin(){
+  const key=document.getElementById('loginKey').value.trim();
+  if(!key)return toast('Enter API key','error');
+  try{
+    const r=await fetch(API+'/admin/api/verify',{headers:{'Authorization':'Bearer '+key}});
+    if(!r.ok)throw new Error();
+    authToken=key;
+    document.getElementById('loginWrap').style.display='none';
+    document.getElementById('app').style.display='flex';
+    initDashboard();
+  }catch{toast('Invalid API key','error')}
+}
+document.getElementById('loginKey').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});
+
+function doLogout(){
+  authToken='';
+  if(logWs){logWs.close();logWs=null}
+  document.getElementById('app').style.display='none';
+  document.getElementById('loginWrap').style.display='flex';
+  document.getElementById('loginKey').value='';
+}
+
+// --- Nav ---
+document.querySelectorAll('.nav-item').forEach(el=>{
+  el.addEventListener('click',()=>{
+    document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+    el.classList.add('active');
+    document.getElementById('page-'+el.dataset.page).classList.add('active');
+  });
+});
+
+function authHeaders(){return{'Authorization':'Bearer '+authToken,'Content-Type':'application/json'}}
+
+// --- Init ---
+async function initDashboard(){
+  await loadOverview();
+  await loadSettings();
+  await loadAccountInfo();
+  await loadCredStore();
+  await loadProxyEndpoints();
+  await loadStats();
+  connectLogStream();
+}
+
+// --- Overview ---
+async function loadOverview(){
+  try{
+    const r=await fetch(API+'/admin/api/config',{headers:authHeaders()});
+    const c=await r.json();
+    document.getElementById('statProvider').textContent=c.provider;
+    document.getElementById('statPlan').textContent=c.plan?.replace('-',' ');
+    document.getElementById('statModels').textContent=c.models?.length||0;
+    const health=await fetch(API+'/health',{headers:authHeaders()});
+    document.getElementById('healthInfo').innerHTML=health.ok
+      ?'<span class="badge badge-success">Healthy</span> Provider: '+c.provider
+      :'<span class="badge badge-danger">Unhealthy</span>';
+  }catch{}
+  updateUptime();
+  setInterval(updateUptime,1000);
+}
+function updateUptime(){
+  const el=document.getElementById('statUptime');
+  if(!el.dataset.start)el.dataset.start=Date.now();
+  const s=Math.floor((Date.now()-+el.dataset.start)/1000);
+  const h=Math.floor(s/3600),m=Math.floor(s%3600/60),ss=s%60;
+  el.textContent=`${h}h${String(m).padStart(2,'0')}m${String(ss).padStart(2,'0')}s`;
+}
+
+// --- Settings ---
+async function loadSettings(){
+  try{
+    const r=await fetch(API+'/admin/api/config',{headers:authHeaders()});
+    const c=await r.json();
+    document.getElementById('cfgPort').value=c.server?.port||8080;
+    document.getElementById('cfgHost').value=c.server?.host||'0.0.0.0';
+    document.getElementById('cfgProvider').value=c.provider||'zai';
+    document.getElementById('cfgPlan').value=c.plan||'coding-plan';
+    document.getElementById('cfgAuthMode').value=c.auth?.mode||'apikey';
+    document.getElementById('cfgApiKey').value=c.auth?.apiKey||'';
+    document.getElementById('cfgProxyApiKey').value=c.auth?.proxyApiKey||'';
+    document.getElementById('cfgDefaultModel').value=c.defaultModel||'';
+    document.getElementById('cfgModels').value=(c.models||[]).join('\n');
+    document.getElementById('cfgRetryMax').value=c.retry?.maxRetries??3;
+    document.getElementById('cfgRetryDelay').value=c.retry?.initialDelayMs??1000;
+    document.getElementById('cfgRetryMaxDelay').value=c.retry?.maxDelayMs??8000;
+    document.getElementById('cfgRetryBackoff').value=c.retry?.backoffFactor??2;
+    document.getElementById('cfgRetryStatuses').value=(c.retry?.retryableStatuses||[529]).join(',');
+    document.getElementById('cfgAppVer').value=c.identity?.appVersion||'';
+    document.getElementById('cfgSrcTitle').value=c.identity?.sourceTitle||'';
+    document.getElementById('cfgReferer').value=c.identity?.refererOrigin||'';
+    document.getElementById('cfgLogLevel').value=c.logging?.level||'info';
+  }catch{}
+}
+async function saveSettings(){
+  const cfg={
+    server:{port:+document.getElementById('cfgPort').value,host:document.getElementById('cfgHost').value},
+    provider:document.getElementById('cfgProvider').value,
+    plan:document.getElementById('cfgPlan').value,
+    auth:{mode:document.getElementById('cfgAuthMode').value,apiKey:document.getElementById('cfgApiKey').value,proxyApiKey:document.getElementById('cfgProxyApiKey').value},
+    defaultModel:document.getElementById('cfgDefaultModel').value,
+    models:document.getElementById('cfgModels').value.split('\n').map(s=>s.trim()).filter(Boolean),
+    retry:{maxRetries:+document.getElementById('cfgRetryMax').value,initialDelayMs:+document.getElementById('cfgRetryDelay').value,maxDelayMs:+document.getElementById('cfgRetryMaxDelay').value,backoffFactor:+document.getElementById('cfgRetryBackoff').value,retryableStatuses:document.getElementById('cfgRetryStatuses').value.split(',').map(s=>parseInt(s.trim())).filter(n=>n>0)},
+    identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
+    logging:{level:document.getElementById('cfgLogLevel').value}
+  };
+  try{
+    const r=await fetch(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify(cfg)});
+    if(r.ok)toast('Settings saved (restart required for some changes)','success');
+    else toast('Save failed','error');
+  }catch{toast('Save failed','error')}
+}
+
+// --- Accounts ---
+async function loadAccountInfo(){
+  try{
+    const r=await fetch(API+'/admin/api/credentials',{headers:authHeaders()});
+    const d=await r.json();
+    if(d.credential){
+      const c=d.credential;
+      document.getElementById('currentCred').innerHTML=`
+        <div style="display:grid;grid-template-columns:120px 1fr;gap:8px;font-size:13px">
+          <span style="color:var(--text2)">Provider</span><span>${c.provider}</span>
+          <span style="color:var(--text2)">API Key</span><span style="font-family:monospace">${c.apiKeyMask}</span>
+          <span style="color:var(--text2)">Auth Mode</span><span>${c.mode||'apikey'}</span>
+          <span style="color:var(--text2)">Has Secret</span><span>${c.hasSecret?'<span class="badge badge-success">Yes</span>':'<span class="badge badge-warn">No</span>'}</span>
+          ${c.userId?`<span style="color:var(--text2)">User ID</span><span>${c.userId}</span>`:''}
+          ${c.expiresAt?`<span style="color:var(--text2)">Expires</span><span>${new Date(c.expiresAt).toLocaleString()}</span>`:''}
+        </div>`;
+    }else{
+      document.getElementById('currentCred').innerHTML='<p style="color:var(--text2)">No credential configured</p>';
+    }
+  }catch{}
+}
+async function addApiKey(){
+  const provider=document.getElementById('addKeyProvider').value;
+  const key=document.getElementById('addKeyValue').value.trim();
+  if(!key)return toast('Enter API key','error');
+  try{
+    const r=await fetch(API+'/admin/api/credentials',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,apiKey:key})});
+    if(r.ok){toast('API key added','success');loadAccountInfo()}
+    else toast('Failed to add key','error');
+  }catch{toast('Failed to add key','error')}
+}
+async function importKey(){
+  const provider=document.getElementById('importProvider').value;
+  try{
+    const r=await fetch(API+'/admin/api/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider})});
+    const d=await r.json();
+    if(r.ok){toast('Key imported: '+d.apiKeyMask,'success');loadAccountInfo()}
+    else toast(d.error||'Import failed','error');
+  }catch{toast('Import failed','error')}
+}
+
+// --- OAuth ---
+async function loadCredStore(){
+  try{
+    const r=await fetch(API+'/admin/api/credentials',{headers:authHeaders()});
+    const d=await r.json();
+    document.getElementById('credStoreInfo').innerHTML=d.credential
+      ?`<span class="badge badge-success">Active</span> ${d.credential.provider} (${d.credential.apiKeyMask})`
+      :'<span class="badge badge-warn">No stored credential</span>';
+  }catch{}
+}
+async function startOAuth(){
+  const provider=document.getElementById('oauthProvider').value;
+  document.getElementById('oauthFlowStatus').style.display='block';
+  document.getElementById('oauthDot').className='oauth-dot off';
+  document.getElementById('oauthStatusText').textContent='Initializing...';
+  document.getElementById('oauthUrlBox').style.display='none';
+  try{
+    const r=await fetch(API+'/admin/api/oauth/init',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider})});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Init failed');
+    document.getElementById('oauthDot').className='oauth-dot on';
+    document.getElementById('oauthStatusText').textContent='Waiting for authorization...';
+    document.getElementById('oauthUrlBox').style.display='block';
+    document.getElementById('oauthUrl').value=d.authorizeUrl;
+    pollOAuth(d.flowId);
+  }catch(e){toast(e.message,'error');document.getElementById('oauthStatusText').textContent='Failed: '+e.message}
+}
+async function pollOAuth(flowId){
+  for(let i=0;i<120;i++){
+    await new Promise(r=>setTimeout(r,2000));
+    try{
+      const r=await fetch(API+'/admin/api/oauth/poll?flowId='+flowId,{headers:authHeaders()});
+      const d=await r.json();
+      if(d.status==='ready'){
+        document.getElementById('oauthDot').className='oauth-dot on';
+        document.getElementById('oauthStatusText').innerHTML='<span class="badge badge-success">Authorized!</span>';
+        document.getElementById('oauthUrlBox').style.display='none';
+        toast('OAuth login successful','success');
+        loadAccountInfo();loadCredStore();
+        return;
+      }
+      if(d.status==='failed'){
+        document.getElementById('oauthDot').className='oauth-dot off';
+        document.getElementById('oauthStatusText').textContent='Authorization failed';
+        toast('OAuth failed','error');return;
+      }
+    }catch{}
+  }
+  document.getElementById('oauthStatusText').textContent='Timed out';
+}
+function copyOauthUrl(){navigator.clipboard.writeText(document.getElementById('oauthUrl').value);toast('URL copied','success')}
+async function clearCredentials(){
+  if(!confirm('Clear all stored credentials?'))return;
+  try{
+    await fetch(API+'/admin/api/credentials',{method:'DELETE',headers:authHeaders()});
+    toast('Credentials cleared','success');loadAccountInfo();loadCredStore();
+  }catch{toast('Failed','error')}
+}
+
+// --- Logs ---
+function connectLogStream(){
+  const wsUrl=API.replace('http','ws')+'/admin/api/logs/stream';
+  try{
+    logWs=new WebSocket(wsUrl);
+    logWs.onmessage=e=>{
+      const d=JSON.parse(e.data);
+      appendLog(d);
+    };
+    logWs.onclose=()=>{setTimeout(connectLogStream,3000)};
+    logWs.onerror=()=>{};
+  }catch{}
+}
+function appendLog(entry){
+  logLines.push(entry);
+  if(logLines.length>2000)logLines=logLines.slice(-1000);
+  renderLogs();
+}
+function renderLogs(){
+  const box=document.getElementById('logBox');
+  const level=document.getElementById('logLevel').value;
+  const search=document.getElementById('logSearch').value.toLowerCase();
+  const filtered=logLines.filter(l=>{
+    if(level&&l.level!==level)return false;
+    if(search&&!l.message.toLowerCase().includes(search))return false;
+    return true;
+  });
+  box.textContent=filtered.map(l=>`[${l.time}] [${l.level||'info'}] ${l.message}`).join('\n');
+  if(document.getElementById('logAutoScroll').checked)box.scrollTop=box.scrollHeight;
+}
+function clearLogs(){logLines=[];document.getElementById('logBox').textContent=''}
+document.getElementById('logLevel').addEventListener('change',renderLogs);
+document.getElementById('logSearch').addEventListener('input',renderLogs);
+
+// --- Proxy ---
+async function loadProxyEndpoints(){
+  try{
+    const r=await fetch(API+'/admin/api/config',{headers:authHeaders()});
+    const c=await r.json();
+    document.getElementById('proxyZaiAnthropic').value=c.providers?.zai?.anthropicBase||'';
+    document.getElementById('proxyZaiOpenai').value=c.providers?.zai?.openaiBase||'';
+    document.getElementById('proxyBmAnthropic').value=c.providers?.bigmodel?.anthropicBase||'';
+    document.getElementById('proxyBmOpenai').value=c.providers?.bigmodel?.openaiBase||'';
+  }catch{}
+}
+async function saveProxyEndpoints(){
+  const endpoints={
+    zai:{anthropicBase:document.getElementById('proxyZaiAnthropic').value,openaiBase:document.getElementById('proxyZaiOpenai').value},
+    bigmodel:{anthropicBase:document.getElementById('proxyBmAnthropic').value,openaiBase:document.getElementById('proxyBmOpenai').value}
+  };
+  try{
+    const r=await fetch(API+'/admin/api/endpoints',{method:'PUT',headers:authHeaders(),body:JSON.stringify(endpoints)});
+    if(r.ok)toast('Endpoints saved','success');else toast('Save failed','error');
+  }catch{toast('Save failed','error')}
+}
+function addRoutingRule(){
+  routingRules.push({pattern:'',provider:'zai',endpoint:''});
+  renderRoutingRules();
+}
+function renderRoutingRules(){
+  const tb=document.getElementById('routingRules');
+  if(!routingRules.length){tb.innerHTML='<tr><td colspan="4" class="empty-state">No custom routing rules</td></tr>';return}
+  tb.innerHTML=routingRules.map((r,i)=>`<tr>
+    <td><input value="${r.pattern}" onchange="routingRules[${i}].pattern=this.value" style="width:100%;padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px"></td>
+    <td><select onchange="routingRules[${i}].provider=this.value" style="padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px"><option value="zai"${r.provider==='zai'?' selected':''}>Z.AI</option><option value="bigmodel"${r.provider==='bigmodel'?' selected':''}>Bigmodel</option></select></td>
+    <td><input value="${r.endpoint}" onchange="routingRules[${i}].endpoint=this.value" placeholder="Default" style="width:100%;padding:4px 8px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px"></td>
+    <td><button class="btn btn-danger btn-sm" onclick="routingRules.splice(${i},1);renderRoutingRules()">Delete</button></td>
+  </tr>`).join('');
+}
+
+// --- Stats ---
+async function loadStats(){
+  try{
+    const r=await fetch(API+'/admin/api/stats',{headers:authHeaders()});
+    const d=await r.json();
+    statsData=d;
+    document.getElementById('statTotal').textContent=d.total||0;
+    document.getElementById('statSuccess').textContent=d.success||0;
+    document.getElementById('statFailed').textContent=d.failed||0;
+    document.getElementById('statRetried').textContent=d.retried||0;
+    document.getElementById('statRequests').textContent=d.total||0;
+    document.getElementById('statRetries').textContent=d.retried||0;
+    const tb=document.getElementById('recentRequests');
+    tb.innerHTML=(d.requests||[]).slice(-20).reverse().map(r=>`<tr>
+      <td>${r.id}</td><td>${r.time}</td><td>${r.model}</td>
+      <td><span class="badge ${r.status<300?'badge-success':r.status<500?'badge-warn':'badge-danger'}">${r.status}</span></td>
+      <td>${r.ttfb||'-'}</td><td>${r.tokens||'-'}</td>
+    </tr>`).join('')||'<tr><td colspan="6" class="empty-state">No requests yet</td></tr>';
+    const mu=document.getElementById('modelUsage');
+    mu.innerHTML=Object.entries(d.models||{}).map(([m,v])=>`<tr><td>${m}</td><td>${v.count}</td><td>${v.avgTtfb}ms</td><td>${v.tokens}</td></tr>`).join('')
+      ||'<tr><td colspan="4" class="empty-state">No data</td></tr>';
+  }catch{}
+}
+setInterval(()=>{if(authToken)loadStats()},10000);
+
+// --- Toast ---
+function toast(msg,type='success'){
+  const el=document.createElement('div');
+  el.className='toast toast-'+type;
+  el.textContent=msg;
+  document.body.appendChild(el);
+  setTimeout(()=>el.remove(),3000);
+}
+</script>
+</body>
+</html>

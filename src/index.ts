@@ -16,7 +16,7 @@ import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.1";
 
 main();
 
@@ -86,7 +86,16 @@ async function serve(configPath?: string): Promise<void> {
     auth.setOAuthCredential(cred);
   }
 
-  const server = startServer({ config, auth });
+  // Intercept console.log for admin dashboard log streaming
+  const origLog = console.log;
+  const origError = console.error;
+  const origWarn = console.warn;
+  const { appendLog } = await import("./admin/api.js");
+  console.log = (...args: unknown[]) => { origLog(...args); try { appendLog("info", args.map(String).join(" ")); } catch {} };
+  console.error = (...args: unknown[]) => { origError(...args); try { appendLog("error", args.map(String).join(" ")); } catch {} };
+  console.warn = (...args: unknown[]) => { origWarn(...args); try { appendLog("warn", args.map(String).join(" ")); } catch {} };
+
+  const server = startServer({ config, auth, configPath: path });
   const url = `http://${server.hostname}:${server.port}`;
   console.log(`zcode-proxy listening on ${url}`);
   console.log(`  provider: ${config.provider}`);
