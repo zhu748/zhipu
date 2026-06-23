@@ -1,5 +1,20 @@
 # zcode-proxy 使用说明
 
+> **v2.1.4.1test4 — Docker 部署修复（bun 1.2 lockfile 兼容）**
+>
+> 修复 v2.1.4.1test3 在 Render / Docker 部署时的构建失败问题：`bun.lock` 使用 Bun 1.2+ 引入的新 JSON 格式（`lockfileVersion: 1`），而 Dockerfile 的 base image 仍是 `oven/bun:1.1-debian`，Bun 1.1.45 无法解析该格式，导致 `bun install --frozen-lockfile` 在容器构建阶段报 `InvalidLockfileVersion` 错误。
+>
+> **v2.1.4.1test4 关键修复**：
+> 1. **Dockerfile base image 升级**：`oven/bun:1.1-debian` → `oven/bun:1.2-debian`，匹配 `bun.lock` 的新 JSON lockfile 格式
+> 2. **同步更新 Dockerfile 注释**：说明必须使用 Bun ≥ 1.2 的原因（lockfile 格式兼容性）
+> 3. **零源代码变更**：本次发版仅修复部署链路，业务逻辑与 v2.1.4.1test3 完全一致
+>
+> **影响范围**：
+> - **Render / Docker / Fly.io / Cloud Run 用户**：解决 `bun install` 构建失败问题，部署可正常完成
+> - **本地直接运行（bun run）用户**：无影响
+>
+> ---
+
 > **v2.1.4.1test3 — 多账号 Render 凭证导出修复**
 >
 > 修复 v2.1.4.1test2 引入的 Render 凭证导出 bug：多账号场景下，dashboard "导出 Render 凭证" 只导出当前激活的一个账号，导致用户在 Render 上只能用到一个账号，丢失了多账号轮转能力。
