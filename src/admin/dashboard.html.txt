@@ -888,7 +888,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>v2.1.4.1test2</span>
+        <span>v2.1.4.1test3</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -2108,17 +2108,22 @@ async function exportRenderCredential(){
     }
     const d=await r.json();
     // Build a modal dialog showing the base64 blob, env vars, and instructions.
+    // For multi-account setups, d.multi=true and d.accountCount=N — show a badge
+    // so the user knows all their accounts are bundled into the single env var.
+    const accountBadge = d.multi
+      ? `<div style="display:inline-block;background:var(--info-soft,rgba(59,130,246,.12));color:var(--info,#3b82f6);padding:3px 10px;border-radius:999px;font-size:11px;font-weight:600;margin-left:8px;">多账号 · ${d.accountCount} 个</div>`
+      : `<div style="display:inline-block;background:var(--success-soft,rgba(16,185,129,.12));color:var(--success,#10b981);padding:3px 10px;border-radius:999px;font-size:11px;font-weight:600;margin-left:8px;">单账号</div>`;
     const modal=document.createElement('div');
     modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:1000;padding:20px;';
     modal.innerHTML=`
       <div style="background:var(--bg-0);border-radius:12px;max-width:720px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,0.3);">
         <div style="padding:20px 24px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
-          <h3 style="margin:0;font-size:18px;color:var(--text-0);">部署到 Render / Fly.io / K8s</h3>
+          <h3 style="margin:0;font-size:18px;color:var(--text-0);">部署到 Render / Fly.io / K8s${accountBadge}</h3>
           <button onclick="this.closest('div[style*=fixed]').remove()" style="background:none;border:none;font-size:24px;color:var(--text-2);cursor:pointer;line-height:1;">×</button>
         </div>
         <div style="padding:20px 24px;">
           <div style="background:var(--warning-bg,rgba(255,193,7,0.1));border-left:3px solid var(--warning,#ffc107);padding:10px 14px;border-radius:4px;margin-bottom:16px;font-size:12px;color:var(--text-1);">
-            <strong>⚠ 安全提示：</strong>该凭证包含明文 API Key。请像对待密码一样处理，在 Render 上标记为 Secret。
+            <strong>⚠ 安全提示：</strong>该凭证包含明文 API Key。请像对待密码一样处理，在 Render 上标记为 Secret。${d.multi ? ' 多账号模式下，该 blob 包含 <strong>所有</strong> 账号的凭证。' : ''}
           </div>
           <div style="margin-bottom:16px;">
             <div style="font-size:12px;color:var(--text-2);margin-bottom:6px;font-weight:600;">在 Render Environment 中设置以下变量：</div>

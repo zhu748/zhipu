@@ -504,6 +504,30 @@ export async function exportAccounts(): Promise<Array<Omit<StoredAccount, "crede
   return store.accounts;
 }
 
+/**
+ * Export the full v2 store (activeId + accounts with credentials) as plain JSON.
+ *
+ * Used by the dashboard's "Export Render credentials" feature when the user has
+ * multiple accounts — the entire store envelope is base64-encoded into
+ * ZCODE_OAUTH_CREDENTIAL so all accounts (and the activeId pointer) survive
+ * the trip to Render / Fly.io / K8s. `render-start.sh` detects this format
+ * (presence of `version: 2` + `accounts` array) and writes it directly to
+ * credentials.json instead of wrapping as a single-account store.
+ *
+ * Returns null if no store exists on disk.
+ */
+export async function exportStore(): Promise<StoreV2 | null> {
+  const store = await readStore();
+  if (!store) return null;
+  // Return a deep-ish copy so callers can JSON.stringify without worrying
+  // about the in-memory cache being mutated by concurrent writers.
+  return {
+    version: 2,
+    activeId: store.activeId,
+    accounts: store.accounts.map(a => ({ ...a, credential: { ...a.credential } })),
+  };
+}
+
 /** Import accounts from a previously exported backup. Merges by id — existing accounts are updated, new ones are appended. */
 export async function importAccounts(
   incoming: Array<Omit<StoredAccount, "credential"> & { credential: Credential }>,

@@ -23,6 +23,7 @@ import {
 } from "./api.js";
 import type { ProxyConfig } from "../config/types.js";
 import { AuthManager } from "../auth/manager.js";
+import { saveCredential, clearCredential } from "../auth/store.js";
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -588,5 +589,103 @@ describe("/admin — dashboard page", () => {
     const opts = makeAdminOpts();
     const resp = await callAdmin(new Request("http://localhost/admin/"), opts);
     expect(resp!.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /admin/api/accounts/render-export — Render credential export
+// ---------------------------------------------------------------------------
+//
+// Regression coverage for the multi-account bug where the export endpoint
+// only emitted the active credential (single) even when the user had multiple
+// accounts stored. The fix:
+//   • 0 accounts → 404
+//   • 1 account  → bare credential base64 (backward compat)
+//   • 2+ accounts → full v2 store envelope base64 (preserves all accounts)
+//
+describe("/admin/api/accounts/render-export — multi-account export", () => {
+  const TEST_SECRET = "test-encryption-secret-for-render-export";
+
+  beforeEach(() => {
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = TEST_SECRET;
+    clearCredential();
+  });
+
+  afterEach(() => {
+    clearCredential();
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+  });
+
+  it("returns 404 when no credential is stored", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(authedReq("/admin/api/accounts/render-export"), opts);
+    expect(resp!.status).toBe(404);
+  });
+
+  it("exports a single account as a bare credential (backward compat)", async () => {
+    await saveCredential({ apiKey: "key-single", provider: "zai" });
+
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(authedReq("/admin/api/accounts/render-export"), opts);
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+
+    expect(body.multi).toBe(false);
+    expect(body.accountCount).toBe(1);
+
+    // Decoded blob should be a bare Credential, not a v2 store envelope.
+    const decoded = JSON.parse(Buffer.from(body.credential, "base64").toString("utf8"));
+    expect(decoded.apiKey).toBe("key-single");
+    expect(decoded.provider).toBe("zai");
+    expect(decoded.version).toBeUndefined();
+    expect(decoded.accounts).toBeUndefined();
+
+    // Env vars are present and contain the same base64 blob.
+    expect(body.envVars.ZCODE_AUTH_MODE).toBe("oauth");
+    expect(body.envVars.ZCODE_OAUTH_CREDENTIAL).toBe(body.credential);
+  });
+
+  it("exports ALL accounts as a v2 store envelope when multiple are stored", async () => {
+    // Save two distinct accounts (different provider+apiKey → not deduped).
+    await saveCredential({ apiKey: "key-A", provider: "zai" });
+    await saveCredential({ apiKey: "key-B", provider: "bigmodel" });
+
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(authedReq("/admin/api/accounts/render-export"), opts);
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+
+    expect(body.multi).toBe(true);
+    expect(body.accountCount).toBe(2);
+
+    // Decoded blob should be a v2 store envelope with both accounts.
+    const decoded = JSON.parse(Buffer.from(body.credential, "base64").toString("utf8"));
+    expect(decoded.version).toBe(2);
+    expect(Array.isArray(decoded.accounts)).toBe(true);
+    expect(decoded.accounts.length).toBe(2);
+    expect(decoded.activeId).toBeTruthy();
+
+    // Both API keys must be present in the export — this is the bug fix.
+    const apiKeys = decoded.accounts.map((a: any) => a.credential.apiKey).sort();
+    expect(apiKeys).toEqual(["key-A", "key-B"]);
+
+    // Each account must have id/label/createdAt + credential structure.
+    for (const acc of decoded.accounts) {
+      expect(typeof acc.id).toBe("string");
+      expect(typeof acc.label).toBe("string");
+      expect(typeof acc.createdAt).toBe("number");
+      expect(acc.credential).toBeTruthy();
+      expect(acc.credential.apiKey).toBeTruthy();
+      expect(acc.credential.provider).toBeTruthy();
+    }
+
+    // Env vars use the same base64 blob.
+    expect(body.envVars.ZCODE_AUTH_MODE).toBe("oauth");
+    expect(body.envVars.ZCODE_OAUTH_CREDENTIAL).toBe(body.credential);
+
+    // Pretty-printed JSON view also reflects both accounts.
+    expect(body.json).toContain('"accounts"');
+    expect(body.json).toContain("key-A");
+    expect(body.json).toContain("key-B");
   });
 });

@@ -106,15 +106,26 @@ if [ "${ZCODE_AUTH_MODE:-}" = "oauth" ]; then
       echo "[render-start]   The proxy will still start, but every upstream request will 401 until you do one of the above."
     fi
   else
-    # Decode base64 and write to the credential store as a single-account
-    # plaintext v2 store. The proxy's readStore() will accept this when
+    # Decode base64 and write to the credential store.
+    #
+    # Two payload formats are supported (auto-detected by inspecting the
+    # decoded JSON):
+    #
+    #   1. Single credential (legacy): the decoded JSON is a bare Credential
+    #      object (has `apiKey` + `provider` at the top level). We wrap it as
+    #      a single-account v2 store on disk.
+    #
+    #   2. Full v2 store envelope (multi-account): the decoded JSON has
+    #      `version: 2` + `accounts: [...]` at the top level. We write it
+    #      verbatim — preserving all accounts and the activeId pointer — so
+    #      users who stored multiple credentials locally can deploy them all
+    #      to Render in one shot.
+    #
+    # The proxy's readStore() accepts the plaintext v2 form when
     # ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1.
     CRED_FILE="$ZCODE_PROXY_STORE_DIR/credentials.json"
     mkdir -p "$ZCODE_PROXY_STORE_DIR"
     echo "[render-start] Decoding ZCODE_OAUTH_CREDENTIAL → $CRED_FILE"
-    # Build the v2 store envelope around the credential JSON.
-    ACCOUNT_ID="$(date +%s | sha256sum | head -c 16)"
-    NOW_MS="$(date +%s%3N)"
     CRED_JSON="$(echo "$ZCODE_OAUTH_CREDENTIAL" | base64 -d)"
     # Validate it's JSON
     if ! echo "$CRED_JSON" | bun -e 'const fs=require("fs");JSON.parse(fs.readFileSync(0,"utf8"))' 2>/dev/null; then
@@ -123,8 +134,27 @@ if [ "${ZCODE_AUTH_MODE:-}" = "oauth" ]; then
       echo "$CRED_JSON" | head -c 200
       exit 1
     fi
-    # Wrap as v2 store. `provider` is read from the credential itself for the label.
-    cat > "$CRED_FILE" <<EOF
+
+    # Detect format: v2 store envelope vs. single credential.
+    # We look for `version: 2` + `accounts: [...]` at the top level (the v2
+    # store schema). Anything else is treated as a single Credential object.
+    IS_STORE_ENVELOPE="$(echo "$CRED_JSON" | bun -e '
+      const fs=require("fs");
+      const j=JSON.parse(fs.readFileSync(0,"utf8"));
+      process.stdout.write((j && j.version===2 && Array.isArray(j.accounts)) ? "1" : "0");
+    ' 2>/dev/null)"
+
+    if [ "$IS_STORE_ENVELOPE" = "1" ]; then
+      # Multi-account: write the decoded store verbatim.
+      echo "[render-start] Detected multi-account v2 store envelope — writing verbatim."
+      echo "$CRED_JSON" > "$CRED_FILE"
+    else
+      # Single credential: wrap as v2 store. `provider` is read from the
+      # credential itself for the label.
+      ACCOUNT_ID="$(date +%s | sha256sum | head -c 16)"
+      NOW_MS="$(date +%s%3N)"
+      echo "[render-start] Detected single credential — wrapping as single-account v2 store."
+      cat > "$CRED_FILE" <<EOF
 {
   "version": 2,
   "activeId": "$ACCOUNT_ID",
@@ -138,6 +168,7 @@ if [ "${ZCODE_AUTH_MODE:-}" = "oauth" ]; then
   ]
 }
 EOF
+    fi
     export ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1
     echo "[render-start] OAuth credential installed. (Plaintext store enabled for this session.)"
   fi

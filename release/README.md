@@ -1,5 +1,24 @@
 # zcode-proxy 使用说明
 
+> **v2.1.4.1test3 — 多账号 Render 凭证导出修复**
+>
+> 修复 v2.1.4.1test2 引入的 Render 凭证导出 bug：多账号场景下，dashboard "导出 Render 凭证" 只导出当前激活的一个账号，导致用户在 Render 上只能用到一个账号，丢失了多账号轮转能力。
+>
+> **v2.1.4.1test3 关键修复**：
+> 1. **`/admin/api/accounts/render-export` 多账号修复**：原实现调用 `loadCredential()` 只取激活凭证；新版改用新增的 `exportStore()` 获取完整 v2 store（含所有账号 + activeId 指针）
+> 2. **智能格式自适应**：单账号时仍输出 bare credential base64（向后兼容旧 `render-start.sh`）；多账号时输出完整的 v2 store envelope（`{version:2, activeId, accounts:[...]}`）
+> 3. **`render-start.sh` 自动识别两种格式**：解码 `ZCODE_OAUTH_CREDENTIAL` 后，检测顶层是否含 `version:2 + accounts` 数组——是则直接落盘为 `credentials.json`，否则按原逻辑包装为单账号 store
+> 4. **Dashboard UI 增强**：导出弹窗标题新增「单账号 / 多账号 · N 个」徽标；安全提示在多账号模式下明确警告 blob 包含所有账号的明文凭证
+> 5. **新增 `exportStore()` 工具函数**：返回 v2 store 的深拷贝（含 activeId），供后端导出接口使用
+> 6. **新增 3 个回归测试**：覆盖 0 账号（404）/ 1 账号（bare credential）/ 2 账号（v2 envelope）三种场景，确保两个 API key 都出现在 base64 blob 中
+> 7. **测试覆盖**：全套 381 测试通过（v2.1.4.1test2 是 378），TypeScript 类型检查零错误
+>
+> **影响范围**：
+> - **单账号用户**：无感知，行为与 v2.1.4.1test2 完全一致
+> - **多账号用户**：现在能完整部署所有账号到 Render，dashboard 切换功能在云端可用
+>
+> ---
+
 > **v2.1.4.1test2 — Render 云部署支持 + dashboard 一键导出环境变量**
 >
 > 新增 Render / Fly.io / K8s 等云平台一键部署能力，dashboard 增加导出环境变量格式的凭证。

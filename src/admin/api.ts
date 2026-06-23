@@ -7,7 +7,7 @@
 import type { ProxyConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
-import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, exportAccounts, importAccounts, maskApiKey } from "../auth/store.js";
+import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, exportAccounts, exportStore, importAccounts, maskApiKey } from "../auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { errorResponse } from "../proxy/handler.js";
@@ -528,33 +528,83 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     }
   }
 
-  // Export the ACTIVE account as a base64 blob suitable for the
-  // ZCODE_OAUTH_CREDENTIAL env var on Render / Fly.io / K8s.
+  // Export credentials as a base64 blob suitable for the ZCODE_OAUTH_CREDENTIAL
+  // env var on Render / Fly.io / K8s.
   //
   // This is the dashboard equivalent of `zcode-proxy auth export` on the CLI.
   // Use case: you logged in via the dashboard (or imported from ZCode), and
   // now want to deploy to Render without re-doing the OAuth flow there.
   //
+  // Two output formats, auto-selected by account count:
+  //
+  //   • Single account  → base64(JSON.stringify(credential))
+  //     Backward-compatible with the original render-start.sh, which wraps the
+  //     decoded blob as a single-account v2 store on the remote host.
+  //
+  //   • Multiple accounts → base64(JSON.stringify({version:2, activeId, accounts}))
+  //     The full v2 store envelope, so all accounts (and the activeId pointer)
+  //     survive the trip to Render. render-start.sh detects this format (top-
+  //     level `version: 2` + `accounts` array) and writes it directly to
+  //     credentials.json instead of wrapping.
+  //
   // Returns:
-  //   { credential: <base64>, json: <pretty JSON>, instructions: <string> }
+  //   { credential: <base64>, json: <pretty JSON>, envVars: {...},
+  //     multi: boolean, accountCount: number, instructions: <string> }
   // The `credential` field is what you paste into Render's ZCODE_OAUTH_CREDENTIAL.
-  // The `json` field is the decoded credential for human inspection.
+  // The `json` field is the decoded payload for human inspection.
   if (path === "/admin/api/accounts/render-export" && method === "GET") {
     try {
-      const cred = await loadCredential();
-      if (!cred) {
-        return errorResponse(404, "not_logged_in", "No active credential. Login or import first.");
+      const store = await exportStore();
+      if (!store || store.accounts.length === 0) {
+        return errorResponse(404, "not_logged_in", "No stored credential. Login or import first.");
       }
-      const json = JSON.stringify(cred);
-      const b64 = Buffer.from(json, "utf8").toString("base64");
+
+      // Single-account path: emit the bare credential (backward compat with
+      // existing render-start.sh consumers).
+      if (store.accounts.length === 1) {
+        const cred = store.accounts[0].credential;
+        const json = JSON.stringify(cred);
+        const b64 = Buffer.from(json, "utf8").toString("base64");
+        return jsonResp({
+          credential: b64,
+          json: JSON.stringify(cred, null, 2),
+          envVars: {
+            ZCODE_AUTH_MODE: "oauth",
+            ZCODE_OAUTH_CREDENTIAL: b64,
+          },
+          multi: false,
+          accountCount: 1,
+          instructions: [
+            "1. Copy the value of ZCODE_OAUTH_CREDENTIAL below.",
+            "2. On Render, go to your service → Environment → add/edit:",
+            "   - ZCODE_AUTH_MODE = oauth",
+            "   - ZCODE_OAUTH_CREDENTIAL = <paste the base64 blob>",
+            "3. Make sure ZCODE_API_KEY is UNSET (otherwise the proxy uses apikey mode).",
+            "4. Save and let Render redeploy.",
+            "",
+            "WARNING: This blob contains your upstream credential in plaintext.",
+            "Treat it like a password. On Render, mark the env var as Secret.",
+          ].join("\n"),
+        });
+      }
+
+      // Multi-account path: emit the full v2 store envelope so all accounts
+      // are preserved on the remote host.
+      const storeJson = JSON.stringify(store);
+      const b64 = Buffer.from(storeJson, "utf8").toString("base64");
       return jsonResp({
         credential: b64,
-        json: JSON.stringify(cred, null, 2),
+        json: JSON.stringify(store, null, 2),
         envVars: {
           ZCODE_AUTH_MODE: "oauth",
           ZCODE_OAUTH_CREDENTIAL: b64,
         },
+        multi: true,
+        accountCount: store.accounts.length,
         instructions: [
+          `Detected ${store.accounts.length} stored accounts — exporting the full credential store (v2 envelope).`,
+          "All accounts and the active-account pointer are preserved in the base64 blob.",
+          "",
           "1. Copy the value of ZCODE_OAUTH_CREDENTIAL below.",
           "2. On Render, go to your service → Environment → add/edit:",
           "   - ZCODE_AUTH_MODE = oauth",
@@ -562,7 +612,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
           "3. Make sure ZCODE_API_KEY is UNSET (otherwise the proxy uses apikey mode).",
           "4. Save and let Render redeploy.",
           "",
-          "WARNING: This blob contains your upstream credential in plaintext.",
+          "WARNING: This blob contains ALL your upstream credentials in plaintext.",
           "Treat it like a password. On Render, mark the env var as Secret.",
         ].join("\n"),
       });
