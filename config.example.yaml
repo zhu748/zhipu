@@ -4,7 +4,7 @@ server:
 
 auth:
   # "apikey" = use a pre-obtained API key directly
-  # "oauth"  = use OAuth login flow (run `bun run src/cli/login.ts` first)
+  # "oauth"  = use OAuth login flow (run `zcode-proxy auth login <zai|bigmodel>` first)
   mode: apikey
 
   # For apikey mode:

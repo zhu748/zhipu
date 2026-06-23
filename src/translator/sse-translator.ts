@@ -4,45 +4,19 @@
  * @see https://docs.anthropic.com/en/api/messages-streaming
  */
 import type { AnthropicStreamEvent, OpenAIStreamChunk } from "./types.js";
+import { parseSSEChunk, waitForBackpressure } from "../utils/sse.js";
 
 const ANTHROPIC_SSE_PREFIX = "event: ";
 const SSE_DATA_PREFIX = "data: ";
 
-/** Parse a raw SSE chunk string into event type + JSON data. */
+/** Parse a raw SSE chunk string into event type + JSON data.
+ *
+ * Re-exported from utils/sse.ts. The local interface is kept for backward
+ * compatibility with internal callers that import ParsedSSE from this module.
+ */
 interface ParsedSSE {
   event: string;
   data: unknown;
-}
-
-function parseSSEChunk(raw: string): ParsedSSE[] {
-  const results: ParsedSSE[] = [];
-  const blocks = raw.split("\n\n");
-
-  for (const block of blocks) {
-    const lines = block.trim().split("\n").filter(Boolean);
-    if (lines.length === 0) continue;
-
-    let eventType = "";
-    let dataStr = "";
-
-    for (const line of lines) {
-      if (line.startsWith("event: ")) {
-        eventType = line.slice(7).trim();
-      } else if (line.startsWith("data:")) {
-        dataStr = line.slice(5).trimStart();
-      }
-    }
-
-    if (dataStr) {
-      try {
-        results.push({ event: eventType, data: JSON.parse(dataStr) });
-      } catch {
-        // Skip malformed JSON
-      }
-    }
-  }
-
-  return results;
 }
 
 interface TranslationState {
@@ -110,6 +84,11 @@ export function anthropicSseToOpenaiSse(
             for (const p of parsed) {
               const output = translateEvent(state, p);
               if (output) {
+                // Wait for the downstream client to drain before enqueuing
+                // more chunks. Without this, a slow client (e.g. Codex CLI
+                // on a flaky network) can cause the proxy's translated-stream
+                // buffer to grow unbounded — eventually OOMing.
+                await waitForBackpressure(controller);
                 controller.enqueue(encoder.encode(output));
               }
             }
@@ -121,11 +100,15 @@ export function anthropicSseToOpenaiSse(
           const parsed = parseSSEChunk(buffer);
           for (const p of parsed) {
             const output = translateEvent(state, p);
-            if (output) controller.enqueue(encoder.encode(output));
+            if (output) {
+              await waitForBackpressure(controller);
+              controller.enqueue(encoder.encode(output));
+            }
           }
         }
 
         // Emit [DONE]
+        await waitForBackpressure(controller);
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       } catch (err) {
         controller.error(err);
@@ -247,6 +230,7 @@ export function openaiSseToAnthropicSse(
             const dataStr = line.slice(6).trim();
 
             if (dataStr === "[DONE]") {
+              await waitForBackpressure(controller);
               controller.enqueue(encoder.encode(
                 formatAnthropicSSE("message_stop", { type: "message_stop" }),
               ));
@@ -259,6 +243,7 @@ export function openaiSseToAnthropicSse(
 
               if (!messageStarted) {
                 messageStarted = true;
+                await waitForBackpressure(controller);
                 controller.enqueue(encoder.encode(formatAnthropicSSE("message_start", {
                   type: "message_start",
                   message: {
@@ -275,16 +260,19 @@ export function openaiSseToAnthropicSse(
               }
 
               if (choice?.delta?.content) {
+                await waitForBackpressure(controller);
                 controller.enqueue(encoder.encode(formatAnthropicSSE("content_block_start", {
                   type: "content_block_start",
                   index: blockIndex,
                   content_block: { type: "text", text: "" },
                 })));
+                await waitForBackpressure(controller);
                 controller.enqueue(encoder.encode(formatAnthropicSSE("content_block_delta", {
                   type: "content_block_delta",
                   index: blockIndex,
                   delta: { type: "text_delta", text: choice.delta.content },
                 })));
+                await waitForBackpressure(controller);
                 controller.enqueue(encoder.encode(formatAnthropicSSE("content_block_stop", {
                   type: "content_block_stop",
                   index: blockIndex,
@@ -294,6 +282,7 @@ export function openaiSseToAnthropicSse(
 
               if (choice?.finish_reason) {
                 const stopReason = mapFinishReason(choice.finish_reason);
+                await waitForBackpressure(controller);
                 controller.enqueue(encoder.encode(formatAnthropicSSE("message_delta", {
                   type: "message_delta",
                   delta: { stop_reason: stopReason },

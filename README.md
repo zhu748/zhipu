@@ -8,11 +8,8 @@ A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI
 # Install dependencies
 bun install
 
-# Copy and edit config
-cp config.example.yaml config.yaml
-# Edit config.yaml — set your API key
-
-# Start the proxy
+# Start the proxy — first run auto-creates config.yaml from the bundled
+# template if it doesn't already exist (no need to cp from config.example.yaml)
 bun run src/index.ts
 
 # Or specify a config path
@@ -38,11 +35,11 @@ provider: zai  # or bigmodel
 ### Option 2: OAuth Login (browser-based, both providers)
 
 ```bash
-# Z.AI device/poll flow
-bun run src/index.ts auth login zai
+# Z.AI device/poll flow (coding-plan is the default; use --plan=start-plan for start-plan)
+bun run src/index.ts auth login zai [--plan=coding-plan|start-plan]
 
 # Bigmodel auth-code flow (via zcode.z.ai proxy)
-bun run src/index.ts auth login bigmodel
+bun run src/index.ts auth login bigmodel [--plan=coding-plan|start-plan]
 
 # This will:
 # 1. Print an authorize URL and open your browser
@@ -72,7 +69,24 @@ bun run src/index.ts auth login bigmodel --import
 | `POST` | `/v1/messages` | Anthropic-format messages (streaming + non-streaming) |
 | `POST` | `/v1/responses` | OpenAI Responses API (streaming + non-streaming, Codex CLI compatible) |
 | `GET` | `/v1/models` | List available models |
-| `GET` | `/health` | Health check |
+| `GET` | `/health` | Health check (also served at `/`) |
+| `GET` | `/admin` | Admin dashboard (web UI: stats, logs, config, accounts, OAuth login) |
+| `*`   | `/admin/api/*` | Admin API endpoints used by the dashboard |
+
+## Admin Dashboard
+
+Open `http://localhost:8080/admin` in your browser. The dashboard lets you:
+
+- View live request stats (counts, latency, tokens/s, model breakdown)
+- Stream live logs (filter by level / search)
+- Edit config (provider, plan, models, identity, retry, routing rules, model mappings)
+- Manage stored accounts (multi-account: add, switch active, edit label/plan, export/import)
+- Trigger OAuth login for Z.AI or Bigmodel
+- Inspect upstream 4xx debug dumps (transformed request bodies that triggered errors)
+
+The dashboard uses the same `auth.proxyApiKey` as the API endpoints (pass it as
+`Authorization: Bearer <key>`). When `proxyApiKey` is unset the dashboard is
+**open to anyone with network access** — set the key in production.
 
 ## Usage Examples
 
@@ -141,7 +155,8 @@ codex --model glm-4.6
 The proxy translates `POST /v1/responses` to Anthropic Messages upstream and back,
 emitting the full Responses streaming event sequence (`response.created` →
 `response.output_text.delta` → `response.completed`) that Codex CLI expects.
-`previous_response_id` is supported via an in-memory LRU store (256 turns).
+`previous_response_id` is supported via an in-memory LRU store (256 turns,
+each capped at 256 KB of serialized input+output to bound memory).
 
 ### List Models
 
@@ -161,6 +176,17 @@ curl http://localhost:8080/v1/models \
 | `identity.appVersion` | `ZCODE_APP_VERSION` | `3.1.1` | `User-Agent: ZCode/{version}` |
 | `identity.sourceTitle` | `ZCODE_SOURCE_TITLE` | `cli` | `X-Title: Z Code@{title}` |
 | `identity.refererOrigin` | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL |
+| — | `ZCODE_PROXY_CREDENTIAL_SECRET` | derived from `homedir` | Override the AES-256-GCM key for `~/.zcode-proxy/credentials.json` |
+| — | `ZCODE_PROXY_ALLOW_PLAINTEXT_STORE` | unset | Set to `1` to allow loading a plaintext credentials.json (debug/test only) |
+| — | `ZCODE_PROXY_CORS_ALLOWLIST` | unset | Comma-separated allowed origins for `Access-Control-Allow-Origin`. When unset, any origin is echoed (legacy permissive behavior). When set, only listed origins get `Access-Control-Allow-Origin: <origin>`; all others get `null`. |
+| — | `ZCODE_PROXY_CONFIG` | `config.yaml` | Path to the config file (used when `serve` is called with no positional arg) |
+
+## Security Notes
+
+- **`auth.proxyApiKey`**: if unset, anyone with network access to the port can use your upstream credentials. The proxy prints a warning at startup if this is missing.
+- **Credential store encryption**: `~/.zcode-proxy/credentials.json` is AES-256-GCM encrypted using a key derived from your homedir/platform. The key can be overridden with `ZCODE_PROXY_CREDENTIAL_SECRET` (useful for test isolation). Plaintext loading is gated behind `ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1` to prevent bypass-via-file-write attacks.
+- **CORS**: by default the proxy echoes the requesting Origin. For production, set `ZCODE_PROXY_CORS_ALLOWLIST` to the comma-separated list of origins you trust (e.g. `http://localhost:3000,https://your-dashboard.example.com`).
+- **Upstream timeouts**: stream requests time out after 10 minutes; batch requests after 5 minutes. A hung upstream connection no longer pins a Bun worker forever — it surfaces as `502 upstream_unreachable`.
 
 ## Architecture
 

@@ -19,6 +19,14 @@ const STORE_DIR = join(homedir(), ".zcode-proxy");
 const STORE_FILE = join(STORE_DIR, "credentials.json");
 const ENV_SECRET = "ZCODE_PROXY_CREDENTIAL_SECRET";
 
+/**
+ * In-memory cache of the decrypted store. Set to `undefined` to indicate
+ * "not yet loaded" (distinct from `null` = "loaded but file doesn't exist").
+ * Invalidated by every writeStore() and clearCredential() call so callers
+ * always see fresh data after a mutation.
+ */
+let cachedStore: StoreV2 | null | undefined = undefined;
+
 /** One stored account record (without encryption — encryption wraps the whole file). */
 export interface StoredAccount {
   /** Stable unique id (16 hex chars). */
@@ -163,7 +171,10 @@ async function decrypt(ciphertext: string): Promise<string> {
 // ---------------------------------------------------------------------------
 
 function genId(): string {
-  return randomBytes(8).toString("hex");
+  // 16 random bytes = 128 bits = 32 hex chars. Matches UUID-style entropy.
+  // 8 bytes was previously used; 16 is the modern default and removes any
+  // collision concern when accounts are imported from another machine.
+  return randomBytes(16).toString("hex");
 }
 
 function defaultLabel(cred: Credential, createdAt: number): string {
@@ -171,8 +182,21 @@ function defaultLabel(cred: Credential, createdAt: number): string {
   return `${cred.provider} · ${ts}`;
 }
 
-/** Read raw store (migrates v1 if needed). Returns null if file doesn't exist. */
+/** Read raw store (migrates v1 if needed). Returns null if file doesn't exist.
+ *
+ * Results are cached in module memory and invalidated on every writeStore()
+ * call. This avoids re-running AES-256-GCM decryption on every admin endpoint
+ * invocation (9+ endpoints all call loadCredential() — that used to mean
+ * 9 disk reads + 9 decrypts per dashboard refresh).
+ */
 async function readStore(): Promise<StoreV2 | null> {
+  if (cachedStore !== undefined) return cachedStore;
+  cachedStore = await readStoreUncached();
+  return cachedStore;
+}
+
+/** Uncached inner implementation. Does the actual disk + decrypt work. */
+async function readStoreUncached(): Promise<StoreV2 | null> {
   if (!existsSync(STORE_FILE)) return null;
 
   let raw: string;
@@ -239,9 +263,23 @@ async function readStore(): Promise<StoreV2 | null> {
     return migrated;
   }
 
-  // Plaintext v2 (used in tests / debugging) — direct parse
-  if (parsed && (parsed as any).version === 2 && Array.isArray((parsed as any).accounts)) {
+  // Plaintext v2 backdoor.
+  //
+  // SECURITY: only allowed when ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1 is set.
+  // Without this gate, any process that can write ~/.zcode-proxy/credentials.json
+  // can inject plaintext credentials and bypass AES-256-GCM entirely — defeating
+  // the encryption-at-rest guarantee. Tests should set this env var explicitly
+  // (or use a temp HOME + ZCODE_PROXY_CREDENTIAL_SECRET).
+  if (process.env.ZCODE_PROXY_ALLOW_PLAINTEXT_STORE === "1"
+      && parsed && (parsed as any).version === 2 && Array.isArray((parsed as any).accounts)) {
     return parsed as StoreV2;
+  }
+
+  // Plaintext file present but env not set — refuse to load and warn.
+  if (parsed && (parsed as any).version === 2 && Array.isArray((parsed as any).accounts)) {
+    console.warn("[store] Refusing to load plaintext credentials.json without ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1.");
+    console.warn("[store] Either delete the file and re-login, or set the env var (test/debug only).");
+    return null;
   }
 
   return null;
@@ -268,6 +306,7 @@ async function writeStore(store: StoreV2): Promise<void> {
   const json = JSON.stringify(store);
   const encrypted = await encrypt(json);
   writeFileSync(STORE_FILE, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
+  cachedStore = store; // keep cache in sync with disk
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +361,7 @@ export function clearCredential(): void {
   if (existsSync(STORE_FILE)) {
     unlinkSync(STORE_FILE);
   }
+  cachedStore = null; // invalidate cache
 }
 
 export function getStorePath(): string {

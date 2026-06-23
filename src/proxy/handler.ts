@@ -42,10 +42,18 @@ export interface ProxyHandlerOptions {
  * (gzip/deflate/br) pass through untouched — the raw bytes and Content-Encoding
  * header are forwarded as-is, letting the client handle decompression.
  *
- * No upstream timeout is applied — matches ZCode desktop client behaviour
- * (the bundle has no automatic timer on LLM calls, only user-initiated abort).
- * Connection-level errors (ECONNREFUSED, DNS failure) still surface as 502.
+ * Upstream timeout: an AbortController fires after UPSTREAM_TIMEOUT_MS (default
+ * 10 minutes for streams, 5 minutes for batch). Without this, a hung upstream
+ * TCP connection pins a Bun worker + the client connection indefinitely — under
+ * upstream network partitions requests accumulate until OOM or fd exhaustion.
+ * The timeout is generous enough to never fire on legitimate LLM calls (the
+ * slowest reasonable thinking-trace stream is well under 10 minutes).
+ *
+ * Connection-level errors (ECONNREFUSED, DNS failure, abort) surface as 502.
  */
+const UPSTREAM_TIMEOUT_STREAM_MS = 10 * 60_000;
+const UPSTREAM_TIMEOUT_BATCH_MS = 5 * 60_000;
+
 export async function proxyRequest(
   clientReq: Request,
   format: Format,
@@ -191,12 +199,41 @@ export async function proxyRequest(
   const buildUpstreamReq = (captcha?: Record<string, string>) =>
     buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, captcha);
 
+  // Track the last anthropic-beta header actually sent upstream. Captured
+  // during the real fetch so diagnostics on 4xx don't need to build a second
+  // throwaway Request (which would generate fresh random UUIDs and log a
+  // header belonging to a different request than the one actually sent).
+  let lastSentBeta: string | null = null;
+
   // Fetch + SSE error detection in one shot. Used for both the initial fetch
   // AND every retry, so SSE errors hidden in 200 streams are caught on every
   // attempt — not just the first one.
+  //
+  // An AbortController applies an upstream timeout: 10 min for streaming
+  // requests (LLM thinking traces can be long), 5 min for batch. Prevents a
+  // hung upstream TCP connection from pinning a Bun worker forever.
   const fetchUpstreamDetected = async (captcha?: Record<string, string>): Promise<Response> => {
     const req = buildUpstreamReq(captcha);
-    let resp = await fetchImpl(req, translateMode ? {} : { decompress: false });
+    lastSentBeta = req.headers.get("anthropic-beta");
+    const timeoutMs = meta.stream ? UPSTREAM_TIMEOUT_STREAM_MS : UPSTREAM_TIMEOUT_BATCH_MS;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    let resp: Response;
+    try {
+      resp = await fetchImpl(req, {
+        ...(translateMode ? {} : { decompress: false }),
+        signal: ctrl.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      // Distinguish abort (timeout) from real network errors so the error
+      // message surfaces the actual cause to the client.
+      if (ctrl.signal.aborted) {
+        throw new Error(`upstream timeout after ${timeoutMs}ms`);
+      }
+      throw err;
+    }
+    clearTimeout(timer);
     if (resp.status === 200) {
       const originalStatus = resp.status;
       resp = await detectSseErrorAndConvert(resp);
@@ -311,10 +348,23 @@ export async function proxyRequest(
       const rawDelay = config.retry.initialDelayMs * Math.pow(config.retry.backoffFactor, attempt - 1);
       let delayMs = Math.min(rawDelay, config.retry.maxDelayMs);
 
-      // Respect Retry-After header if present (value is in seconds)
+      // Respect Retry-After header. Per RFC 7231 §7.1.3 the value can be:
+      //   - delta-seconds (e.g. "120"), OR
+      //   - HTTP-date   (e.g. "Wed, 21 Oct 2025 07:28:00 GMT")
+      // The old code only parsed delta-seconds and silently ignored HTTP-date
+      // values — meaning the proxy would retry sooner than the upstream
+      // explicitly requested.
       const retryAfter = upstreamResp.headers.get("retry-after");
       if (retryAfter) {
-        const retryAfterMs = parseFloat(retryAfter) * 1000;
+        let retryAfterMs: number;
+        const asNum = parseFloat(retryAfter);
+        if (Number.isFinite(asNum)) {
+          retryAfterMs = asNum * 1000;
+        } else {
+          // Try HTTP-date format
+          const dateMs = Date.parse(retryAfter);
+          retryAfterMs = Number.isFinite(dateMs) ? dateMs - Date.now() : NaN;
+        }
         if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
           delayMs = Math.max(delayMs, retryAfterMs);
         }
@@ -357,8 +407,13 @@ export async function proxyRequest(
         const errMsg = (err as Error).message ?? String(err);
         if (attempt < config.retry.maxRetries) {
           console.log(`${reqId} fetch failed on retry ${attempt}: ${errMsg}, will retry again...`);
-          // Create a synthetic 502 response so the loop can continue checking retryableStatuses
-          upstreamResp = errorResponse(502, "upstream_unreachable", errMsg);
+          // Network errors are ALWAYS retryable — they are the most common
+          // retry scenario (upstream blip, transient DNS, ECONNREFUSED during
+          // deploy). The previous code synthesized a 502 and then checked
+          // `retryableStatuses.includes(502)` — but the default config is
+          // `[529]` only, so synthetic 502 broke the loop and the actual
+          // retry never happened. Skip the retryable-status check below by
+          // continuing the loop directly here.
           continue;
         }
         console.log(`${reqId} fetch failed on final retry ${attempt}: ${errMsg}`);
@@ -400,17 +455,18 @@ export async function proxyRequest(
     console.log(`${reqId} transformed request summary: ${summarizeBody(transformedObj ?? parsedBody)}`);
     // Also log the anthropic-beta header that was actually sent upstream —
     // mismatched beta flags vs body is a common 3001 cause on ZCode gateway.
-    const sentBeta = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, undefined).headers.get("anthropic-beta");
-    console.log(`${reqId} anthropic-beta sent: ${sentBeta ?? "(none)"}`);
-    // Record to in-memory ring buffer (capped at 20 entries by admin/api.ts).
-    // The full body is exposed via /admin/api/debug-dumps?id=<reqId>&full=1.
+    // Reuses lastSentBeta captured during the real fetch (instead of building
+    // a fresh Request just to read one header — the old code generated new
+    // random UUIDs for x-request-id etc., making the logged header belong to
+    // a different request than the one actually sent).
+    console.log(`${reqId} anthropic-beta sent: ${lastSentBeta ?? "(none)"}`);
     if (transformedBody) {
       try {
         recordDebugDump({
           id: reqId,
           status: upstreamResp.status,
           upstreamError: errPeek.slice(0, 500),
-          anthropicBeta: sentBeta ?? "",
+          anthropicBeta: lastSentBeta ?? "",
           bodySummary: summarizeBody(transformedObj ?? parsedBody),
           body: transformedBody,
         });
@@ -674,6 +730,12 @@ async function translatedBatchResponse(
   if (clientAcceptsGzip(clientReq)) {
     respHeaders.set("content-encoding", "gzip");
     printRow(reqId, format, meta, upstream.status, started, headersAt, openaiResp.usage?.completion_tokens ?? 0, 0, 0);
+    // Note: Bun.gzipSync blocks the event loop briefly (~5-20ms for 200KB).
+    // Bun's typing only exposes gzipSync (not an async Bun.gzip), and the
+    // alternative (Bun.deflateSync with GZIP format) is also sync. In
+    // practice this is rarely a hot path — chat completions responses are
+    // usually <50KB. If you hit high concurrency with large responses,
+    // consider moving to a worker thread or a streaming compressor.
     return new Response(Bun.gzipSync(payload), {
       status: upstream.status,
       headers: respHeaders,
@@ -802,22 +864,24 @@ export function globMatch(pattern: string, value: string): boolean {
   if (!p.includes("*") && !p.includes("?")) return p === v;
 
   // DP: dp[i] = true if v[0..i) matches the part of pattern processed so far.
-  const dp = new Array<boolean>(v.length + 1).fill(false);
-  dp[0] = true;
+  // Use Uint8Array (1 byte per cell) instead of Array<boolean> — slightly
+  // less memory, faster to allocate (no .fill call needed since 0 is falsy).
+  const dp = new Uint8Array(v.length + 1);
+  dp[0] = 1;
   for (let pi = 0; pi < p.length; pi++) {
     const ch = p[pi];
     if (ch === "*") {
       // `*` matches zero or more chars: dp[j] = dp[j] || dp[j-1]
-      for (let j = 1; j <= v.length; j++) dp[j] = dp[j] || dp[j - 1];
+      for (let j = 1; j <= v.length; j++) dp[j] = dp[j]! || dp[j - 1]! ? 1 : 0;
     } else {
       // Single char (or `?`): must match exactly one char, shift right-to-left.
       for (let j = v.length; j >= 1; j--) {
-        dp[j] = dp[j - 1] && (ch === "?" || ch === v[j - 1]);
+        dp[j] = dp[j - 1]! && (ch === "?" || ch === v[j - 1]) ? 1 : 0;
       }
-      dp[0] = false; // any non-* char requires at least one input char
+      dp[0] = 0; // any non-* char requires at least one input char
     }
   }
-  return dp[v.length];
+  return dp[v.length] === 1;
 }
 
 /**

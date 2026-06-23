@@ -6,23 +6,36 @@ import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import { loadConfig } from "./config/loader.js";
 import { AuthManager } from "./auth/manager.js";
 import { startServer } from "./server/server.js";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+
+// Resolve the test config relative to THIS test file (not the CWD). The old
+// code used `loadConfig("config.test.yaml")`, which only worked when tests
+// were run from the repo root — running from any other directory failed
+// with "Config file not found: config.test.yaml".
+const TEST_CONFIG_PATH = join(dirname(import.meta.dir), "config.test.yaml");
 
 let proxyServer: ReturnType<typeof Bun.serve>;
 let mockUpstreamServer: ReturnType<typeof Bun.serve>;
 let proxyPort: number;
 let mockPort: number;
 let config: ReturnType<typeof loadConfig>;
-
-function findFreePort(): number {
-  return 18000 + Math.floor(Math.random() * 1000);
-}
+// Snapshot of HOME so afterEach can restore it (we redirect HOME to a tmpdir
+// so the test never touches the user's real ~/.zcode-proxy/credentials.json).
+let realHome: string | undefined;
 
 beforeAll(() => {
-  mockPort = findFreePort();
-  proxyPort = findFreePort();
+  // Redirect HOME to a temp directory so the credential store (and any other
+  // dotfiles the proxy might write) never touches the user's real $HOME.
+  // The previous code shared `~/.zcode-proxy/credentials.json` with the user.
+  realHome = process.env.HOME;
+  const tmpHome = mkdtempSync(join(tmpdir(), "zcode-proxy-int-"));
+  process.env.HOME = tmpHome;
+  process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "integration-test-secret";
 
   mockUpstreamServer = Bun.serve({
-    port: mockPort,
+    port: 0, // let the OS pick a free port — eliminates the port-race flake
     hostname: "127.0.0.1",
     async fetch(req) {
       const url = new URL(req.url);
@@ -70,9 +83,12 @@ beforeAll(() => {
       return new Response("not found", { status: 404 });
     },
   });
+  // Read the actual port assigned by the OS — no race possible.
+  mockPort = (mockUpstreamServer as any).port ?? mockUpstreamServer.port;
 
-  const loaded = loadConfig("config.test.yaml");
-  loaded.server.port = proxyPort;
+  const loaded = loadConfig(TEST_CONFIG_PATH);
+  // Spin proxy on port 0 too — same anti-flake rationale.
+  loaded.server.port = 0;
   loaded.server.host = "127.0.0.1";
   loaded.auth.proxyApiKey = "integration-test-key";
   loaded.providers.zai.anthropicBase = `http://127.0.0.1:${mockPort}/anthropic`;
@@ -87,11 +103,16 @@ beforeAll(() => {
   });
 
   proxyServer = startServer({ config, auth });
+  // Read the actual proxy port assigned by the OS.
+  proxyPort = (proxyServer as any).port ?? proxyServer.port;
 });
 
 afterAll(() => {
   proxyServer?.stop(true);
   mockUpstreamServer?.stop(true);
+  // Restore HOME so other test files see the real environment.
+  if (realHome !== undefined) process.env.HOME = realHome;
+  delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
 });
 
 function proxyUrl(path: string): string {

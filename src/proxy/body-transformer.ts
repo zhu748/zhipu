@@ -679,8 +679,26 @@ function normalizeAllMessageContent(body: Record<string, unknown>): boolean {
 /**
  * start-plan: prepend ZCode gateway system blocks. The gateway rejects
  * requests without these identity blocks with 3012 "method not allowed".
+ *
+ * Returns true only if the body's system field was actually changed —
+ * short-circuits the `JSON.stringify(transformedObj)` in handler.ts when
+ * the body already had the official blocks in the right position, saving
+ * ~5ms on a 90KB body for the common case of repeated identical requests.
  */
 function applyStartPlanSystem(body: Record<string, unknown>): boolean {
-  body.system = buildStartPlanSystem(body.system);
+  const newSystem = buildStartPlanSystem(body.system);
+  // Quick structural check: same length + same first-block text means the
+  // official blocks were already prepended (by us on a previous transform,
+  // or by the client mimicking the gateway format). Skip the reassignment
+  // entirely so transformRequestBodyObj doesn't flag the body as modified.
+  const cur = body.system;
+  if (Array.isArray(cur) && cur.length === newSystem.length) {
+    const curFirst = cur[0] as { text?: string } | undefined;
+    const newFirst = newSystem[0] as { text?: string } | undefined;
+    if (curFirst && newFirst && curFirst.text === newFirst.text) {
+      return false;
+    }
+  }
+  body.system = newSystem;
   return true;
 }

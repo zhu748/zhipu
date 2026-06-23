@@ -153,7 +153,10 @@ function extractErrorFromJson(jsonStr: string, eventType: string): SseErrorInfo 
   let data: any;
   try {
     data = JSON.parse(jsonStr);
-  } catch {
+  } catch (err) {
+    // Log malformed JSON in SSE error events so silent passthrough of
+    // garbage streams can be diagnosed. Previously these were swallowed.
+    console.warn(`[sse-error] malformed JSON in SSE error event: ${(err as Error).message}; payload=${jsonStr.slice(0, 200)}`);
     return null;
   }
 

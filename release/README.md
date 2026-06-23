@@ -1,25 +1,51 @@
 # zcode-proxy 使用说明
 
-> **v2.1.3.5 — 全面优化版（安全加固 + 测试补全 + UX 提升）**
+> **v2.1.4 — 全面优化版（安全加固 + 性能优化 + 资源控制）**
 >
-> 在 v2.1.3.4 稳定版基础上进行了 13 项优化，覆盖安全、内存、UX、代码质量四个维度。
+> 在 v2.1.3.5 基础上进行了一次完整的代码审查与系统性优化，覆盖 30 项发现，分 P0/P1/P2/P3 四级落地。
 >
-> **v2.1.3.5 关键改进**（按重要性排序）：
-> 1. **调试文件泄露修复**：4xx 错误的请求快照不再写入磁盘，改为内存环形缓冲（最多 20 条），新增管理面板「调试转储」页面
-> 2. **CORS 安全加固**：从 `*` 改为 echo origin，防止第三方网站跨域读取响应
-> 3. **未配置 proxyApiKey 警告**：启动时醒目提示，避免开放代理被滥用
-> 4. **优雅关闭**：等待在途请求最长 30s 完成，不再强杀 SSE 流
-> 5. **/verify 安全语义**：未配置 proxyApiKey 时返回 `{warning: "no_auth"}`，前端展示警告横幅
-> 6. **OAuth flow 内存泄漏修复**：5 分钟定时清理过期 flow
-> 7. **统计双计数修复**：同一请求重试时不再被记录为多条
-> 8. **SSE 日志缓冲索引修复**：改用单调 seq 号，splice 后客户端不丢日志
-> 9. **前端 XSS 加固**：所有用户数据 escapeHtml；Token 改用 sessionStorage
-> 10. **配置热生效反馈**：保存返回 `{requiresRestart, restartFields, hotApplied}`
-> 11. **概览页统计自动刷新**：不再静止不动
-> 12. **路由规则 glob 匹配**：实现真正的 `*` 和 `?` 通配符（之前是隐藏 no-op）
-> 13. **代码质量优化**：服务器路由 Map O(1) 查找；加密模块 decrypt 三重尝试合并；配置验证增强
+> **v2.1.4 关键改进**（按优先级）：
 >
-> 全套 **348 测试通过**（v2.1.3.4 是 295），TypeScript 类型检查零错误。
+> ### P0 关键（安全/正确性）
+> 1. **Admin token 时序攻击修复**：admin 控制台 token 比较改用 timingSafeEqual（之前用 `===`）
+> 2. **凭证存储明文后门加固**：必须设置 `ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1` 才能加载明文 credentials.json
+> 3. **上游 fetch 超时**：stream 10 分钟、batch 5 分钟，挂起的上游连接不再无限占用 worker
+> 4. **SSE 流背压控制**：所有翻译流在 enqueue 前检查 `controller.desiredSize`，慢客户端不再导致 OOM
+> 5. **console.log 猴补丁修复**：保留 Error stack，处理循环引用（之前 `JSON.stringify(Error)` 返回 `"{}"`）
+>
+> ### P1 高优先级（可靠性）
+> 6. **网络错误默认可重试**：之前合成 502 但默认 retryableStatuses 不含 502，重试静默失效
+> 7. **Retry-After HTTP-date 格式**：RFC 7231 完整支持（之前只解析 delta-seconds）
+> 8. **配置原子写入 + 互斥锁**：所有 dashboard 保存改用 temp-file + rename，并发 PUT 串行化
+> 9. **凭证 store 内存缓存**：9+ admin 端点不再每次磁盘读 + AES-GCM 解密
+> 10. **OAuth callback server 泄漏修复**：try/finally 保证 oauth.close() 总执行
+> 11. **responses-store 大小上限**：每条 256KB 上限，防止 Codex 长对话 OOM
+> 12. **死代码删除**：移除 `routes-auth.ts` + `cli/login.ts`（220 LOC）
+> 13. **recordStat O(n) → Map**：去重查找 O(1)
+> 14. **SSE 错误日志**：malformed JSON 不再静默吞掉
+>
+> ### P2 中优先级（性能/架构）
+> 15. **SSE 解析器去重**：3 处副本合并到 `src/utils/sse.ts`
+> 16. **4xx 时不再二次构造 Request**：`lastSentBeta` 缓存实际发送的 header
+> 17. **structuredClone 优化**：模块加载时一次性 freeze 而非每请求克隆
+> 18. **logging.level 真正生效**：之前配置了但不被读取
+> 19. **Admin log stream O(n²) → O(n)**：直接遍历 buffer 替代 find(seq)
+> 20. **CORS allowlist 支持**：新增 `ZCODE_PROXY_CORS_ALLOWLIST` 环境变量
+> 21. **applyStartPlanSystem 短路优化**：body 已正确时跳过 stringify
+> 22. **globMatch 改用 Uint8Array**：减少分配
+> 23. **defaultModel 与 models 一致性校验**
+>
+> ### P3 改进（DX）
+> 24. **README 更新**：auto-create config.yaml 说明、`--plan=` flag、Admin Dashboard 章节、Security Notes
+> 25. **tsconfig 加严**：noImplicitReturns / noFallthroughCasesInSwitch / forceConsistentCasingInFileNames
+> 26. **genId 升级到 128-bit**：8 字节 → 16 字节
+> 27. **集成测试隔离**：port 0（消除端口竞争）+ 临时 HOME（不污染用户凭证目录）+ 绝对路径 config
+>
+> 全套 **348 测试通过**（v2.1.3.5 是 329+1 失败 → v2.1.4 是 348+0 失败），TypeScript 类型检查零错误。
+>
+> ### 新增环境变量
+> - `ZCODE_PROXY_ALLOW_PLAINTEXT_STORE=1` — 允许加载明文凭证文件（仅 debug/test）
+> - `ZCODE_PROXY_CORS_ALLOWLIST=https://a.com,https://b.com` — CORS origin 白名单
 
 ---
 

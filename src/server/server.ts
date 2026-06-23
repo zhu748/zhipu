@@ -10,6 +10,7 @@ import { handleMessages } from "./routes-anthropic.js";
 import { handleResponses } from "./routes-responses.js";
 import { errorResponse } from "../proxy/handler.js";
 import { handleAdminRoute, type AdminOptions } from "../admin/api.js";
+import { timingSafeEqual } from "../utils/crypto.js";
 
 export interface ServerOptions {
   config: ProxyConfig;
@@ -126,21 +127,6 @@ function checkProxyKey(authHeader: string, expected: string): boolean {
   return timingSafeEqual(provided, expected);
 }
 
-/** Constant-time string comparison to mitigate timing attacks. */
-function timingSafeEqual(a: string, b: string): boolean {
-  // To avoid leaking length information, always compare the full length of
-  // the expected value. If the provided value has a different length, we
-  // still do a full comparison but the result will always be wrong.
-  const maxLen = Math.max(a.length, b.length);
-  let result = a.length ^ b.length; // Non-zero if lengths differ
-  for (let i = 0; i < maxLen; i++) {
-    const aChar = i < a.length ? a.charCodeAt(i) : 0;
-    const bChar = i < b.length ? b.charCodeAt(i) : 0;
-    result |= aChar ^ bChar;
-  }
-  return result === 0;
-}
-
 /** Build a CORS preflight response. */
 function corsResponse(req: Request): Response {
   return new Response(null, {
@@ -163,10 +149,11 @@ function addCorsHeaders(resp: Response, req: Request): Response {
 }
 
 function corsHeaders(req: Request): Record<string, string> {
-  // Echo the requesting Origin instead of "*" so that:
-  //   1) The dashboard (same-origin or LAN) still works.
-  //   2) Arbitrary third-party websites cannot read responses from this proxy
-  //      via CORS ("*" would let any site call /v1/messages from a browser).
+  // Echo the requesting Origin only when it's been explicitly allowed, OR
+  // when no allowlist is configured (preserving the old permissive behavior
+  // for backwards compatibility). When the origin is NOT in the allowlist,
+  // we return "null" — which prevents the browser from reading the response
+  // cross-origin.
   //
   // We do NOT use Access-Control-Allow-Credentials, so cookies are not sent
   // cross-origin — API auth is via Authorization header only.
@@ -174,8 +161,20 @@ function corsHeaders(req: Request): Record<string, string> {
   // When no Origin header is present (server-to-server / curl), fall back to
   // "*" for compatibility with simple clients.
   const origin = req.headers.get("origin");
+  const allowList = (globalThis as any).__ZCODE_PROXY_CORS_ALLOWLIST__ as string[] | undefined;
+  let allowOrigin: string;
+  if (!origin) {
+    allowOrigin = "*";
+  } else if (allowList && allowList.length > 0) {
+    // Allowlist configured — only echo if origin is in the list (case-insensitive).
+    allowOrigin = allowList.some(o => o.toLowerCase() === origin.toLowerCase()) ? origin : "null";
+  } else {
+    // No allowlist configured — preserve old permissive behavior (echo anything).
+    // Document this in README so operators can lock down via ZCODE_PROXY_CORS_ALLOWLIST.
+    allowOrigin = origin;
+  }
   return {
-    "access-control-allow-origin": origin ?? "*",
+    "access-control-allow-origin": allowOrigin,
     "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
     "access-control-allow-headers": "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta",
     "access-control-max-age": "86400",

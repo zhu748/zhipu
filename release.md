@@ -88,7 +88,7 @@ file release/zcode-proxy.exe
 | CLI 参数变化 | `--plan=` 改名为 `--tier=` |
 | 菜单项需要调整 | 新增"刷新 token"菜单项 |
 | `src/index.ts` 的 `printHelp()` 或 `authCommand()` 改动 | 任何 CLI 入口逻辑变化 |
-| `src/cli/login.ts` 改动 | OAuth 流程变化 |
+| OAuth 流程变化 | `src/auth/oauth.ts` / `src/admin/api.ts` `/admin/api/oauth/*` |
 
 ### 4.2 检测方法
 

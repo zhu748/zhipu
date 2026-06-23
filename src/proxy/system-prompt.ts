@@ -22,11 +22,25 @@ interface SystemBlock {
 export const ZCODE_SYSTEM_BLOCKS = blocks as SystemBlock[];
 
 /**
+ * Pre-frozen snapshot of the official blocks.
+ *
+ * `buildStartPlanSystem` previously called `structuredClone(b)` per request
+ * (~1ms for a multi-KB object) defensively in case downstream transforms
+ * mutated the constant. Body-transformer.ts already wraps these in a new
+ * outer array via spread, and downstream transforms never mutate the inner
+ * block fields. The per-request clone is wasteful — freeze once at module
+ * load instead.
+ */
+const OFFICIAL_BLOCKS_FROZEN: readonly SystemBlock[] = Object.freeze(
+  ZCODE_SYSTEM_BLOCKS.map(b => Object.freeze({ ...b })) as SystemBlock[],
+);
+
+/**
  * Prepend official ZCode gateway blocks to the request's `system` field.
  * Client system blocks (if any) are preserved after position 1.
  */
 export function buildStartPlanSystem(existingSystem: unknown): unknown[] {
-  const official = ZCODE_SYSTEM_BLOCKS.map((b) => structuredClone(b));
+  const official: SystemBlock[] = OFFICIAL_BLOCKS_FROZEN.map((b) => ({ ...b }));
   const userBlocks = normalizeUserSystem(existingSystem);
   return [...official, ...userBlocks];
 }

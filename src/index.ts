@@ -16,7 +16,7 @@ import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const VERSION = "2.1.3.5";
+const VERSION = "2.1.4";
 
 main();
 
@@ -170,13 +170,74 @@ async function serve(configPath?: string): Promise<void> {
   const origError = console.error;
   const origWarn = console.warn;
   const { appendLog } = await import("./admin/api.js");
-  const safeAppend = (level: string, args: unknown[]) => {
-    try { appendLog(level, args.map(a => typeof a === "string" ? a : (a instanceof Error ? a.message : JSON.stringify(a))).join(" ")); }
+
+  /**
+   * Serialize a single console argument to a single string.
+   *
+   * Three things the old code got wrong:
+   *   1. `JSON.stringify(Error)` returns "{}" because Error properties are
+   *      non-enumerable — so errors were logged as empty objects.
+   *   2. The .stack property (most useful diagnostic) was dropped in favor
+   *      of just .message.
+   *   3. `JSON.stringify` throws on circular structures (TypeError) — caught
+   *      silently, so the log line was lost entirely.
+   */
+  const serialize = (a: unknown): string => {
+    if (typeof a === "string") return a;
+    if (a instanceof Error) {
+      // Preserve the stack trace — it's the single most useful diagnostic.
+      return a.stack ?? `${a.name}: ${a.message}`;
+    }
+    if (typeof a === "number" || typeof a === "boolean" || a === null || a === undefined) {
+      return String(a);
+    }
+    try {
+      return JSON.stringify(a);
+    } catch {
+      // Circular structure or other stringify failure — fall back to String().
+      // String() on objects returns "[object Object]", which is unhelpful, so
+      // try a custom inspect for plain objects before giving up.
+      if (a && typeof a === "object") {
+        try {
+          // bun's Bun.inspect handles circular refs and is much more useful
+          // than "[object Object]" for nested data.
+          // Using globalThis.Bun to avoid import overhead in non-Bun envs.
+          const BunRef = (globalThis as any).Bun;
+          if (BunRef && typeof BunRef.inspect === "function") {
+            return BunRef.inspect(a);
+          }
+        } catch { /* fall through */ }
+      }
+      return String(a);
+    }
+  };
+
+  // logging.level enforcement: filter what gets buffered for the dashboard
+  // based on the configured minimum level. The console itself still prints
+  // everything (origLog/origError/origWarn are called unconditionally) —
+  // this only controls what the admin dashboard exposes. Previously the
+  // YAML field was parsed but never enforced, silently ignoring user config.
+  const LEVEL_ORDER: Record<string, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+  const minLevel = LEVEL_ORDER[config.logging.level] ?? 1; // default info
+
+  const safeAppend = (level: string, levelRank: number, args: unknown[]) => {
+    if (levelRank < minLevel) return; // below configured minimum — skip
+    try { appendLog(level, args.map(serialize).join(" ")); }
     catch (e) { /* appendLog itself may throw if log buffer is full; never let it kill the request */ void e; }
   };
-  console.log = (...args: unknown[]) => { origLog(...args); safeAppend("info", args); };
-  console.error = (...args: unknown[]) => { origError(...args); safeAppend("error", args); };
-  console.warn = (...args: unknown[]) => { origWarn(...args); safeAppend("warn", args); };
+  console.log = (...args: unknown[]) => { origLog(...args); safeAppend("info", 1, args); };
+  console.error = (...args: unknown[]) => { origError(...args); safeAppend("error", 3, args); };
+  console.warn = (...args: unknown[]) => { origWarn(...args); safeAppend("warn", 2, args); };
+
+  // CORS allowlist: comma-separated list of allowed origins. When set, the
+  // proxy only echoes `Access-Control-Allow-Origin` for origins in this list
+  // (prevents arbitrary websites from issuing authenticated cross-origin
+  // requests through the proxy). When unset, preserves the legacy permissive
+  // behavior (echo any origin) for backwards compatibility.
+  const corsAllowList = process.env.ZCODE_PROXY_CORS_ALLOWLIST;
+  if (corsAllowList) {
+    (globalThis as any).__ZCODE_PROXY_CORS_ALLOWLIST__ = corsAllowList.split(",").map(s => s.trim()).filter(Boolean);
+  }
 
   const server = startServer({ config, auth, configPath: path });
   const url = `http://${server.hostname}:${server.port}`;

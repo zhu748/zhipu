@@ -29,6 +29,7 @@ import type {
   OpenAIResponse,
   ResponsesOutputItem,
 } from "./types.js";
+import { parseSSEChunk, waitForBackpressure } from "../utils/sse.js";
 
 /** Default model name when upstream doesn't echo one back. */
 const DEFAULT_MODEL = "glm-4.6";
@@ -115,37 +116,6 @@ const ANTHROPIC_SSE_PREFIX = "event: ";
 interface ParsedSSE {
   event: string;
   data: unknown;
-}
-
-function parseSSEChunk(raw: string): ParsedSSE[] {
-  const results: ParsedSSE[] = [];
-  const blocks = raw.split("\n\n");
-
-  for (const block of blocks) {
-    const lines = block.trim().split("\n").filter(Boolean);
-    if (lines.length === 0) continue;
-
-    let eventType = "";
-    let dataStr = "";
-
-    for (const line of lines) {
-      if (line.startsWith("event: ")) {
-        eventType = line.slice(7).trim();
-      } else if (line.startsWith("data:")) {
-        dataStr = line.slice(5).trimStart();
-      }
-    }
-
-    if (dataStr) {
-      try {
-        results.push({ event: eventType, data: JSON.parse(dataStr) });
-      } catch {
-        // Skip malformed JSON
-      }
-    }
-  }
-
-  return results;
 }
 
 interface StreamState {
@@ -478,6 +448,9 @@ export function anthropicSseToResponsesSse(
             for (const p of parsed) {
               const output = translateStreamEvent(state, p);
               for (const line of output) {
+                // Apply backpressure before each enqueue to prevent unbounded
+                // memory growth when the downstream client is slow.
+                await waitForBackpressure(controller);
                 controller.enqueue(encoder.encode(line));
               }
             }
@@ -490,6 +463,7 @@ export function anthropicSseToResponsesSse(
           for (const p of parsed) {
             const output = translateStreamEvent(state, p);
             for (const line of output) {
+              await waitForBackpressure(controller);
               controller.enqueue(encoder.encode(line));
             }
           }
