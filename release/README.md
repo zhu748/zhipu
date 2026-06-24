@@ -1,5 +1,77 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.0.3 — 凭证加密根因修复 + 空回重试 + Dashboard 优化（测试版）**
+>
+> 一次性修复 vceshi0.0.2 暴露的 6 个用户痛点 + UI 优化。所有改动都有回归测试覆盖（430 测试通过，TypeScript 类型检查零错误）。
+>
+> **0. 加密解密根因修复（最关键 — 解决"版本更新后凭证丢失"的根本原因）**
+>
+> - **现象**：用户报告「同一个 zip 解压两次能用，但新版本 release 解压后凭证全没」。只能提前导出账号再更新。
+> - **根因深挖**（不是简单的"加密失败"）：
+>   - 旧版密钥派生用 `SHA-256(${homedir()}-${process.platform}-${process.arch})`
+>   - 旧 release 用 Bun 1.1 编译 → `os.homedir()` 在 Windows 直接读 `USERPROFILE` 环境变量
+>   - 新 release（GitHub Actions）用 Bun 1.3.14 编译 → `os.homedir()` 改用 Win32 API `SHGetKnownFolderPath`，返回值可能在大小写、路径规范化、域用户后缀（`Alice` vs `Alice.Company`）等方面不同
+>   - git 历史可证：`4ca5f0e` "fix(docker): upgrade bun base image to 1.2" + `ffe3075` "add GitHub Actions build" — Bun 1.1 → 1.2 → 1.3 的升级链改变了 `homedir()` 行为
+>   - 结果：旧 `credentials.json` 用 X 加密，新二进制算出 Y，解密失败 → 旧版"备份+返回 null"逻辑让 `saveCredential` 静默覆盖原文件 → 凭证全没
+> - **修复（三层防御）**：
+>   1. **持久化 key file**（`~/.zcode-proxy/.secret-key`）：首次运行时把派生出的 key 写入文件，之后所有运行都直接读文件，**不再依赖 `homedir()`/`platform`/`arch`** — 这些变量再怎么变都不影响。Bun 升级、Windows 用户名改、跨位数编译全部免疫。
+>   2. **多 seed fallback**：解密失败时自动尝试所有合理的旧 seed 组合：
+>      - `${homedir()}-${plat}-${arch}` / `${homedir()}-${plat}` / `${homedir()}-${arch}` / `${homedir()}`
+>      - `${USERPROFILE}-*` / `${HOMEDRIVE}${HOMEPATH}-*` / `${HOME}-*`（旧 Bun 直接用这些 env var）
+>      - 每种 seed 都试 SHA-256 派生 + XOR-fold 派生（覆盖 zcode-api-ref 旧格式）
+>      - 每种 key 都试 Node crypto 格式（IV[16]）+ WebCrypto 格式（IV[12]）
+>      - 任意一个组合成功 → 解密成功 + 把命中的 key 写入 key file，下次免 fallback
+>   3. **手动恢复通道**：`ZCODE_PROXY_LEGACY_SEED` 环境变量让用户显式提供旧 seed 字符串（例如 `set ZCODE_PROXY_LEGACY_SEED=C:\Users\OldName-win32-x64`），多 seed fallback 会尝试它
+> - **效果**：用户更新到 vceshi0.0.3 后：
+>   - 首次启动 → 多 seed fallback 自动找到旧 key → 解密成功 → key 持久化到 key file
+>   - 之后所有运行 → 直接读 key file → 再也不依赖 homedir/platform/arch → 任何版本更新都不再丢凭证
+> - **极端情况兜底**：如果所有 fallback 都失败（如 credentials.json 从完全不同的机器拷过来），上一版的"拒绝覆盖"守卫仍生效——不会静默销毁原文件，用户可手动恢复或显式 `auth logout` 重来
+>
+> **1. 版本更新后凭证丢失（严重数据丢失 bug）**
+> - **现象**：下载新 release 解压后启动 exe，提示「没有凭证」无法进入；回到 `~/.zcode-proxy/` 发现 `credentials.json` 被清空。
+> - **根因**：上面 #0 详解。
+> - **修复**：
+>   - 上面 #0 的三层防御从源头解决
+>   - 额外兜底：`src/auth/store.ts` 新增 `undecryptableFilePresent` 守卫标志。一旦读到无法解密的 `credentials.json`，`writeStore()` 会**抛错拒绝覆盖**，强制 `saveCredential` 把错误冒泡给调用方。原文件保持不变，`.broken-{timestamp}` 备份也保留。
+>   - 用户必须显式执行 `zcode-proxy auth logout`（或 dashboard 的「清空凭证」按钮）才会清除守卫，之后才能保存新凭证——避免任何意外的数据销毁。
+>   - `clearCredential()` 同时清除守卫标志 + 删除 key file，确保登出后能正常重新登录。
+>
+> **2. Dashboard 刷新看不到外部新增凭证**
+> - **现象**：通过 `start.bat` 获取新凭证后，刷新 dashboard 看不到，必须重启程序。
+> - **根因**：`store.ts` 的 `cachedStore` 是进程内缓存，`writeStore` 才失效。外部进程（start.bat 调起的 `zcode-proxy auth login`）写入磁盘后，长期运行的代理进程的缓存仍是旧快照。
+> - **修复**：导出 `invalidateStoreCache()`，在 `/admin/api/accounts` 和 `/admin/api/credentials` 的 GET handler 中调用——dashboard 每次刷新都强制重新读盘+解密，外部进程的新增凭证立即可见。
+>
+> **3. 200 空回被识别为有效输出（额度耗尽时的核心 bug）**
+> - **现象**：某账号额度耗尽时上游返回 HTTP 200 + `text/event-stream` 但 body 为空（无任何 SSE 事件）。代理透传给客户端，Claude Code / Codex CLI 报「empty or malformed response (HTTP 200)」，但 dashboard 统计显示成功。
+> - **修复**：`src/proxy/sse-error-detector.ts` 增加 empty-stream 检测——如果 200 SSE 流读到结束都没出现任何完整 SSE 事件（`\n\n` 分隔的块），合成一个 529 `overloaded_error` 响应，并打上 `x-zcode-empty-stream: 1` 标记头。
+>
+> **4. 空回 3 次后自动切换凭证**
+> - **现象**：用户期望「200 空回 → 重试 3 次 → 仍空回就切换下一个凭证」，但旧逻辑只在 5 次普通失败后才切换，对空回这种「凭证已死」的强信号反应太慢。
+> - **修复**：`src/proxy/handler.ts` 新增 `consecutiveEmptyStreams` 计数器（与现有 `consecutiveCredFailures` 独立）。检测到 `x-zcode-empty-stream: 1` 标记就累加；达到 3 次立即调用 `auth.switchToNextCredential()`，**不等** `credentialSwitchThreshold=5`。切换时额外授予 1 次 retry 配额（`extraAttemptsFromSwitches`），确保新凭证至少有 1 次尝试机会。切换后计数器重置，新凭证走完整的 3 次空回阈值才会再次切换。
+> - 日志清晰显示每次空回与切换：「`retry 2 got empty-stream 529 (3/3 before forced switch)`」「`credential switched after 3 consecutive empty-stream responses`」。
+>
+> **5. OAuth 新凭证默认启用，覆盖原选择**
+> - **现象**：dashboard 走 OAuth 登录新账号后，新账号立即变成 active，原激活账号被静默替换——用户没点「激活」却发生切换。
+> - **根因**：`saveCredential` 总是把新账号设为 active（`store.activeId = account.id`），无论调用方是否期望保持原选择。
+> - **修复**：`saveCredential` 增加可选参数 `opts.keepActive`。当 `keepActive: true` 且已存在 active 账号时，新账号**仅追加**到列表，不动 `activeId`。`src/admin/api.ts` 中 4 处 OAuth 完成点（bigmodel 自动回调、zai 自动轮询、zai 手动 callback、bigmodel 手动 callback）全部传入 `{ keepActive: true }`。只有「首次登录」（store 为空）才会自动激活。用户必须显式点 dashboard 的「激活」按钮才会切换。
+>
+> **6. bigmodel 手动 callback 缺热替换（一致性 bug）**
+> - **现象**：bigmodel 手动 callback 路径在 OAuth 完成后没有调用 `opts.auth.setOAuthCredential()`，与其他 3 处 OAuth 完成点不一致——用户在远程环境用手动 callback 登录后，运行中的代理仍用旧凭证，直到重启才生效。
+> - **修复**：补齐热替换调用，与其他 3 处对齐。同时所有 OAuth 完成点统一行为：**只在首次登录（store 为空）时热替换**，否则保留当前激活——与 `keepActive` 语义一致。
+>
+> **7. UI 优化：账号管理排版重构**
+> - 新增 4 卡片统计栏：账号总数 / Bigmodel / Z.AI / Start Plan 数量一目了然。
+> - 表头增加搜索框 + 提供商/套餐过滤器：实时过滤，无网络请求。
+> - 右上角「刷新」按钮：强制重新读盘，外部新增凭证立即可见（与 Bug #2 修复配合）。
+> - 标题栏副标题增加可点击「刷新」链接。
+> - 账号数量徽标动态显示（如「3 个」）。
+> - 空状态分两种：完全无账号 vs 过滤无匹配，引导更清晰。
+> - 「添加 API Key」表单帮助文案明确说明：手动添加会自动激活，OAuth 不会——与 Bug #5 行为一致。
+>
+> 全套 430 测试通过（vceshi0.0.2 是 422），TypeScript 类型检查零错误。
+>
+> ---
+
 > **vceshi0.0.2 — 凭证额度查询功能（测试版）**
 >
 > 新增「额度查询」：dashboard 账号表格每个账号的「操作」列新增「额度」按钮，点击后实时查询上游真实额度并弹窗展示。

@@ -360,6 +360,20 @@ export async function proxyRequest(
   // because fetch() consumes the body on the first call — this was the bug
   // where every retry after the first would silently fail with a synthetic 502.
   if (config.retry.maxRetries > 0 && config.retry.retryableStatuses.includes(upstreamResp.status)) {
+    // Detect empty-stream 529 (set by sse-error-detector.ts when the upstream
+    // returned HTTP 200 + text/event-stream with zero SSE events — typical
+    // quota-exhausted signature). This gets a dedicated retry policy:
+    //   - retry up to 3 times with the SAME credential
+    //   - if still empty after 3 retries, switch to the next stored credential
+    //     and retry with the new one (counter resets on credential switch)
+    //   - if no alternative credential is available, return the error to client
+    //
+    // This is separate from the generic credentialSwitchThreshold because
+    // empty-stream is a high-confidence "this credential is dead" signal —
+    // we don't want to wait for 5 generic failures before switching.
+    const isEmptyStream529 = upstreamResp.status === 529 &&
+      upstreamResp.headers.get("x-zcode-empty-stream") === "1";
+
     try { upstreamResp.body?.cancel(); } catch {}
 
     // Credential switching: track consecutive failures with the current
@@ -375,8 +389,20 @@ export async function proxyRequest(
     // Credentials already tried in this request — prevents cycling back to a
     // known-failing credential when multiple alternatives exist.
     const triedApiKeys = new Set<string>([cred.apiKey]);
+    // EMPTY-STREAM counter: tracks consecutive empty-stream 529s with the
+    // current credential. When it hits EMPTY_STREAM_SWITCH_THRESHOLD, switch
+    // to the next credential (regardless of the generic switchThreshold).
+    const EMPTY_STREAM_SWITCH_THRESHOLD = 3;
+    let consecutiveEmptyStreams = isEmptyStream529 ? 1 : 0;
+    // Track whether we already forcibly bumped maxRetries to give the empty-stream
+    // path enough attempts to cycle through alternative credentials. The user's
+    // spec is "retry 3 times then switch" — we may need MORE than maxRetries
+    // total attempts if we want to actually try an alternative credential after
+    // the switch (default maxRetries=3 would exhaust before the switch+retry).
+    // We bump the effective limit by 1 per credential switch.
+    let extraAttemptsFromSwitches = 0;
 
-    for (let attempt = 1; attempt <= config.retry.maxRetries; attempt++) {
+    for (let attempt = 1; attempt <= config.retry.maxRetries + extraAttemptsFromSwitches; attempt++) {
       // Calculate backoff delay: initialDelay * backoffFactor^(attempt-1), capped at maxDelay
       const rawDelay = config.retry.initialDelayMs * Math.pow(config.retry.backoffFactor, attempt - 1);
       let delayMs = Math.min(rawDelay, config.retry.maxDelayMs);
@@ -418,13 +444,25 @@ export async function proxyRequest(
       // userId are applied by reassigning `cred` and rebuilding the
       // transformed body — the buildUpstreamReq closure picks up the new
       // values automatically on the next fetch.
-      if (switchThreshold > 0 && consecutiveCredFailures >= switchThreshold) {
+      //
+      // EMPTY-STREAM SHORTCUT: if we've seen EMPTY_STREAM_SWITCH_THRESHOLD
+      // (3) consecutive empty-stream 529s with the current credential,
+      // switch IMMEDIATELY regardless of switchThreshold. Empty streams are
+      // a much stronger "credential is dead" signal than a generic 529, so
+      // we don't make the user wait through 5 generic failures first.
+      const shouldSwitchForEmptyStream = isEmptyStream529 &&
+        consecutiveEmptyStreams >= EMPTY_STREAM_SWITCH_THRESHOLD;
+      if (shouldSwitchForEmptyStream ||
+          (switchThreshold > 0 && consecutiveCredFailures >= switchThreshold)) {
         const failedCount = consecutiveCredFailures;
         const newCred = await auth.switchToNextCredential(triedApiKeys);
         if (newCred) {
+          const reason = shouldSwitchForEmptyStream
+            ? `${consecutiveEmptyStreams} consecutive empty-stream responses`
+            : `${failedCount} consecutive failures`;
           console.log(
-            `${reqId} credential switched after ${failedCount} consecutive failures ` +
-            `(retry ${attempt}/${config.retry.maxRetries}): ${maskApiKey(cred.apiKey)} → ${maskApiKey(newCred.apiKey)}`,
+            `${reqId} credential switched after ${reason} ` +
+            `(retry ${attempt}/${config.retry.maxRetries + extraAttemptsFromSwitches}): ${maskApiKey(cred.apiKey)} → ${maskApiKey(newCred.apiKey)}`,
           );
           cred = newCred;
           // Rebuild the transformed body — userId is credential-specific and
@@ -436,7 +474,18 @@ export async function proxyRequest(
           });
           transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
           consecutiveCredFailures = 0;
+          consecutiveEmptyStreams = 0; // reset empty-stream counter on switch
           triedApiKeys.add(newCred.apiKey);
+          // Grant one extra retry attempt ONLY for empty-stream switches.
+          // The user's spec is "retry 3 times then switch" — without an extra
+          // attempt, the new credential would only get whatever's left of the
+          // original maxRetries budget (often just 1 attempt with default
+          // maxRetries=3). The extra attempt gives the new credential a fair
+          // shot. For generic switchThreshold switches we DON'T add extra
+          // attempts — the existing tests expect the loop to end at maxRetries.
+          if (shouldSwitchForEmptyStream) {
+            extraAttemptsFromSwitches++;
+          }
           // Persist the switch so the dashboard reflects the new active account.
           // Non-fatal: if persistence fails, the in-memory switch still works
           // for the remainder of this request.
@@ -445,7 +494,7 @@ export async function proxyRequest(
             const match = accounts.find(a => a.credential.apiKey === newCred.apiKey);
             if (match) {
               await switchAccount(match.id);
-              appendLog("info", `Auto-switched credential to "${match.label}" (${maskApiKey(newCred.apiKey)}) after ${failedCount} consecutive failures`);
+              appendLog("info", `Auto-switched credential to "${match.label}" (${maskApiKey(newCred.apiKey)}) after ${reason}`);
             }
           } catch (e) {
             console.log(`${reqId} could not persist credential switch: ${(e as Error).message}`);
@@ -488,7 +537,7 @@ export async function proxyRequest(
         const errMsg = (err as Error).message ?? String(err);
         // Network errors count toward the credential-switch failure counter.
         consecutiveCredFailures++;
-        if (attempt < config.retry.maxRetries) {
+        if (attempt < config.retry.maxRetries + extraAttemptsFromSwitches) {
           console.log(`${reqId} fetch failed on retry ${attempt}: ${errMsg}, will retry again...`);
           // Network errors are ALWAYS retryable — they are the most common
           // retry scenario (upstream blip, transient DNS, ECONNREFUSED during
@@ -512,14 +561,29 @@ export async function proxyRequest(
 
       // Still a retryable status — count as a failure for credential switching.
       consecutiveCredFailures++;
+      // Track empty-stream responses separately — they trigger a faster
+      // credential switch (3 consecutive empties vs. switchThreshold=5 for
+      // generic failures).
+      const retryWasEmptyStream = upstreamResp.status === 529 &&
+        upstreamResp.headers.get("x-zcode-empty-stream") === "1";
+      if (retryWasEmptyStream) {
+        consecutiveEmptyStreams++;
+        console.log(`${reqId} retry ${attempt} got empty-stream 529 (${consecutiveEmptyStreams}/${EMPTY_STREAM_SWITCH_THRESHOLD} before forced switch)`);
+      } else {
+        // Any non-empty retryable status resets the empty-stream counter —
+        // a 529 from a real overloaded_error is a different signal than
+        // an empty stream, and we don't want it to count toward the
+        // empty-stream switch.
+        consecutiveEmptyStreams = 0;
+      }
 
       // Still a retryable status — if this was the last attempt, keep the
       // response body intact (don't cancel) so we can return it to the
       // client with a body. Previously the code cancelled the body then
       // refetched — but that refetch reused the consumed Request object
       // and always failed. Keeping the body is simpler and correct.
-      if (attempt === config.retry.maxRetries) {
-        console.log(`${reqId} all ${config.retry.maxRetries} retries exhausted, returning ${upstreamResp.status}`);
+      if (attempt === config.retry.maxRetries + extraAttemptsFromSwitches) {
+        console.log(`${reqId} all ${config.retry.maxRetries + extraAttemptsFromSwitches} retries exhausted, returning ${upstreamResp.status}`);
         break;
       }
 

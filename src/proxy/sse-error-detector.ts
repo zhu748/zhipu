@@ -58,6 +58,14 @@ const MAX_PEEK_BYTES = 16 * 1024;
  * benefit from conversion (client sees a real 401/500 instead of a phantom
  * 200 with an error buried in the stream). The retry logic in handler.ts
  * then decides whether to retry based on retryableStatuses.
+ *
+ * EMPTY-STREAM DETECTION: if the upstream returns HTTP 200 + text/event-stream
+ * but the stream is empty (no SSE events at all — typically happens when the
+ * credential has run out of quota and the gateway closes the connection
+ * immediately), we synthesize a 529 "overloaded_error" response. This makes
+ * the existing retry logic kick in so the proxy can retry 3x then switch to
+ * the next credential — instead of silently passing the empty 200 to the
+ * client as if it were a valid response.
  */
 export async function detectSseErrorAndConvert(resp: Response): Promise<Response> {
   if (!resp.body) return resp;
@@ -75,6 +83,11 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
   const decoder = new TextDecoder();
   let buffer = "";
   const bufferedChunks: Uint8Array[] = [];
+  // Track whether we saw ANY complete SSE event (terminated by \n\n) inside
+  // the buffer. If the stream ends with zero complete events, the upstream
+  // gave us an empty SSE response — most likely a quota-exhausted gateway
+  // closing the connection without emitting any data.
+  let sawAnyCompleteEvent = false;
 
   try {
     while (buffer.length < MAX_PEEK_BYTES) {
@@ -93,11 +106,52 @@ export async function detectSseErrorAndConvert(resp: Response): Promise<Response
 
       // Check for a legitimate (non-error) event — stop peeking, pass through
       if (hasNonErrorEvent(buffer)) {
+        sawAnyCompleteEvent = true;
         break;
       }
     }
+    // If we exited the loop because buffer grew past MAX_PEEK_BYTES, we must
+    // have seen at least one complete event (otherwise the loop would have
+    // kept reading). Mark accordingly so the empty-stream check below doesn't
+    // fire.
+    if (buffer.length >= MAX_PEEK_BYTES) {
+      sawAnyCompleteEvent = true;
+    }
   } catch {
     // Read error — fall through to reconstruction with whatever we have
+    // If we got at least some bytes, treat as non-empty.
+    if (bufferedChunks.length > 0) sawAnyCompleteEvent = true;
+  }
+
+  // EMPTY-STREAM CHECK: if the stream ended with zero complete SSE events
+  // AND we read zero (or only whitespace) bytes, the upstream returned an
+  // empty 200 — treat as a retryable error so the proxy retries + switches
+  // credentials instead of passing the empty body to the client.
+  //
+  // The user-visible symptom of this bug: "200 OK but no output" when a
+  // credential runs out of quota. Claude Code / Codex CLI see a successful
+  // HTTP response with an empty body and report "empty or malformed response".
+  //
+  // We map this to 529 (overloaded_error) because:
+  //   1. 529 is in the default retryableStatuses ([529]), so retry kicks in
+  //   2. 529 semantically means "upstream can't serve this right now" —
+  //      which matches "quota exhausted, gateway returned nothing"
+  //   3. The retry loop in handler.ts counts 529s toward the empty-response
+  //      counter, triggering credential switch after 3 consecutive empties
+  if (!sawAnyCompleteEvent && bufferedChunks.length === 0) {
+    try { await reader.cancel(); } catch {}
+    const emptyInfo: SseErrorInfo = {
+      type: "overloaded_error",
+      status: 529,
+      message: "Upstream returned an empty SSE stream (likely quota exhausted). Retrying with the same credential; will switch to next credential after 3 consecutive empty responses.",
+      rawBody: "",
+    };
+    const synthetic = makeSyntheticErrorResponse(emptyInfo, resp.headers);
+    // Tag the synthetic response so handler.ts can distinguish "real 529"
+    // from "empty-stream 529" and apply the dedicated empty-response retry
+    // policy (3 retries then credential switch) instead of the generic one.
+    synthetic.headers.set("x-zcode-empty-stream", "1");
+    return synthetic;
   }
 
   // No error found — reconstruct the stream with buffered bytes prepended

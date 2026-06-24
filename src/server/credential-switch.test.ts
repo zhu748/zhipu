@@ -448,6 +448,121 @@ describe("AuthManager.switchToNextCredential", () => {
   });
 });
 
+describe("empty-stream 529 → 3 retries then credential switch", () => {
+  // These tests cover the vCESHI0.0.3 fix for "200 empty response treated as
+  // valid output when quota is exhausted". The sse-error-detector now tags
+  // empty HTTP 200 + text/event-stream responses with x-zcode-empty-stream:1
+  // and converts them to synthetic 529. handler.ts then tracks consecutive
+  // empty-stream responses per credential and switches after 3 (faster than
+  // the generic credentialSwitchThreshold=5).
+
+  it("switches to the next credential after 3 consecutive empty-stream responses", async () => {
+    // Default config: maxRetries=3, credentialSwitchThreshold=5
+    // Empty-stream switch threshold is hardcoded to 3 in handler.ts
+    const config = makeConfig({
+      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5 },
+    });
+    const auth = new AuthManager({
+      mode: "oauth",
+      provider: "zai",
+      listAllCredentials: async () => [CRED_A, CRED_B],
+    });
+    auth.setOAuthCredential(CRED_A);
+
+    const seenApiKeys: string[] = [];
+    const mockFetch = (async (req: Request): Promise<Response> => {
+      const apiKey = req.headers.get("x-api-key") ?? "";
+      seenApiKeys.push(apiKey);
+      await req.text();
+      // Credential A returns empty SSE stream (quota exhausted signature)
+      // Credential B returns a successful SSE stream
+      if (apiKey === "key-AAA") {
+        return new Response(new ReadableStream<Uint8Array>({
+          start(c) { c.close(); }, // empty stream — zero events
+        }), { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      // Credential B: return a real SSE event
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(new TextEncoder().encode("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"));
+            c.close();
+          },
+        }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    }) as typeof fetch;
+
+    const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+    const resp = await handler(
+      new Request("http://localhost/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, stream: true, messages: [{ role: "user", content: "Hi" }] }),
+      }),
+    );
+
+    // The proxy should have:
+    //   1. Initial attempt with A → empty stream → counted as empty #1
+    //   2. Retry 1 with A → empty stream → counted as empty #2
+    //   3. Retry 2 with A → empty stream → counted as empty #3 → switch to B
+    //   4. Retry 3 with B → real SSE event → success
+    expect(seenApiKeys.length).toBe(4); // 1 initial + 3 retries
+    expect(seenApiKeys.slice(0, 3).every(k => k === "key-AAA")).toBe(true);
+    expect(seenApiKeys[3]).toBe("key-BBB");
+    // Final response should be 200 (the successful SSE stream from B)
+    expect(resp.status).toBe(200);
+  });
+
+  it("returns 529 to client when all credentials return empty streams", async () => {
+    const config = makeConfig({
+      retry: { maxRetries: 3, initialDelayMs: 1, maxDelayMs: 5, backoffFactor: 1, retryableStatuses: [529], credentialSwitchThreshold: 5 },
+    });
+    const auth = new AuthManager({
+      mode: "oauth",
+      provider: "zai",
+      listAllCredentials: async () => [CRED_A, CRED_B],
+    });
+    auth.setOAuthCredential(CRED_A);
+
+    const seenApiKeys: string[] = [];
+    const mockFetch = (async (req: Request): Promise<Response> => {
+      const apiKey = req.headers.get("x-api-key") ?? "";
+      seenApiKeys.push(apiKey);
+      await req.text();
+      // Both credentials return empty streams
+      return new Response(new ReadableStream<Uint8Array>({
+        start(c) { c.close(); },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+
+    const handler = createFetchHandler({ config, auth, fetchImpl: mockFetch });
+    const resp = await handler(
+      new Request("http://localhost/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "glm-4.6", max_tokens: 100, stream: true, messages: [{ role: "user", content: "Hi" }] }),
+      }),
+    );
+
+    // Flow:
+    //   1. Initial A → empty #1
+    //   2. Retry 1 A → empty #2
+    //   3. Retry 2 A → empty #3 → switch to B (extra attempt granted)
+    //   4. Retry 3 B → empty #1 (counter reset on switch)
+    //   5. Retry 4 B → empty #2
+    //   6. Retry 5 B → empty #3 → switch to... no alternative left, continue with B
+    //   7. Loop ends (extraAttempts exhausted)
+    // We expect:
+    //   - A is used for the first 3 attempts
+    //   - B is used for the remaining attempts
+    //   - Final response is 529 (the synthetic empty-stream 529)
+    expect(seenApiKeys.slice(0, 3).every(k => k === "key-AAA")).toBe(true);
+    expect(seenApiKeys.slice(3).every(k => k === "key-BBB")).toBe(true);
+    expect(resp.status).toBe(529);
+  });
+});
+
 describe("config loader: credentialSwitchThreshold", () => {
   const TMP = join(tmpdir(), `zcode-proxy-cfg-test-${Date.now()}-${process.pid}`);
 

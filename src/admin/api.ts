@@ -7,7 +7,7 @@
 import type { ProxyConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
-import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, exportAccounts, exportStore, importAccounts, maskApiKey } from "../auth/store.js";
+import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, exportAccounts, exportStore, importAccounts, maskApiKey, invalidateStoreCache } from "../auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { queryQuota } from "../auth/quota.js";
@@ -361,6 +361,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
 
   // Get credentials (active credential summary)
   if (path === "/admin/api/credentials" && method === "GET") {
+    // Invalidate cache so external writes (e.g. start.bat adding a credential)
+    // are reflected on dashboard refresh.
+    invalidateStoreCache();
     const cred = await loadCredential();
     if (!cred) return jsonResp({ credential: null });
     return jsonResp({
@@ -403,7 +406,15 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   }
 
   // List all stored accounts (multi-account support)
+  //
+  // BUGFIX: invalidate the in-memory store cache before reading. The cache is
+  // process-local — if the user added a credential via start.bat (which runs
+  // `zcode-proxy auth login` in a separate process) while the proxy server
+  // was still running, the new credential is on disk but the cache still
+  // holds the old snapshot. Without this invalidation, refreshing the
+  // dashboard would NOT show the new credential until the proxy was restarted.
   if (path === "/admin/api/accounts" && method === "GET") {
+    invalidateStoreCache();
     const result = await listAccounts();
     return jsonResp(result);
   }
@@ -817,7 +828,11 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       }
       const result = await importAccounts(validated as any);
       appendLog("info", `Imported accounts: ${result.added} added, ${result.updated} updated`);
-      // Hot-swap active credential
+      // Hot-swap active credential (only if it changed). After import we
+      // must invalidate cache so loadCredential() reads the freshly-imported
+      // store from disk (importAccounts already wrote it, but our cache is
+      // stale).
+      invalidateStoreCache();
       const cred = await loadCredential();
       if (cred) opts.auth.setOAuthCredential(cred);
       return jsonResp({ ok: true, added: result.added, updated: result.updated });
@@ -861,14 +876,21 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
             const { accessToken, userId, jwt } = await oauth.exchangeCode(authCode, callbackUrl, state);
             const resolver = new KeyResolver();
             const cred = await resolver.resolveCredential(accessToken, provider, userId, oauthPlan, jwt);
-            await saveCredential(cred);
-            // Hot-swap the in-memory credential so the new account takes
-            // effect immediately. Without this, the AuthManager keeps using
-            // the previously-installed credential — only the on-disk store is
-            // updated, so the dashboard would show the new account as active
-            // but the request path would still use the old one.
-            const bmActiveCred = await loadCredential();
-            if (bmActiveCred) opts.auth.setOAuthCredential(bmActiveCred);
+            // keepActive:true — do NOT silently swap the user's currently-active
+            // credential out from under them. The new account appears in the
+            // dashboard list; the user explicitly clicks "Activate" to switch.
+            // (Only swap if there's no active credential yet — i.e. first-ever login.)
+            await saveCredential(cred, { keepActive: true });
+            // Hot-swap the in-memory credential ONLY IF there was no active
+            // credential before this OAuth flow completed. Otherwise preserve
+            // the current selection — the user can activate the new account
+            // explicitly from the dashboard.
+            const existingActive = await loadCredential();
+            // If existingActive is the just-saved cred (i.e. there was no prior
+            // active), hot-swap. Otherwise leave the in-memory credential alone.
+            if (existingActive && existingActive.apiKey === cred.apiKey) {
+              opts.auth.setOAuthCredential(existingActive);
+            }
             // Mark flow as ready
             const flow = activeFlows.get(flowId);
             if (flow) { (flow as any).status = "ready"; }
@@ -908,10 +930,12 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
           const { accessToken, userId, jwt } = await oauth.exchangeCode(authCode, init.callbackUrl, init.state);
           const resolver = new KeyResolver();
           const cred = await resolver.resolveCredential(accessToken, provider, userId, oauthPlan, jwt);
-          await saveCredential(cred);
-          // Hot-swap the in-memory credential — see comment in bigmodel path.
-          const zaiActiveCred = await loadCredential();
-          if (zaiActiveCred) opts.auth.setOAuthCredential(zaiActiveCred);
+          // keepActive:true — see bigmodel path comment above.
+          await saveCredential(cred, { keepActive: true });
+          const existingActive = await loadCredential();
+          if (existingActive && existingActive.apiKey === cred.apiKey) {
+            opts.auth.setOAuthCredential(existingActive);
+          }
           const flow = activeFlows.get(init.flowId);
           if (flow) { (flow as any).status = "ready"; }
         } catch (err) {
@@ -993,11 +1017,12 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         const resolver = new KeyResolver();
         const flowPlan = ((flow as any).plan ?? "coding-plan") as "coding-plan" | "start-plan";
         const cred = await resolver.resolveCredential(accessToken, "zai", userId, flowPlan, jwt);
-        await saveCredential(cred);
-        // Hot-swap the in-memory credential so the manual-callback flow
-        // also takes effect immediately (parity with auto-poll path).
-        const manualActiveCred = await loadCredential();
-        if (manualActiveCred) opts.auth.setOAuthCredential(manualActiveCred);
+        // keepActive:true — manual callback path matches auto-poll path behavior.
+        await saveCredential(cred, { keepActive: true });
+        const existingActive = await loadCredential();
+        if (existingActive && existingActive.apiKey === cred.apiKey) {
+          opts.auth.setOAuthCredential(existingActive);
+        }
 
         activeFlows.delete(flowId);
         return jsonResp({
@@ -1024,7 +1049,12 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         const resolver = new KeyResolver();
         const flowPlan = ((flow as any).plan ?? "coding-plan") as "coding-plan" | "start-plan";
         const cred = await resolver.resolveCredential(accessToken, "bigmodel", userId, flowPlan, jwt);
-        await saveCredential(cred);
+        // keepActive:true — matches zai manual path + auto-poll path behavior.
+        await saveCredential(cred, { keepActive: true });
+        const existingActive = await loadCredential();
+        if (existingActive && existingActive.apiKey === cred.apiKey) {
+          opts.auth.setOAuthCredential(existingActive);
+        }
 
         activeFlows.delete(flowId);
         return jsonResp({

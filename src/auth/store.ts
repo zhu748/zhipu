@@ -30,7 +30,12 @@ import type { Credential } from "./types.js";
  */
 const STORE_DIR = process.env.ZCODE_PROXY_STORE_DIR ?? join(homedir(), ".zcode-proxy");
 const STORE_FILE = join(STORE_DIR, "credentials.json");
+const KEY_FILE = join(STORE_DIR, ".secret-key");
 const ENV_SECRET = "ZCODE_PROXY_CREDENTIAL_SECRET";
+/** Optional env var: if set, its value is used as the legacy seed for decrypt
+ *  fallback (lets users recover credentials.json encrypted by an old version
+ *  whose homedir/platform/arch differed from the current one). */
+const ENV_LEGACY_SEED = "ZCODE_PROXY_LEGACY_SEED";
 
 /**
  * In-memory cache of the decrypted store. Set to `undefined` to indicate
@@ -39,6 +44,18 @@ const ENV_SECRET = "ZCODE_PROXY_CREDENTIAL_SECRET";
  * always see fresh data after a mutation.
  */
 let cachedStore: StoreV2 | null | undefined = undefined;
+
+/**
+ * Guard flag set by readStoreUncached() when credentials.json exists on disk
+ * but cannot be decrypted (wrong key, corrupt ciphertext, etc.).
+ *
+ * While this flag is true, writeStore() REFUSES to overwrite credentials.json —
+ * forcing saveCredential() to throw instead of silently destroying the user's
+ * existing accounts. The flag is cleared by clearCredential() (the user must
+ * explicitly confirm they want to discard the unreadable file) or by a
+ * successful readStoreUncached() (the file was deleted or fixed).
+ */
+let undecryptableFilePresent = false;
 
 /** One stored account record (without encryption — encryption wraps the whole file). */
 export interface StoredAccount {
@@ -63,36 +80,201 @@ interface StoreV2 {
 // ---------------------------------------------------------------------------
 
 /**
- * Derive a 256-bit encryption key from a machine-specific seed using SHA-256.
- * Same key derivation as before, but uses Node's crypto instead of WebCrypto
- * to avoid OperationError on Windows compiled binaries.
+ * In-memory cache of the encryption key. Set once on first call to avoid
+ * re-reading the key file (or re-deriving from seed) on every encrypt/decrypt.
+ * Reset by `_resetKeyCacheForTesting` between unit tests.
  */
-function getEncryptionKeyBuffer(): Buffer {
-  const seed = process.env[ENV_SECRET] ?? `${homedir()}-${process.platform}-${process.arch}`;
+let cachedKey: Buffer | null = null;
+
+/**
+ * Reset the key cache. Internal — used by unit tests so they can simulate
+ * "first run after upgrade" scenarios by clearing the cache between tests.
+ * @internal
+ */
+export function _resetKeyCacheForTesting(): void {
+  cachedKey = null;
+}
+
+/**
+ * SHA-256–derive a 256-bit key from a seed string. Used by both the current
+ * key derivation and the multi-seed fallback in decrypt().
+ */
+function deriveSha256Key(seed: string): Buffer {
   return createHash("sha256").update(seed).digest();
 }
 
 /**
- * Derive the legacy XOR-fold key used by zcode-api-ref (the open-source
- * reference repo) and early zhipu versions. The seed string is identical
- * to getEncryptionKeyBuffer(), but the derivation is different:
- *
- *   zcode-api-ref: hash[i % 32] ^= seedBytes[i]   (XOR fold, NOT cryptographic)
- *   current zhipu: SHA-256(seed)                   (cryptographic)
- *
- * We keep this around so users who already have a credentials.json created
- * by zcode-api-ref (or the open-source clone) can have it transparently
- * migrated when they switch to zhipu — instead of getting a "Failed to
- * decrypt credential store" error and having to re-login.
+ * Derive the legacy XOR-fold key (zcode-api-ref / early zhipu format).
+ * NOT cryptographic — kept only so users with credentials.json from the
+ * open-source zcode-api-ref repo can be transparently migrated.
  */
-function getLegacyXorEncryptionKey(): Buffer {
+function deriveXorFoldKey(seed: string): Buffer {
   const hash = Buffer.alloc(32);
-  const seed = process.env[ENV_SECRET] ?? `${homedir()}-${process.platform}-${process.arch}`;
   const seedBytes = Buffer.from(seed, "utf8");
   for (let i = 0; i < seedBytes.length; i++) {
     hash[i % 32] ^= seedBytes[i];
   }
   return hash;
+}
+
+/**
+ * Persist a key (32 raw bytes) to the key file so future runs read it
+ * directly instead of re-deriving from seed. Called:
+ *   - After first-run legacy seed derivation (getEncryptionKeyBuffer fallback)
+ *   - After a multi-seed fallback in decrypt() finds the working key
+ *
+ * IMPORTANT: always writes, even when ZCODE_PROXY_CREDENTIAL_SECRET is set.
+ * The env var check belongs in getEncryptionKeyBuffer (priority 1 skips key
+ * file READ), not here. If decrypt's fallback found a working key, that key
+ * MUST be persisted — the user might clear the env var later (e.g. they set
+ * it only for the recovery attempt), and without the key file the next run
+ * would be locked out again.
+ *
+ * Failures are non-fatal — we still set cachedKey so the current process works.
+ */
+function persistKeyToKeyFile(key: Buffer): void {
+  try {
+    mkdirSync(dirname(KEY_FILE), { recursive: true });
+    writeFileSync(KEY_FILE, key.toString("base64"), { mode: 0o600 });
+    cachedKey = key;
+    console.log(`[store] Encryption key persisted to ${KEY_FILE}. Future runs will read this file directly, immune to homedir/platform/arch changes.`);
+  } catch (err) {
+    console.warn(`[store] Could not persist encryption key to ${KEY_FILE}: ${(err as Error).message}. Using in-memory only — credentials will not survive a restart if the key file can't be written.`);
+  }
+}
+
+/**
+ * Get the encryption key.
+ *
+ * Priority:
+ *   1. `ZCODE_PROXY_CREDENTIAL_SECRET` env var → SHA-256(env var value)
+ *      Used by tests, Render cloud deploy, and power users who want to
+ *      explicitly pin the key. Skips key file entirely.
+ *   2. `~/.zcode-proxy/.secret-key` file → 32 random bytes (base64)
+ *      The PREFERRED mechanism for desktop users. Once written, this file
+ *      is the single source of truth for the encryption key — independent
+ *      of homedir(), process.platform, process.arch, or Bun version. This
+ *      means a version update (or even an OS upgrade that changes how
+ *      homedir() resolves) will NOT lock the user out of their existing
+ *      credentials.
+ *   3. Legacy seed-based derivation → SHA-256(`${homedir()}-${platform}-${arch}`)
+ *      Used ONLY on first run after upgrade from a pre-key-file version. The
+ *      derived key is immediately persisted to the key file (priority 2 on
+ *      next run) so future runs no longer depend on the seed.
+ *
+ * WHY this design: the original seed-based derivation was vulnerable to any
+ * change in homedir/platform/arch — Bun version upgrades, Windows username
+ * changes, 32-bit-vs-64-bit binary switches, etc. would all silently rotate
+ * the key and lock users out of their own credentials.json. The key file
+ * breaks that coupling: once the key is on disk, it's stable forever.
+ */
+function getEncryptionKeyBuffer(): Buffer {
+  // Priority 1: explicit env var (testing / Render cloud / power users)
+  // NOT cached — env var can change mid-process (e.g. tests changing it between
+  // cases), and SHA-256 is fast enough that re-deriving on every call is fine.
+  // Caching here would silently use a stale key when the env var changes.
+  const envSecret = process.env[ENV_SECRET];
+  if (envSecret) {
+    return deriveSha256Key(envSecret);
+  }
+
+  // Priority 2 & 3 are cached (file I/O is slow). cachedKey only holds the
+  // key-file or legacy-seed derived key — never the env-var key.
+  if (cachedKey) return cachedKey;
+
+  // Priority 2: persistent key file (preferred — immune to homedir/platform/arch)
+  try {
+    if (existsSync(KEY_FILE)) {
+      const raw = readFileSync(KEY_FILE, "utf-8").trim();
+      const key = Buffer.from(raw, "base64");
+      if (key.length === 32) {
+        cachedKey = key;
+        return cachedKey;
+      }
+      console.warn(`[store] ${KEY_FILE} present but malformed (expected 32 bytes base64, got ${key.length} bytes). Will fall back to seed derivation and overwrite.`);
+    }
+  } catch (err) {
+    console.warn(`[store] Could not read key file ${KEY_FILE}: ${(err as Error).message}. Falling back to seed derivation.`);
+  }
+
+  // Priority 3: legacy seed-based derivation + persist to key file for next run
+  const legacySeed = `${homedir()}-${process.platform}-${process.arch}`;
+  const legacyKey = deriveSha256Key(legacySeed);
+  cachedKey = legacyKey; // set cache first so even if persist fails, this process works
+  persistKeyToKeyFile(legacyKey);
+  return legacyKey;
+}
+
+/**
+ * Build a list of candidate encryption keys to try during decrypt.
+ *
+ * The current key (from getEncryptionKeyBuffer) is tried first by the caller.
+ * If that fails (e.g. credentials.json was encrypted by an older version with
+ * a different homedir/platform/arch — the original "version update locks me
+ * out" bug), we try a series of fallback seeds covering common version-drift
+ * scenarios:
+ *
+ *   - `${home}-${plat}-${arch}`     current (already tried by caller)
+ *   - `${home}-${plat}`             arch differed (32-bit vs 64-bit binary)
+ *   - `${home}-${arch}`             platform differed (unlikely but cheap)
+ *   - `${home}`                     old version may have only used homedir
+ *   - `ZCODE_PROXY_LEGACY_SEED`     user-supplied (manual recovery)
+ *
+ * For each seed we generate both SHA-256 (zhipu) and XOR-fold (zcode-api-ref)
+ * derived keys, matching the historical key derivation functions.
+ *
+ * If any candidate succeeds, the caller persists its key to the key file so
+ * future runs skip the fallback dance entirely.
+ */
+function buildCandidateKeysForDecrypt(): Array<{ label: string; key: Buffer; seed: string; derivation: string }> {
+  const home = homedir();
+  const plat = process.platform;
+  const arch = process.arch;
+
+  // Collect all plausible "home path" strings that an older version might
+  // have used as the seed. The variations cover:
+  //   - os.homedir() result (current Bun version)
+  //   - Direct env vars (old Bun 1.1 used USERPROFILE on Windows verbatim,
+  //     and HOME on Unix — these may differ from homedir() in case / trailing
+  //     slash / canonicalization).
+  //   - Windows HOMEDRIVE+HOMEPATH fallback (some corporate Windows installs
+  //     have USERPROFILE pointing to a redirected folder while HOMEDRIVE+
+  //     HOMEPATH points to the canonical local path).
+  const homeVariants = new Set<string>();
+  homeVariants.add(home);
+  // Windows env vars
+  const userProfile = process.env.USERPROFILE;
+  if (userProfile) homeVariants.add(userProfile);
+  const homeDrive = process.env.HOMEDRIVE;
+  const homePath = process.env.HOMEPATH;
+  if (homeDrive && homePath) homeVariants.add(`${homeDrive}${homePath}`);
+  // Unix env var
+  const homeEnv = process.env.HOME;
+  if (homeEnv) homeVariants.add(homeEnv);
+
+  // For each home variant, build the full seed combinations an older version
+  // might have used. The historical seed template was `${home}-${plat}-${arch}`,
+  // but during development there were brief periods where the template was
+  // `${home}-${plat}` or `${home}-${arch}` or just `${home}`. We try all of
+  // them to maximize recovery odds.
+  const seeds = new Set<string>();
+  for (const h of homeVariants) {
+    seeds.add(`${h}-${plat}-${arch}`);
+    seeds.add(`${h}-${plat}`);
+    seeds.add(`${h}-${arch}`);
+    seeds.add(`${h}`);
+  }
+  // User-supplied legacy seed (manual recovery)
+  const legacyEnv = process.env[ENV_LEGACY_SEED];
+  if (legacyEnv) seeds.add(legacyEnv);
+
+  const candidates: Array<{ label: string; key: Buffer; seed: string; derivation: string }> = [];
+  for (const seed of seeds) {
+    const shortSeed = seed.length > 60 ? seed.slice(0, 57) + "..." : seed;
+    candidates.push({ label: `SHA-256("${shortSeed}")`, key: deriveSha256Key(seed), seed, derivation: "SHA-256" });
+    candidates.push({ label: `XOR-fold("${shortSeed}")`, key: deriveXorFoldKey(seed), seed, derivation: "XOR-fold" });
+  }
+  return candidates;
 }
 
 /**
@@ -109,20 +291,26 @@ async function encrypt(plaintext: string): Promise<string> {
 }
 
 /**
- * Decrypt ciphertext. Tries multiple formats in order:
- *   1. New Node.js crypto format (IV[16] + AUTH_TAG[16] + CIPHERTEXT, SHA-256 key)
- *   2. Legacy WebCrypto format (IV[12] + encrypted+tag) with two possible keys:
- *      a. SHA-256 key (zhipu legacy)
- *      b. XOR-fold key (zcode-api-ref / early zhipu)
+ * Decrypt ciphertext. Tries multiple formats + multiple keys in order:
  *
- * The XOR-fold key attempt lets users who already have a credentials.json from
- * the open-source zcode-api-ref repo transparently migrate to zhipu without
- * re-logging in.
+ *   1. Current Node.js crypto format (IV[16] + AUTH_TAG[16] + CIPHERTEXT)
+ *      with the current key (env var > key file > legacy seed).
+ *   2. If #1 fails (credentials.json was encrypted by an older version whose
+ *      homedir/platform/arch differed from the current one), try the current
+ *      key in legacy WebCrypto format (IV[12] + encrypted+tag).
+ *   3. If #2 fails, iterate through ALL candidate seeds (buildCandidateKeysForDecrypt)
+ *      in BOTH formats. This handles the "version update locks me out" bug where
+ *      Bun 1.1's homedir() returned a different path than Bun 1.3's.
+ *
+ * If ANY candidate succeeds, the winning key is persisted to the key file
+ * (~/.zcode-proxy/.secret-key) so future runs read it directly — no more
+ * multi-seed fallback needed. This is the migration path from the old
+ * fragile seed-based scheme to the new stable key-file scheme.
  */
 async function decrypt(ciphertext: string): Promise<string> {
   const data = Buffer.from(ciphertext, "base64");
 
-  // --- Try 1: new Node.js crypto format (IV[16] + AUTH_TAG[16] + CIPHERTEXT) ---
+  // --- Try 1: current key, Node.js crypto format (IV[16] + AUTH_TAG[16] + CIPHERTEXT) ---
   // This is the only format using a 16-byte IV (WebCrypto uses 12-byte).
   if (data.length >= 32) {
     try {
@@ -134,22 +322,49 @@ async function decrypt(ciphertext: string): Promise<string> {
       decipher.setAuthTag(tag);
       return decipher.update(encrypted, undefined, "utf8") + decipher.final("utf8");
     } catch {
-      // Not new format — fall through to legacy WebCrypto attempts
+      // Current key didn't work in Node format — fall through
     }
   }
 
-  // --- Try 2: legacy WebCrypto format (IV[12] + encrypted+tag) ---
-  // Both zhipu-legacy and zcode-api-ref use the same IV/ciphertext layout;
-  // they differ only in the key derivation. Try both in sequence.
-  const candidateKeys: Array<{ label: string; key: Buffer }> = [
-    { label: "SHA-256", key: getEncryptionKeyBuffer() },
-    { label: "XOR-fold", key: getLegacyXorEncryptionKey() },
+  // --- Try 2: build candidate keys (current + multi-seed fallback) ---
+  // The first entry is always the current key (already tried in Node format
+  // above, but we retry it in WebCrypto format which uses a 12-byte IV).
+  // Subsequent entries are the multi-seed fallback for version-drift recovery.
+  const candidates = [
+    // Always start with the current key in case it works in WebCrypto format
+    // (the credentials.json was encrypted with WebCrypto by an older zhipu version
+    // that used the same key derivation but a different cipher implementation).
+    {
+      label: "current key (WebCrypto format)",
+      key: getEncryptionKeyBuffer(),
+      persistable: false, // already persisted (or env var) — no need to re-persist
+    },
+    // Multi-seed fallback: try every plausible seed an older version might have used
+    ...buildCandidateKeysForDecrypt().map(c => ({
+      label: c.label,
+      key: c.key,
+      persistable: true, // if this works, persist to key file for future runs
+    })),
   ];
 
-  for (const { label, key } of candidateKeys) {
+  // Helper: try decrypting with a key in Node.js crypto format (IV[16] + tag[16] + ct)
+  const tryNodeFormat = (key: Buffer): string | null => {
+    if (data.length < 32) return null;
     try {
-      // Copy into a fresh ArrayBuffer to satisfy BufferSource typing (avoids
-      // the SharedArrayBuffer-incompatible typing issue with Buffer.subarray).
+      const iv = data.subarray(0, 16);
+      const tag = data.subarray(16, 32);
+      const encrypted = data.subarray(32);
+      const decipher = createDecipheriv("aes-256-gcm", key, iv);
+      decipher.setAuthTag(tag);
+      return decipher.update(encrypted, undefined, "utf8") + decipher.final("utf8");
+    } catch {
+      return null;
+    }
+  };
+
+  // Helper: try decrypting with a key in legacy WebCrypto format (IV[12] + ct+tag)
+  const tryWebCryptoFormat = async (key: Buffer): Promise<string | null> => {
+    try {
       const keyCopy = new Uint8Array(32);
       keyCopy.set(key);
       const cryptoKey = await crypto.subtle.importKey(
@@ -168,14 +383,43 @@ async function decrypt(ciphertext: string): Promise<string> {
       );
       return new TextDecoder().decode(decrypted);
     } catch {
-      // This key didn't work — try the next candidate
-      void label; // label retained for future debug logging
+      return null;
     }
+  };
+
+  // Iterate candidates: try each in both Node format and WebCrypto format
+  for (const { label, key, persistable } of candidates) {
+    // Node format (16-byte IV) — try first since it's faster (no async)
+    let plaintext = tryNodeFormat(key);
+    if (plaintext !== null) {
+      // Success! If this was a fallback key (not the current key), persist it
+      // to the key file so future runs don't need to fall back again.
+      if (persistable) {
+        console.log(`[store] Decryption succeeded with fallback key: ${label}. Persisting to key file for future runs.`);
+        persistKeyToKeyFile(key);
+      }
+      return plaintext;
+    }
+
+    // WebCrypto format (12-byte IV) — slower async path
+    plaintext = await tryWebCryptoFormat(key);
+    if (plaintext !== null) {
+      if (persistable) {
+        console.log(`[store] Decryption succeeded with fallback key (WebCrypto format): ${label}. Persisting to key file for future runs.`);
+        persistKeyToKeyFile(key);
+      }
+      return plaintext;
+    }
+    void label; // label retained for future debug logging
   }
 
   throw new Error(
-    "Failed to decrypt credential store (tried current SHA-256/Node-crypto, " +
-    "legacy SHA-256/WebCrypto, and zcode-api-ref XOR-fold formats)"
+    "Failed to decrypt credential store. Tried: current key (Node + WebCrypto formats), " +
+    "multi-seed fallback covering homedir/platform/arch variations across Bun versions " +
+    "(Bun 1.1/1.2/1.3 homedir() differences, USERPROFILE vs HOMEDRIVE+HOMEPATH, etc.). " +
+    "If your credentials.json was encrypted on a different machine / OS / username, " +
+    "set ZCODE_PROXY_LEGACY_SEED to the old seed string (e.g. \"C:\\\\Users\\\\OldName-win32-x64\") " +
+    "and retry. As a last resort, run `zcode-proxy auth logout` to discard and re-login."
   );
 }
 
@@ -201,11 +445,29 @@ function defaultLabel(cred: Credential, createdAt: number): string {
  * call. This avoids re-running AES-256-GCM decryption on every admin endpoint
  * invocation (9+ endpoints all call loadCredential() — that used to mean
  * 9 disk reads + 9 decrypts per dashboard refresh).
+ *
+ * The cache is process-local: a CLI invocation (e.g. `zcode-proxy auth login`
+ * from start.bat) writes to the same credentials.json on disk, but the
+ * long-running proxy process won't see the change because cachedStore is
+ * still pointing at the old in-memory copy. Call invalidateStoreCache()
+ * before reads that must reflect external writes (e.g. dashboard refresh).
  */
 async function readStore(): Promise<StoreV2 | null> {
   if (cachedStore !== undefined) return cachedStore;
   cachedStore = await readStoreUncached();
   return cachedStore;
+}
+
+/**
+ * Invalidate the in-memory store cache. Call this before any read that MUST
+ * reflect external writes (e.g. another process added a credential via
+ * start.bat while the proxy server was still running).
+ *
+ * Safe to call when the cache is already empty — it just resets the sentinel.
+ * After this call, the next readStore() will re-read from disk + re-decrypt.
+ */
+export function invalidateStoreCache(): void {
+  cachedStore = undefined;
 }
 
 /** Uncached inner implementation. Does the actual disk + decrypt work. */
@@ -226,6 +488,7 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
     // File exists but isn't valid JSON — back it up and start fresh.
     console.warn(`[store] credentials.json is not valid JSON. Backing up and starting fresh.`);
     backupCorruptedStore(raw);
+    undecryptableFilePresent = true;
     return null;
   }
 
@@ -238,12 +501,26 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
     } catch (err) {
       // Decryption failed — most common cause is the encryption key changing
       // (different homedir / username / OS reinstall / file copied from another
-      // machine). Rather than blocking the user from saving new credentials,
-      // back up the unreadable file and treat the store as empty.
+      // machine, OR the binary was recompiled and homedir()/platform/arch
+      // resolved differently than before).
+      //
+      // CRITICAL FIX (was: "back up and treat as empty"): we used to return
+      // null here, which silently allowed the NEXT saveCredential() call to
+      // OVERWRITE the original credentials.json with a fresh store containing
+      // only the newly-added credential. The user's existing accounts were
+      // preserved as a `.broken-{timestamp}` backup file but the live
+      // credentials.json was clobbered — appearing as "credentials cleared"
+      // after a version update.
+      //
+      // New behavior: back up the unreadable file (so the user can recover
+      // later), set a guard flag, and return null. saveCredential() checks
+      // the flag and REFUSES to overwrite — it throws so the caller surfaces
+      // the error to the user instead of silently destroying data.
       console.warn(`[store] Failed to decrypt credentials.json: ${(err as Error).message}`);
       console.warn(`[store] This usually happens after changing username, reinstalling OS, or copying the file from another machine.`);
-      console.warn(`[store] Backing up the unreadable file and starting with an empty store.`);
+      console.warn(`[store] The unreadable file has been backed up. The store will be treated as empty for reads, but saveCredential() will refuse to overwrite until you explicitly clear it (zcode-proxy auth logout) — this prevents accidental data loss.`);
       backupCorruptedStore(raw);
+      undecryptableFilePresent = true;
       return null;
     }
 
@@ -315,6 +592,29 @@ function backupCorruptedStore(originalContent: string): void {
 }
 
 async function writeStore(store: StoreV2): Promise<void> {
+  // Guard against the "silent overwrite" footgun: if a previous read found
+  // credentials.json on disk but couldn't decrypt it (e.g. encryption key
+  // changed after a binary update), the original file is preserved as a
+  // `.broken-{timestamp}` backup. We MUST NOT overwrite credentials.json
+  // with a fresh store here — that would clobber the only reference to the
+  // user's existing accounts and force them to manually find+rename the
+  // backup file.
+  //
+  // Instead, throw so the caller (saveCredential / setAccountLabel / etc.)
+  // surfaces the error to the user. The user can then either:
+  //   1. Restore the .broken-{timestamp} backup (rename it back to
+  //      credentials.json) and figure out why decryption failed, OR
+  //   2. Explicitly run `zcode-proxy auth logout` (or call clearCredential())
+  //      to remove the unreadable file, after which new saves will work.
+  if (undecryptableFilePresent) {
+    throw new Error(
+      `Refusing to overwrite ${STORE_FILE}: the existing file could not be ` +
+      `decrypted (likely the encryption key changed after a binary update). ` +
+      `A backup was saved as ${STORE_FILE}.broken-{timestamp}. ` +
+      `Either restore that backup manually, or run \`zcode-proxy auth logout\` ` +
+      `to discard the unreadable file before saving new credentials.`,
+    );
+  }
   try {
     mkdirSync(dirname(STORE_FILE), { recursive: true });
     const json = JSON.stringify(store);
@@ -338,9 +638,16 @@ async function writeStore(store: StoreV2): Promise<void> {
 /**
  * Save a credential. If an account with the same `provider + apiKey` exists,
  * it's updated in place (preserving activeId); otherwise a new account is
- * created and marked active.
+ * created.
+ *
+ * @param opts.keepActive — when true, the new account is appended WITHOUT
+ *   becoming the active one. The existing activeId is preserved. Used by
+ *   the OAuth flow so logging in via the dashboard doesn't silently swap
+ *   the user's active credential out from under them. Default: false
+ *   (preserves historical behavior used by `auth login` CLI and the
+ *   "Add API Key" form).
  */
-export async function saveCredential(cred: Credential): Promise<void> {
+export async function saveCredential(cred: Credential, opts?: { keepActive?: boolean }): Promise<void> {
   let store = await readStore();
   if (!store) store = { version: 2, activeId: null, accounts: [] };
 
@@ -364,7 +671,15 @@ export async function saveCredential(cred: Credential): Promise<void> {
       credential: cred,
     };
     store.accounts.push(account);
-    store.activeId = account.id; // newly added becomes active
+    // BUGFIX: previously always `store.activeId = account.id`, which silently
+    // swapped the user's active credential out from under them whenever they
+    // logged in via OAuth. Now we honor opts.keepActive so the dashboard's
+    // OAuth flow preserves the user's currently-selected account — the new
+    // account is added to the list but the user must explicitly click
+    // "Activate" to switch to it.
+    if (!opts?.keepActive || !store.activeId) {
+      store.activeId = account.id; // newly added becomes active
+    }
   }
 
   await writeStore(store);
@@ -383,7 +698,18 @@ export function clearCredential(): void {
   if (existsSync(STORE_FILE)) {
     unlinkSync(STORE_FILE);
   }
-  cachedStore = null; // invalidate cache
+  // Also remove the key file — once the user explicitly clears credentials,
+  // there's no reason to keep the encryption key around (it would just be a
+  // stale orphan that future runs would read but never be able to use, since
+  // the credentials.json it encrypted is gone).
+  if (existsSync(KEY_FILE)) {
+    try { unlinkSync(KEY_FILE); } catch { /* best-effort */ }
+  }
+  cachedStore = null; // invalidate store cache
+  cachedKey = null;   // invalidate key cache
+  // Clear the guard flag — once the user has explicitly cleared credentials,
+  // they're free to save new ones without the "refusing to overwrite" error.
+  undecryptableFilePresent = false;
 }
 
 export function getStorePath(): string {

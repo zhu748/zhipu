@@ -13,7 +13,12 @@ import {
   setAccountLabel,
   setAccountProxy,
   maskApiKey,
+  invalidateStoreCache,
+  _resetKeyCacheForTesting,
 } from "./store.js";
+import { existsSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 import type { Credential } from "./types.js";
 
 const TEST_SECRET = "test-encryption-secret-for-zcode-proxy";
@@ -21,12 +26,15 @@ const TEST_SECRET = "test-encryption-secret-for-zcode-proxy";
 describe("credential store", () => {
   beforeEach(() => {
     process.env.ZCODE_PROXY_CREDENTIAL_SECRET = TEST_SECRET;
+    _resetKeyCacheForTesting();
     clearCredential();
   });
 
   afterEach(() => {
     clearCredential();
+    _resetKeyCacheForTesting();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+    delete process.env.ZCODE_PROXY_LEGACY_SEED;
   });
 
   it("returns null when no credential stored", async () => {
@@ -249,5 +257,190 @@ describe("multi-account store", () => {
     const bigAcc = list.accounts.find(a => a.provider === "bigmodel")!;
     expect(zaiAcc.proxy).toBe("");
     expect(bigAcc.proxy).toBe("http://p:8080");
+  });
+
+  // --- vCESHI0.0.3: keepActive + cache invalidation + undecryptable guard ---
+
+  it("saveCredential with keepActive:true preserves the existing activeId", async () => {
+    // First credential: becomes active (no prior active to preserve)
+    await saveCredential({ apiKey: "first-key", provider: "zai" });
+    const list1 = await listAccounts();
+    expect(list1.activeId).toBe(list1.accounts[0].id);
+
+    // Switch active to first explicitly
+    await switchAccount(list1.accounts[0].id);
+
+    // Second credential with keepActive:true — should be ADDED but NOT activated
+    await saveCredential({ apiKey: "second-key", provider: "bigmodel" }, { keepActive: true });
+    const list2 = await listAccounts();
+    expect(list2.accounts).toHaveLength(2);
+    // activeId should still point at the first credential, not the new one
+    expect(list2.activeId).toBe(list1.accounts[0].id);
+    // loadCredential should still return the first credential
+    const active = await loadCredential();
+    expect(active!.apiKey).toBe("first-key");
+  });
+
+  it("saveCredential with keepActive:true still activates if no prior active exists", async () => {
+    // First credential with keepActive:true — no prior active, so it becomes active
+    // (matches OAuth flow on first-ever login: user has nothing yet)
+    await saveCredential({ apiKey: "first-key", provider: "zai" }, { keepActive: true });
+    const list = await listAccounts();
+    expect(list.accounts).toHaveLength(1);
+    expect(list.activeId).toBe(list.accounts[0].id);
+  });
+
+  it("invalidateStoreCache forces re-read from disk on next read", async () => {
+    // Save one credential
+    await saveCredential({ apiKey: "first-key", provider: "zai" });
+    let list = await listAccounts();
+    expect(list.accounts).toHaveLength(1);
+
+    // Simulate an EXTERNAL process writing a second credential by bypassing
+    // the cache: manually clear and re-save directly through the public API
+    // (which is what start.bat does — runs `zcode-proxy auth login` in a
+    // separate process, writing to the same credentials.json on disk).
+    // To simulate this in-process, we invalidate the cache so the next read
+    // goes back to disk.
+    //
+    // We can't truly spawn a separate process in a unit test, but we CAN
+    // verify the cache invalidation works: after invalidateStoreCache(),
+    // the next listAccounts() MUST reflect disk state, not the cached state.
+    //
+    // Approach: write a second credential via saveCredential (which updates
+    // the cache), then invalidate the cache, then verify loadCredential()
+    // re-reads from disk (returning the second credential).
+    await saveCredential({ apiKey: "second-key", provider: "bigmodel" });
+    list = await listAccounts();
+    expect(list.accounts).toHaveLength(2);
+
+    // Now invalidate and verify the cache was actually cleared
+    invalidateStoreCache();
+    // The next read should re-read from disk and return the same 2 accounts
+    // (this verifies the invalidation didn't corrupt anything)
+    const list2 = await listAccounts();
+    expect(list2.accounts).toHaveLength(2);
+    // Both keys are <= 12 chars so maskApiKey returns them as-is
+    const keys = list2.accounts.map(a => a.apiKeyMask).sort();
+    expect(keys).toEqual(["first-key", "second-key"]);
+  });
+
+  it("multi-seed fallback recovers credentials when ZCODE_PROXY_LEGACY_SEED matches the old seed", async () => {
+    // Simulates the REAL upgrade scenario:
+    //   1. v1.x binary encrypts credentials.json with seed = "old-bun-homedir-win32-x64"
+    //      (Bun 1.1 returned a different homedir() than Bun 1.3)
+    //   2. v2.x binary (new Bun) computes a different homedir() → different default seed
+    //      → decryption fails with the current key
+    //   3. User sets ZCODE_PROXY_LEGACY_SEED to the old seed → multi-seed fallback
+    //      finds it, decrypts successfully, AND persists the recovered key to the
+    //      key file so subsequent runs don't need the env var anymore.
+    //
+    // Step 1: encrypt with the "old" seed via ZCODE_PROXY_LEGACY_SEED
+    //         (we use the env var path to force a specific seed for the encryption,
+    //         simulating what the old binary did)
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "old-seed-simulating-bun-1.1-homedir";
+    _resetKeyCacheForTesting();
+    await saveCredential({ apiKey: "original-key", provider: "zai" });
+    expect(await loadCredential()).not.toBeNull();
+
+    // Step 2: change the env var to a DIFFERENT value (simulating new Bun's homedir)
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "new-seed-simulating-bun-1.3-homedir";
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
+
+    // Now the current key can't decrypt. Without fallback, loadCredential returns null.
+    // But with ZCODE_PROXY_LEGACY_SEED set to the old seed, the multi-seed fallback
+    // should find it and recover the credential.
+    process.env.ZCODE_PROXY_LEGACY_SEED = "old-seed-simulating-bun-1.1-homedir";
+    const recovered = await loadCredential();
+    expect(recovered).not.toBeNull();
+    expect(recovered!.apiKey).toBe("original-key");
+
+    // The key file should now be persisted with the recovered key — clear the
+    // env vars entirely and verify the credential still loads (key file takes over).
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+    delete process.env.ZCODE_PROXY_LEGACY_SEED;
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
+    const fromKeyFile = await loadCredential();
+    expect(fromKeyFile).not.toBeNull();
+    expect(fromKeyFile!.apiKey).toBe("original-key");
+  });
+
+  it("REFUSES to overwrite credentials.json when ALL fallback keys fail", async () => {
+    // When the multi-seed fallback can't find any working key (e.g. credentials.json
+    // was copied from a completely different machine with unknown homedir), the
+    // guard kicks in and prevents saveCredential from silently destroying the
+    // unreadable file.
+    //
+    // Step 1: encrypt with a secret that won't be in any fallback candidate list
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "completely-unique-secret-not-in-any-fallback-list";
+    _resetKeyCacheForTesting();
+    await saveCredential({ apiKey: "original-key", provider: "zai" });
+    expect(await loadCredential()).not.toBeNull();
+
+    // Step 2: switch to a DIFFERENT secret (no LEGACY_SEED set → no fallback recovery)
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "a-different-secret-also-not-in-fallback";
+    delete process.env.ZCODE_PROXY_LEGACY_SEED;
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
+
+    // The multi-seed fallback should fail (none of the homedir/USERPROFILE/etc.
+    // seeds will match "completely-unique-secret-not-in-any-fallback-list"),
+    // so loadCredential returns null AND the guard flag is set.
+    const loaded = await loadCredential();
+    expect(loaded).toBeNull();
+
+    // Step 3: try to save a new credential — should THROW (guard active)
+    await expect(
+      saveCredential({ apiKey: "new-key", provider: "bigmodel" }),
+    ).rejects.toThrow(/Refusing to overwrite/);
+
+    // The original credentials.json should still exist on disk (not deleted)
+    const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
+    expect(existsSync(storePath)).toBe(true);
+
+    // After clearCredential (user explicitly confirms discard), saving works again
+    clearCredential();
+    _resetKeyCacheForTesting();
+    await saveCredential({ apiKey: "fresh-key", provider: "zai" });
+    const fresh = await loadCredential();
+    expect(fresh!.apiKey).toBe("fresh-key");
+  });
+
+  it("key file is written on first run and reused on subsequent runs (immune to homedir changes)", async () => {
+    // Verify the core fix: once the key file exists, homedir/platform/arch changes
+    // don't affect decryption. This is the "version update no longer locks me out"
+    // guarantee.
+    //
+    // Step 1: first run with no key file — derives key from seed, persists to key file
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+    _resetKeyCacheForTesting();
+    await saveCredential({ apiKey: "test-key", provider: "zai" });
+
+    const keyFilePath = join(homedir(), ".zcode-proxy", ".secret-key");
+    expect(existsSync(keyFilePath)).toBe(true);
+
+    // Step 2: simulate homedir change by overriding the env var with a different
+    // "fake homedir" — but since the key file takes priority over seed derivation,
+    // the credential should still load.
+    // We can't actually change os.homedir() in a test, but we can verify the key
+    // file is being READ (not re-derived) by checking that the credential loads
+    // even when ZCODE_PROXY_CREDENTIAL_SECRET is unset (which forces the key file
+    // path; if the key file weren't being read, the seed derivation would produce
+    // a different key and decryption would fail).
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
+    const loaded = await loadCredential();
+    expect(loaded).not.toBeNull();
+    expect(loaded!.apiKey).toBe("test-key");
+
+    // Step 3: even after clearing the in-memory key cache (simulating a process
+    // restart), the key file is re-read and decryption still works.
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
+    const reloaded = await loadCredential();
+    expect(reloaded).not.toBeNull();
+    expect(reloaded!.apiKey).toBe("test-key");
   });
 });

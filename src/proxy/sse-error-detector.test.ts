@@ -143,13 +143,22 @@ test("passes through stream when ping comes before content", async () => {
   expect(body).toContain("Hi");
 });
 
-test("passes through empty stream", async () => {
+test("converts empty stream to synthetic 529 with x-zcode-empty-stream marker", async () => {
+  // EMPTY-STREAM DETECTION (bugfix): an HTTP 200 + text/event-stream response
+  // with zero SSE events is the signature of a quota-exhausted upstream
+  // gateway. Previously the proxy passed this through as a "valid" 200 with
+  // an empty body, causing Claude Code / Codex CLI to report "empty or
+  // malformed response". Now we convert it to a synthetic 529 so the retry
+  // logic kicks in (3 retries then credential switch).
   const resp = sseResponse([]);
 
   const converted = await detectSseErrorAndConvert(resp);
 
-  expect(converted.status).toBe(200);
-  expect(await readBody(converted)).toBe("");
+  expect(converted.status).toBe(529);
+  expect(converted.headers.get("x-zcode-empty-stream")).toBe("1");
+  const body = await readBody(converted);
+  expect(body).toContain("overloaded_error");
+  expect(body).toContain("empty SSE stream");
 });
 
 // ---------------------------------------------------------------------------
