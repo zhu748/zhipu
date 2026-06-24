@@ -1,5 +1,55 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.0.5 — 全面 bug 修复（dashboard 模态框/CRITICAL 凭据切换/配置深合并/校验补全）**
+>
+> 对 dashboard、admin API、handler、store 进行全面审查后修复 22 个 bug，包括 4 个 CRITICAL、6 个 P1、12 个 P2。所有修复都有回归测试覆盖（452 测试通过，TypeScript 零错误）。
+>
+> **CRITICAL 修复：**
+>
+> **C1. dashboard 账号详情/编辑模态框无法显示（CSS 完全缺失）**
+> - 现象：点「查看」「编辑」按钮看起来什么都没发生（实际 HTML 被追加到页面底部，需滚动才能看到）
+> - 根因：`openAccountDetail` / `openEditModal` 用 `class="modal-overlay"` 等类名，但 CSS 里完全没定义这些类
+> - 修复：在 `:root` 后添加完整 `.modal-overlay` / `.modal` / `.modal-header` / `.modal-body` / `.modal-footer` / `.modal-close` CSS（带 fadeIn 动画、遮罩、居中、暗色背景）
+>
+> **C2. empty-stream 凭据切换 off-by-one（默认配置永不触发）**
+> - 现象：用户配置 `maxRetries=3, emptyStreamSwitchThreshold=3`，初始响应非空 529 时，切换永远不会触发（计数器在最后一次 retry 末尾才到 3，但 break 先触发）
+> - 修复：在 retry loop 末尾、break 之前加切换检查。达到阈值且有备用凭据时，授予 1 个 extra attempt 并 `continue`，让新凭据真正被尝试
+>
+> **C3. 凭据切换后不同步 plan（跨 plan 切换必失败）**
+> - 现象：从 coding-plan 凭据切到 start-plan 凭据时，请求仍发到 coding-plan endpoint 但带 start-plan JWT → 上游 401/403
+> - 修复：引入 `currentPlan` 变量，切换后调用 `effectivePlanForCred(newCred)` 更新；所有 `config.plan` 引用（buildUpstreamReq / refreshCaptchaHeaders / 401/403 检测 / transformRequestBodyObj）改为读 `currentPlan`
+>
+> **C4. PUT /config 浅合并 retry 对象（部分更新导致 TypeError 崩溃）**
+> - 现象：客户端发 `{"retry":{"maxRetries":5}}` 会让 `retryableStatuses` 等字段丢失，handler.ts 抛 `TypeError: Cannot read property 'includes' of undefined`
+> - 修复：对 `retry` / `identity` / `logging` / `providers` 都做深合并（之前只 `auth` 做了）
+>
+> **P1 修复：**
+>
+> - **statTotal ID 重复**：账号页「账号总数」卡片 10 秒后被统计页「总请求数」覆盖。改账号页 ID 为 `statAccountsTotal`
+> - **btn-warning CSS 未定义**：「导出 Render 凭证」按钮无警告色。加 `.btn-warning` 别名
+> - **clearCredentials 不检查 r.ok**：服务端返回 4xx 时仍显示「凭证已清空」成功提示。改为检查 `r.ok`
+> - **loadDebugDumps upstreamError.slice 空值崩溃**：`upstreamError` 为 undefined 时 `.slice()` 抛 TypeError，整个 dumps 列表渲染失败。加 `||''` 保护
+> - **/admin/api/endpoints 不持久化**：修改 endpoints 重启即丢失。加 `persistConfig` 调用
+> - **POST /admin/api/credentials 缺热替换+校验**：手动添加 API Key 在 oauth 模式下不立即生效；空 apiKey / 未知 provider 写入脏数据。加字段校验 + invalidateStoreCache + setOAuthCredential 热替换
+> - **POST /admin/api/import 缺热替换**：从 ZCode 导入在 oauth 模式下不立即生效。加热替换 + name 自动命名为 `zcode(N)-plan`
+> - **bigmodel 手动 callback 缺 state 校验**：CSRF 防御不一致（zai 有 bigmodel 无）。补齐 `state !== flow.state` 校验
+> - **/admin/api/oauth/poll 不检查过期**：过期 flow 永远返回 "pending"，dashboard 永远转圈。加过期检查返回 `"expired"` 状态；失败时返回 `error` 字段
+>
+> **P2 修复：**
+>
+> - 未定义 CSS 变量 `--bg-1/--bg-2/--text-1/--text-0/--warning/--warning-bg` 全部添加别名映射
+> - Escape 键现在能关闭账号详情/编辑模态框（之前只关 proxy/quota 模态框）
+> - `loadUptimeFromServer` 登出后停止请求（之前每秒发 401）
+> - `openAccountDetail` 的 API Key 行在 `cred.apiKey` 为空时不再显示 `[object Object]`
+> - `validateConfigForSave` 增加 `emptyStreamSwitchThreshold`（>=0）和 `backoffFactor`（>0）校验
+> - `PUT /admin/api/accounts/edit` 增加 name/email 类型校验（防非字符串值崩溃 setAccountName 的 .trim()）
+> - `GET /admin/api/accounts/export-single` 加 `invalidateStoreCache`（外部新增账号立即可见）
+> - `undecryptableFilePresent` 守卫在解密成功 / 文件不存在时自动清除（之前用户用 LEGACY_SEED 恢复后能读不能写，被锁死）
+>
+> 全套 452 测试通过（vceshi0.0.4 是 445），TypeScript 类型检查零错误。
+>
+> ---
+
 > **vceshi0.0.4 — 空回阈值可配置 + 凭证名称/邮箱 + 单账号导出（测试版）**
 >
 > 用户反馈：3 次空回切换凭证的阈值应该可配置；凭证 JSON 格式应该有 name + email；账号管理 UI 应该可以查看/编辑/导出单账号。本版全部实现。

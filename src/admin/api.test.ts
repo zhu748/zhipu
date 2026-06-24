@@ -1210,3 +1210,139 @@ describe("/admin/api/accounts/export-single — single account JSON export", () 
     expect(body.account.credential.name).toBe("bob@x.com-coding-plan");
   });
 });
+
+// vceshi0.0.5: PUT /config deep-merges nested objects (retry/identity/logging/providers)
+describe("PUT /admin/api/config — deep merge of nested objects (vceshi0.0.5+)", () => {
+  beforeEach(() => {
+    clearCredential();
+    _resetKeyCacheForTesting();
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "test-secret-config-merge";
+  });
+  afterEach(() => {
+    clearCredential();
+    _resetKeyCacheForTesting();
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+  });
+
+  it("partial retry update preserves other retry fields (no TypeError)", async () => {
+    // Send only maxRetries in the retry object. Without deep-merge, this would
+    // drop retryableStatuses/initialDelayMs/etc., causing handler.ts to throw
+    // TypeError on the next request.
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/config", {
+        method: "PUT",
+        body: JSON.stringify({ retry: { maxRetries: 7 } }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    // The merged retry config should still have all original fields plus the new maxRetries
+    expect(opts.config.retry.maxRetries).toBe(7);
+    expect(opts.config.retry.initialDelayMs).toBe(1000); // preserved
+    expect(opts.config.retry.maxDelayMs).toBe(8000); // preserved
+    expect(opts.config.retry.backoffFactor).toBe(2); // preserved
+    expect(opts.config.retry.retryableStatuses).toEqual([529]); // preserved
+    expect(opts.config.retry.credentialSwitchThreshold).toBe(0); // preserved
+    expect(opts.config.retry.emptyStreamSwitchThreshold).toBe(3); // preserved
+  });
+
+  it("partial identity update preserves other identity fields", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/config", {
+        method: "PUT",
+        body: JSON.stringify({ identity: { appVersion: "9.9.9" } }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    expect(opts.config.identity.appVersion).toBe("9.9.9");
+    expect(opts.config.identity.sourceTitle).toBe("cli"); // preserved
+    expect(opts.config.identity.refererOrigin).toBe("https://zcode.z.ai"); // preserved
+  });
+});
+
+// vceshi0.0.5: POST /admin/api/credentials validates apiKey + provider
+describe("POST /admin/api/credentials — field validation (vceshi0.0.5+)", () => {
+  beforeEach(() => {
+    clearCredential();
+    _resetKeyCacheForTesting();
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "test-secret-cred-validation";
+  });
+  afterEach(() => {
+    clearCredential();
+    _resetKeyCacheForTesting();
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+  });
+
+  it("returns 400 when apiKey is empty", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/credentials", {
+        method: "POST",
+        body: JSON.stringify({ provider: "zai", apiKey: "" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.type).toBe("missing_param");
+  });
+
+  it("returns 400 when provider is invalid", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/credentials", {
+        method: "POST",
+        body: JSON.stringify({ provider: "invalid-provider", apiKey: "some-key" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.type).toBe("invalid_param");
+  });
+});
+
+// vceshi0.0.5: validateConfigForSave rejects bad emptyStreamSwitchThreshold + backoffFactor
+describe("PUT /admin/api/config — retry field validation (vceshi0.0.5+)", () => {
+  beforeEach(() => {
+    clearCredential();
+    _resetKeyCacheForTesting();
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "test-secret-retry-validation";
+  });
+  afterEach(() => {
+    clearCredential();
+    _resetKeyCacheForTesting();
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+  });
+
+  it("rejects negative emptyStreamSwitchThreshold", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/config", {
+        method: "PUT",
+        body: JSON.stringify({ retry: { emptyStreamSwitchThreshold: -1 } }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(500);
+    const body = await resp!.json();
+    expect(body.error.message).toContain("emptyStreamSwitchThreshold");
+  });
+
+  it("rejects zero/negative backoffFactor", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/config", {
+        method: "PUT",
+        body: JSON.stringify({ retry: { backoffFactor: 0 } }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(500);
+    const body = await resp!.json();
+    expect(body.error.message).toContain("backoffFactor");
+  });
+});

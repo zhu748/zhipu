@@ -163,7 +163,20 @@ export async function proxyRequest(
     upstreamBodyObj = translated;
   }
 
-  let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: config.plan === "start-plan" });
+  // currentPlan tracks the effective plan for the CURRENT credential. It starts
+  // as config.plan but is updated whenever the credential is switched mid-retry
+  // (vceshi0.0.5+ fix for the "cross-plan credential switch" bug). Without this,
+  // switching from a coding-plan cred to a start-plan cred (or vice versa) would
+  // keep using the old plan's upstream URL, auth headers, and captcha logic —
+  // guaranteeing the retried request fails the same way.
+  let currentPlan: "coding-plan" | "start-plan" = config.plan;
+  const effectivePlanForCred = (c: Credential): "coding-plan" | "start-plan" => {
+    if (c.plan === "start-plan" || c.plan === "coding-plan") return c.plan;
+    // Infer from JWT presence (matches store.ts inferPlan logic)
+    return c.jwt ? "start-plan" : "coding-plan";
+  };
+
+  let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan" });
   let transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
 
   // Diagnostic: log thinking-block strip counts so users can verify the fix
@@ -185,7 +198,7 @@ export async function proxyRequest(
   }
 
   let captchaHeaders: Record<string, string> | undefined;
-  if (config.plan === "start-plan") {
+  if (currentPlan === "start-plan") {
     try {
       const token = await getCaptchaToken();
       captchaHeaders = { [RETRY_HEADERS.PARAM]: token.verifyParam, [RETRY_HEADERS.REGION]: token.region };
@@ -202,7 +215,7 @@ export async function proxyRequest(
   // get caught by the catch block, and get converted to a synthetic 502 —
   // making retries completely ineffective.
   const buildUpstreamReq = (captcha?: Record<string, string>) =>
-    buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, config.plan, captcha);
+    buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, currentPlan, captcha);
 
   // Track the last anthropic-beta header actually sent upstream. Captured
   // during the real fetch so diagnostics on 4xx don't need to build a second
@@ -276,7 +289,7 @@ export async function proxyRequest(
   // getCaptchaToken() internally caches for TOKEN_TTL_MS (45s), so calling
   // it on every retry is cheap — only re-solves when the cache expires.
   const refreshCaptchaHeaders = async (): Promise<Record<string, string> | undefined> => {
-    if (config.plan !== "start-plan") return undefined;
+    if (currentPlan !== "start-plan") return undefined;
     try {
       const token = await getCaptchaToken();
       return { [RETRY_HEADERS.PARAM]: token.verifyParam, [RETRY_HEADERS.REGION]: token.region };
@@ -324,7 +337,7 @@ export async function proxyRequest(
   }
   let headersAt = Date.now();
 
-  if (upstreamResp.status === 401 && config.plan === "start-plan") {
+  if (upstreamResp.status === 401 && currentPlan === "start-plan") {
     printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0);
     return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
   }
@@ -332,7 +345,7 @@ export async function proxyRequest(
   // start-plan: on 403 captcha challenge, force re-solve and retry once.
   // This handles the INITIAL response. Retries that return 403 are handled
   // inside the retry loop below via the same handleCaptchaChallenge() helper.
-  if (config.plan === "start-plan" && (upstreamResp.status === 403 || detectCaptchaChallenge(upstreamResp))) {
+  if (currentPlan === "start-plan" && (upstreamResp.status === 403 || detectCaptchaChallenge(upstreamResp))) {
     upstreamResp = await handleCaptchaChallenge(upstreamResp);
     // If captcha re-solve itself failed, bail out
     if (upstreamResp.status === 503 && upstreamResp.headers.get("content-type")?.includes("application/json")) {
@@ -470,12 +483,22 @@ export async function proxyRequest(
             `(retry ${attempt}/${config.retry.maxRetries + extraAttemptsFromSwitches}): ${maskApiKey(cred.apiKey)} → ${maskApiKey(newCred.apiKey)}`,
           );
           cred = newCred;
+          // Sync currentPlan to the new credential's plan (vceshi0.0.5+ fix for
+          // cross-plan credential switch bug). Without this, switching from a
+          // coding-plan cred to a start-plan cred (or vice versa) would keep
+          // using the old plan's upstream URL, auth headers, captcha logic —
+          // guaranteeing the retried request fails the same way.
+          const newPlan = effectivePlanForCred(newCred);
+          if (newPlan !== currentPlan) {
+            console.log(`${reqId} plan synced to ${newPlan} (from new credential ${maskApiKey(newCred.apiKey)})`);
+            currentPlan = newPlan;
+          }
           // Rebuild the transformed body — userId is credential-specific and
           // gets injected into Anthropic metadata on start-plan.
           transformedObj = transformRequestBodyObj(upstreamBodyObj, {
             format: upstreamFormat,
             userId: cred.userId,
-            startPlan: config.plan === "start-plan",
+            startPlan: currentPlan === "start-plan",
           });
           transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
           consecutiveCredFailures = 0;
@@ -532,7 +555,7 @@ export async function proxyRequest(
         // re-solve and retry once before giving up. This handles the case
         // where the token expired between refreshCaptchaHeaders() and the
         // upstream actually validating it (rare but possible under load).
-        if (config.plan === "start-plan" && (upstreamResp.status === 403 || detectCaptchaChallenge(upstreamResp))) {
+        if (currentPlan === "start-plan" && (upstreamResp.status === 403 || detectCaptchaChallenge(upstreamResp))) {
           console.log(`${reqId} retry ${attempt} got 403 captcha challenge, re-solving...`);
           upstreamResp = await handleCaptchaChallenge(upstreamResp);
         }
@@ -580,6 +603,54 @@ export async function proxyRequest(
         // an empty stream, and we don't want it to count toward the
         // empty-stream switch.
         consecutiveEmptyStreams = 0;
+      }
+
+      // vceshi0.0.5+ fix: off-by-one in empty-stream switch.
+      // Previously the switch check was only at the TOP of the loop, so if
+      // the threshold was reached on the LAST retry attempt, the break below
+      // would fire before the switch ever triggered — making the feature
+      // a no-op under default config (maxRetries=3, threshold=3, initial
+      // response non-empty). Now we check AFTER incrementing and BEFORE the
+      // break: if threshold reached AND there's an alternative credential
+      // available, force a switch + grant an extra attempt so the new cred
+      // actually gets tried.
+      const shouldForceSwitchNow = (
+        (EMPTY_STREAM_SWITCH_THRESHOLD > 0 && consecutiveEmptyStreams >= EMPTY_STREAM_SWITCH_THRESHOLD) ||
+        (switchThreshold > 0 && consecutiveCredFailures >= switchThreshold)
+      );
+      if (shouldForceSwitchNow) {
+        // Try to switch — if a new cred is available, grant an extra attempt
+        // and continue the loop instead of breaking.
+        const failedCount = consecutiveCredFailures;
+        const newCred = await auth.switchToNextCredential(triedApiKeys);
+        if (newCred) {
+          const reason = (EMPTY_STREAM_SWITCH_THRESHOLD > 0 && consecutiveEmptyStreams >= EMPTY_STREAM_SWITCH_THRESHOLD)
+            ? `${consecutiveEmptyStreams} consecutive empty-stream responses`
+            : `${failedCount} consecutive failures`;
+          console.log(
+            `${reqId} credential switched (end-of-loop) after ${reason} ` +
+            `(retry ${attempt}/${config.retry.maxRetries + extraAttemptsFromSwitches}): ${maskApiKey(cred.apiKey)} → ${maskApiKey(newCred.apiKey)}`,
+          );
+          cred = newCred;
+          const newPlan = effectivePlanForCred(newCred);
+          if (newPlan !== currentPlan) {
+            console.log(`${reqId} plan synced to ${newPlan} (from new credential ${maskApiKey(newCred.apiKey)})`);
+            currentPlan = newPlan;
+          }
+          transformedObj = transformRequestBodyObj(upstreamBodyObj, {
+            format: upstreamFormat,
+            userId: cred.userId,
+            startPlan: currentPlan === "start-plan",
+          });
+          transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
+          consecutiveCredFailures = 0;
+          consecutiveEmptyStreams = 0;
+          triedApiKeys.add(newCred.apiKey);
+          extraAttemptsFromSwitches++;
+          try { upstreamResp.body?.cancel(); } catch {}
+          continue; // skip the break, give the new cred a chance
+        }
+        // No alternative credential — fall through to break
       }
 
       // Still a retryable status — if this was the last attempt, keep the

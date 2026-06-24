@@ -572,4 +572,43 @@ describe("multi-account store", () => {
     const exported = await exportSingleAccount("nonexistent-id");
     expect(exported).toBeNull();
   });
+
+  // --- vceshi0.0.5: undecryptableFilePresent guard auto-clears on success ---
+
+  it("undecryptableFilePresent guard auto-clears when decryption succeeds on retry", async () => {
+    // Simulate the recovery scenario:
+    //   1. Save a credential with secret A
+    //   2. Change secret so decryption fails → guard set to true
+    //   3. Change secret back → decryption succeeds → guard should auto-clear
+    //   4. saveCredential should now work (no "Refusing to overwrite" error)
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "secret-A";
+    _resetKeyCacheForTesting();
+    await saveCredential({ apiKey: "original-key", provider: "zai" });
+    expect(await loadCredential()).not.toBeNull();
+
+    // Step 2: change secret, invalidate cache, read → fails, guard set
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "secret-B-wrong";
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
+    const failedLoad = await loadCredential();
+    expect(failedLoad).toBeNull();
+
+    // Attempting to save now should fail (guard active)
+    await expect(
+      saveCredential({ apiKey: "should-fail", provider: "zai" }),
+    ).rejects.toThrow(/Refusing to overwrite/);
+
+    // Step 3: change secret back, invalidate cache, read → succeeds, guard clears
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "secret-A";
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
+    const recoveredLoad = await loadCredential();
+    expect(recoveredLoad).not.toBeNull();
+    expect(recoveredLoad!.apiKey).toBe("original-key");
+
+    // Step 4: saveCredential should now work (guard auto-cleared)
+    await saveCredential({ apiKey: "new-after-recovery", provider: "zai" });
+    const finalLoad = await loadCredential();
+    expect(finalLoad!.apiKey).toBe("new-after-recovery");
+  });
 });

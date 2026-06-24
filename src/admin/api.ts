@@ -319,9 +319,37 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       }
 
       const newConfig = { ...opts.config, ...body };
-      // Merge auth separately to avoid losing fields not sent by the dashboard
+      // Deep-merge nested objects so partial updates don't drop fields.
+      // Previously only `auth` was deep-merged; `retry` / `identity` / `logging`
+      // / `providers` were shallow-merged, meaning a client sending
+      // `{"retry":{"maxRetries":5}}` would lose all other retry fields
+      // (initialDelayMs, retryableStatuses, emptyStreamSwitchThreshold, etc.),
+      // causing runtime TypeError in handler.ts when those fields became undefined.
       if (authBody) {
         newConfig.auth = { ...opts.config.auth, ...authBody };
+      }
+      if (body.retry) {
+        newConfig.retry = {
+          ...opts.config.retry,
+          ...(body.retry as object),
+          // retryableStatuses is an array — if client sends it, use it; else keep existing
+          retryableStatuses: Array.isArray((body.retry as any).retryableStatuses)
+            ? (body.retry as any).retryableStatuses
+            : opts.config.retry.retryableStatuses,
+        };
+      }
+      if (body.identity) {
+        newConfig.identity = { ...opts.config.identity, ...(body.identity as object) };
+      }
+      if (body.logging) {
+        newConfig.logging = { ...opts.config.logging, ...(body.logging as object) };
+      }
+      if (body.providers) {
+        const bp = body.providers as any;
+        newConfig.providers = {
+          zai: { ...opts.config.providers.zai, ...(bp.zai || {}) },
+          bigmodel: { ...opts.config.providers.bigmodel, ...(bp.bigmodel || {}) },
+        };
       }
       // Validate the merged config before persisting
       validateConfigForSave(newConfig);
@@ -383,16 +411,33 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   if (path === "/admin/api/credentials" && method === "POST") {
     try {
       const body = await req.json() as { provider: string; apiKey: string; plan?: string; proxy?: string };
+      // Field validation (vceshi0.0.5+): reject empty apiKey / unknown provider
+      // before they get persisted as garbage that breaks later requests.
+      if (!body.apiKey || typeof body.apiKey !== "string" || !body.apiKey.trim()) {
+        return errorResponse(400, "missing_param", "apiKey is required and must be a non-empty string");
+      }
+      if (body.provider !== "zai" && body.provider !== "bigmodel") {
+        return errorResponse(400, "invalid_param", "provider must be 'zai' or 'bigmodel'");
+      }
       const plan = (body.plan === "start-plan" ? "start-plan" : "coding-plan") as "coding-plan" | "start-plan";
       const cred = {
-        apiKey: body.apiKey,
-        provider: body.provider as "zai" | "bigmodel",
+        apiKey: body.apiKey.trim(),
+        provider: body.provider,
         plan,
         // Per-account proxy (v2.1.4.1test5+). Trim; empty/whitespace → undefined
         // so the field is omitted from the serialized credential entirely.
         ...(body.proxy && body.proxy.trim() ? { proxy: body.proxy.trim() } : {}),
       } as AppCredential;
+      // Manual add: NO keepActive — new key becomes active (matches user expectation
+      // that clicking "Add Key" makes it the active credential immediately).
       await saveCredential(cred);
+      invalidateStoreCache();
+      // Hot-swap in-memory credential so oauth-mode requests pick up the new
+      // active credential immediately without restart.
+      const active = await loadCredential();
+      if (active && active.apiKey === cred.apiKey) {
+        opts.auth.setOAuthCredential(active);
+      }
       return jsonResp({ ok: true });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
@@ -698,10 +743,27 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   if (path === "/admin/api/import" && method === "POST") {
     try {
       const body = await req.json() as { provider: string; plan?: string };
-      const provider = body.provider as "zai" | "bigmodel";
+      if (body.provider !== "zai" && body.provider !== "bigmodel") {
+        return errorResponse(400, "invalid_param", "provider must be 'zai' or 'bigmodel'");
+      }
+      const provider = body.provider;
       const plan = (body.plan === "start-plan" ? "start-plan" : "coding-plan") as "coding-plan" | "start-plan";
       const cred = importFromZCodeConfig(provider, plan);
+      // Auto-generate name as `zcode(N)-{plan}` matching the CLI behavior (vceshi0.0.4+).
+      try {
+        const list = await listAccounts();
+        const zcodeCount = list.accounts.filter(a => (a.name || "").startsWith("zcode(")).length;
+        const actualPlan = cred.plan || plan;
+        cred.name = `zcode(${zcodeCount + 1})-${actualPlan}`;
+      } catch { /* non-fatal */ }
+      // Manual import: NO keepActive — new key becomes active.
       await saveCredential(cred);
+      invalidateStoreCache();
+      // Hot-swap so oauth-mode requests pick up the new active credential immediately.
+      const active = await loadCredential();
+      if (active && active.apiKey === cred.apiKey) {
+        opts.auth.setOAuthCredential(active);
+      }
       return jsonResp({ ok: true, apiKeyMask: maskApiKey(cred.apiKey), plan: cred.plan });
     } catch (err) {
       return errorResponse(500, "import_failed", (err as Error).message);
@@ -752,8 +814,16 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   if (path === "/admin/api/accounts/edit" && method === "PUT") {
     try {
       const body = await req.json() as { id?: string; name?: string; email?: string };
-      if (!body.id) {
-        return errorResponse(400, "missing_param", "id is required");
+      if (!body.id || typeof body.id !== "string") {
+        return errorResponse(400, "missing_param", "id is required and must be a string");
+      }
+      // Type-check name/email (vceshi0.0.5+): non-string values (numbers, null,
+      // objects) would crash setAccountName's .trim() call. Reject early.
+      if (body.name !== undefined && typeof body.name !== "string") {
+        return errorResponse(400, "invalid_param", "name must be a string");
+      }
+      if (body.email !== undefined && typeof body.email !== "string") {
+        return errorResponse(400, "invalid_param", "email must be a string");
       }
       // At least one of name/email must be provided (otherwise the call is a no-op).
       if (body.name === undefined && body.email === undefined) {
@@ -797,6 +867,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       if (!id) {
         return errorResponse(400, "missing_param", "id query param is required");
       }
+      // Invalidate cache so external writes (e.g. start.bat adding a credential)
+      // are reflected — otherwise we might return 404 for a just-added account.
+      invalidateStoreCache();
       const account = await exportSingleAccount(id);
       if (!account) {
         return errorResponse(404, "not_found", "Account not found");
@@ -1033,10 +1106,21 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     if (!flowId) return errorResponse(400, "missing_param", "flowId required");
     const flow = activeFlows.get(flowId);
     if (!flow) return errorResponse(404, "not_found", "Unknown flow");
+    // Check expiry (vceshi0.0.5+): expired flows return "expired" status so the
+    // dashboard can show a clear "授权已过期" message instead of spinning forever.
+    if (Date.now() > flow.expiresAt) {
+      activeFlows.delete(flowId);
+      return jsonResp({ status: "expired" });
+    }
     const status = (flow as any).status || "pending";
-    if (status === "ready") activeFlows.delete(flowId);
-    if (status === "failed") activeFlows.delete(flowId);
-    return jsonResp({ status });
+    const resp: any = { status };
+    // Surface the error message on failure (vceshi0.0.5+) — previously the
+    // dashboard couldn't tell the user WHY the flow failed.
+    if (status === "failed" && (flow as any).error) {
+      resp.error = (flow as any).error;
+    }
+    if (status === "ready" || status === "failed") activeFlows.delete(flowId);
+    return jsonResp(resp);
   }
 
   // OAuth manual callback URL submission
@@ -1124,6 +1208,11 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         if (!storedCallbackUrl) {
           return errorResponse(500, "missing_callback", "Original localhost callback URL not found. Please restart the login.");
         }
+        // State validation (vceshi0.0.5+): defense-in-depth CSRF check, matching
+        // the zai path above. Previously bigmodel manual callback skipped this.
+        if (state !== flow.state) {
+          return errorResponse(400, "state_mismatch", "Callback state does not match the OAuth flow. Please restart the login.");
+        }
         const { accessToken, userId, jwt, email } = await oauth.exchangeCode(code, storedCallbackUrl, state);
         const resolver = new KeyResolver();
         const flowPlan = ((flow as any).plan ?? "coding-plan") as "coding-plan" | "start-plan";
@@ -1160,6 +1249,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       const body = await req.json() as { zai?: Record<string, string>; bigmodel?: Record<string, string> };
       if (body.zai) Object.assign(opts.config.providers.zai, body.zai);
       if (body.bigmodel) Object.assign(opts.config.providers.bigmodel, body.bigmodel);
+      // Persist to disk so changes survive restart (vceshi0.0.5+ fix — previously
+      // the in-memory update was hot but lost on restart, silently reverting).
+      await persistConfig(opts.config, opts.configPath);
       return jsonResp({ ok: true });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
@@ -1673,6 +1765,21 @@ function validateConfigForSave(cfg: Record<string, unknown>): void {
       : parseInt(String(retry.credentialSwitchThreshold), 10);
     if (Number.isFinite(credentialSwitchThreshold) && credentialSwitchThreshold < 0) {
       throw new Error(`retry.credentialSwitchThreshold ${credentialSwitchThreshold} must be >= 0`);
+    }
+    // emptyStreamSwitchThreshold (vceshi0.0.5+): 0 = disabled, otherwise the
+    // number of consecutive empty-stream 529s before forcing a credential switch.
+    const emptyStreamSwitchThreshold = typeof retry.emptyStreamSwitchThreshold === "number"
+      ? retry.emptyStreamSwitchThreshold
+      : parseInt(String(retry.emptyStreamSwitchThreshold), 10);
+    if (Number.isFinite(emptyStreamSwitchThreshold) && emptyStreamSwitchThreshold < 0) {
+      throw new Error(`retry.emptyStreamSwitchThreshold ${emptyStreamSwitchThreshold} must be >= 0`);
+    }
+    // backoffFactor: must be > 0 (0 → all delays become 0, no backoff; negative → invalid)
+    const backoffFactor = typeof retry.backoffFactor === "number"
+      ? retry.backoffFactor
+      : parseFloat(String(retry.backoffFactor));
+    if (Number.isFinite(backoffFactor) && backoffFactor <= 0) {
+      throw new Error(`retry.backoffFactor ${backoffFactor} must be > 0`);
     }
   }
 

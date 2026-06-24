@@ -472,7 +472,13 @@ export function invalidateStoreCache(): void {
 
 /** Uncached inner implementation. Does the actual disk + decrypt work. */
 async function readStoreUncached(): Promise<StoreV2 | null> {
-  if (!existsSync(STORE_FILE)) return null;
+  if (!existsSync(STORE_FILE)) {
+    // File doesn't exist — clear the guard. Without this, a previous failed
+    // read would leave undecryptableFilePresent=true forever, locking the user
+    // out of saving new credentials even after the file was deleted externally.
+    undecryptableFilePresent = false;
+    return null;
+  }
 
   let raw: string;
   try {
@@ -526,6 +532,11 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
 
     if ((parsed as any).version === 2) {
       // v2: encrypted blob is the StoreV2 JSON
+      // Decryption succeeded — clear the guard so future writes are allowed.
+      // Without this, a user who recovers via ZCODE_PROXY_LEGACY_SEED would
+      // be able to READ but not WRITE (the guard from the initial failed read
+      // would persist forever, locking them out of saving any changes).
+      undecryptableFilePresent = false;
       return JSON.parse(json) as StoreV2;
     }
 

@@ -234,11 +234,15 @@ describe("credential auto-switching", () => {
       }),
     );
 
-    // 1 initial + 10 retries = 11 total attempts
-    expect(seenApiKeys.length).toBe(11);
-    // First 5 should be A (initial + 4 retries)
+    // vceshi0.0.5+: end-of-loop switch grants 1 extra attempt when switching,
+    // so total is 1 initial + 10 retries + 1 end-of-loop extra = 12 attempts.
+    // (Previously 11 — the off-by-one fix gives the switched-to credential
+    // a fair shot instead of breaking immediately when the threshold is hit
+    // on the last retry.)
+    expect(seenApiKeys.length).toBe(12);
+    // First 5 should be A (initial + 4 retries before threshold=5 triggers switch)
     expect(seenApiKeys.slice(0, 5).every(k => k === "key-AAA")).toBe(true);
-    // After switch, remaining 6 should all be B (no cycling back to A)
+    // After switch, remaining 7 should all be B (no cycling back to A)
     expect(seenApiKeys.slice(5).every(k => k === "key-BBB")).toBe(true);
     // Final response is 529 (exhausted)
     expect(resp.status).toBe(529);
