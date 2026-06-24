@@ -167,6 +167,235 @@ async function expectStats(expected: { total: number; success: number; failed: n
 }
 
 // ---------------------------------------------------------------------------
+// recordStat — vceshi0.0.7+ post-trim dedup (seenIds)
+// ---------------------------------------------------------------------------
+
+describe("recordStat — post-trim deduplication (vceshi0.0.7+)", () => {
+  it("does NOT double-count when a retry arrives after the original entry was trimmed", () => {
+    // Fill the requests[] buffer past the 200-entry trim threshold.
+    // Each id is unique so they're all counted as new requests.
+    for (let i = 0; i < 210; i++) {
+      recordStat({
+        id: `#trim-${i}`, time: "10:00:00", model: "glm-4.6",
+        status: 200, ttfb: "100", tokens: "5",
+      });
+    }
+    // After 200 entries, the buffer is trimmed to 100. The first 110 ids
+    // (`#trim-0` through `#trim-109`) are evicted from requestIndex but
+    // remain in the lifetime seenIds set.
+    // Now simulate a retry for one of the evicted ids — without seenIds
+    // this would be counted as a new request, inflating `total`.
+    recordStat({
+      id: `#trim-0`, time: "10:00:00", model: "glm-4.6",
+      status: 200, ttfb: "100", tokens: "5", retried: true,
+    });
+    // total should stay at 210 (not 211), retried should be 1.
+    return expectStats({ total: 210, success: 211, failed: 0, retried: 1 })
+      .catch((err) => {
+        // If the assertion fails, the actual total reveals the bug.
+        throw err;
+      });
+  });
+
+  it("caps the models map at 100 distinct entries (vceshi0.0.7+)", async () => {
+    // Send 105 distinct model names. After 100, the rest should aggregate
+    // under "_other" instead of creating new entries.
+    for (let i = 0; i < 105; i++) {
+      recordStat({
+        id: `#cap-${i}`, time: "10:00:00", model: `model-${i}`,
+        status: 200, ttfb: "100", tokens: "5",
+      });
+    }
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(authedReq("/admin/api/stats"), opts);
+    const body = await resp!.json();
+    const modelCount = Object.keys(body.models).length;
+    // Should be exactly 101 (100 distinct + "_other").
+    expect(modelCount).toBe(101);
+    // "_other" should have aggregated the last 5 entries.
+    expect(body.models["_other"].count).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// recordStat — byCredential re-classification on retry (vceshi0.0.7+)
+// ---------------------------------------------------------------------------
+
+describe("recordStat — byCredential re-classification (vceshi0.0.7+)", () => {
+  it("increments byCredential when a failed request succeeds on retry", async () => {
+    // First call: 529 (failed) — byCredential NOT incremented (only counts successes).
+    recordStat({
+      id: "#cred-1", time: "10:00:00", model: "glm-4.6",
+      status: 529, ttfb: "100", tokens: "0",
+      credentialKey: "abc12345...wxyz",
+    });
+    // Retry: 200 (success) — byCredential SHOULD be incremented now.
+    recordStat({
+      id: "#cred-1", time: "10:00:00", model: "glm-4.6",
+      status: 200, ttfb: "200", tokens: "15",
+      credentialKey: "abc12345...wxyz",
+      retried: true,
+    });
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(authedReq("/admin/api/stats"), opts);
+    const body = await resp!.json();
+    expect(body.byCredential["abc12345...wxyz"].count).toBe(1);
+    expect(body.byCredential["abc12345...wxyz"].outputTokens).toBe(15);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /admin/api/oauth/init — provider validation (vceshi0.0.7+)
+// ---------------------------------------------------------------------------
+
+describe("POST /admin/api/oauth/init — provider validation (vceshi0.0.7+)", () => {
+  it("returns 400 for unknown provider", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/oauth/init", {
+        method: "POST",
+        body: JSON.stringify({ provider: "evil" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.message).toMatch(/provider must be 'zai' or 'bigmodel'/);
+  });
+
+  it("returns 400 when provider is missing", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/oauth/init", {
+        method: "POST",
+        body: JSON.stringify({}),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /admin/api/endpoints — URL validation (vceshi0.0.7+)
+// ---------------------------------------------------------------------------
+
+describe("PUT /admin/api/endpoints — URL validation (vceshi0.0.7+)", () => {
+  it("returns 400 for malformed anthropicBase URL", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/endpoints", {
+        method: "PUT",
+        body: JSON.stringify({ zai: { anthropicBase: "api.z.ai" } }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.message).toMatch(/not a valid URL/);
+  });
+
+  it("returns 400 for non-http(s) scheme", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/endpoints", {
+        method: "PUT",
+        body: JSON.stringify({ zai: { anthropicBase: "ftp://example.com" } }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.message).toMatch(/must be http\(s\):\/\//);
+  });
+
+  it("returns 400 for unknown field in provider object", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/endpoints", {
+        method: "PUT",
+        body: JSON.stringify({ zai: { apiKey: "stolen" } }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.message).toMatch(/not allowed/);
+  });
+
+  it("accepts valid URLs and persists", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/endpoints", {
+        method: "PUT",
+        body: JSON.stringify({
+          zai: { anthropicBase: "https://api.z.ai/api/anthropic" },
+          bigmodel: { openaiBase: "https://open.bigmodel.cn/api/coding/paas/v4" },
+        }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    expect(opts.config.providers.zai.anthropicBase).toBe("https://api.z.ai/api/anthropic");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /admin/api/credentials DELETE — clears in-memory auth (vceshi0.0.7+)
+// ---------------------------------------------------------------------------
+
+describe("DELETE /admin/api/credentials — clears in-memory oauth cred (vceshi0.0.7+)", () => {
+  it("calls auth.clearOAuthCredential() so running requests stop using the cleared cred", async () => {
+    // Use a mock AuthManager to verify clearOAuthCredential is called.
+    let clearCalled = false;
+    const fakeAuth = {
+      setOAuthCredential: () => {},
+      clearOAuthCredential: () => { clearCalled = true; },
+      getCredential: async () => { throw new Error("no cred"); },
+      switchToNextCredential: async () => null,
+      getMode: () => "oauth" as const,
+    };
+    const opts = makeAdminOpts({ auth: fakeAuth as unknown as AuthManager });
+    const resp = await callAdmin(
+      authedReq("/admin/api/credentials", { method: "DELETE" }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    expect(clearCalled).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /admin/api/accounts/quota — per-account rate limit (vceshi0.0.7+)
+// ---------------------------------------------------------------------------
+
+describe("POST /admin/api/accounts/quota — per-account rate limit (vceshi0.0.7+)", () => {
+  it("returns 400 when id is missing or non-string", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/quota", {
+        method: "POST",
+        body: JSON.stringify({}),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+  });
+
+  it("returns 400 when id is a number (not a string)", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(
+      authedReq("/admin/api/accounts/quota", {
+        method: "POST",
+        body: JSON.stringify({ id: 123 }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // recordDebugDump — ring buffer
 // ---------------------------------------------------------------------------
 

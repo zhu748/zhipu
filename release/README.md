@@ -1,5 +1,38 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.0.7 — 管理面板逻辑 Bug 全面修复 + 性能优化**
+>
+> 对管理面板进行了系统性审计，修复 5 个严重 Bug + 7 个高优先级 Bug + 6 个中优先级优化。
+> 新增 12 个回归测试，全套 472/472 通过。本版本无 CLI 命令变化，无需重新生成 start.bat / start.sh。
+>
+> **1. 严重 Bug 修复（Critical）**
+> - **凭证详情弹窗 XSS / 显示按钮失效**：`toggleSecret` 内联 `onclick` 把 `escapeHtml` 转义后的 `'`（`&#39;`）放回 JS 字符串，HTML 解码后破坏 JS 语法。含 `'` 的 API Key/JWT 无法显示，且可被恶意凭证注入 JS。改为 `data-secret` 属性 + 事件委托。
+> - **清空凭证未清内存**：`DELETE /admin/api/credentials` 只删磁盘文件，内存 `oauthCred` 仍存活，运行中的请求继续用已删除凭证。新增 `AuthManager.clearOAuthCredential()`，清空时同步热清除内存。
+> - **OAuth 过期状态未处理**：后端 `oauth/poll` 在流程过期时返回 `{status:"expired"}`，前端 `pollOAuth` 不处理这个状态，导致用户授权超时后界面空转 4 分钟无提示。
+> - **OAuth 旧轮询循环未取消**：用户重新点击"开始登录"启动新流程时，旧 `pollOAuth` 循环仍后台运行，两个循环同时更新 UI 造成状态闪烁。新增 `oauthPollCancelled` 标志，新流程启动时通知旧循环退出。
+> - **日志 SSE 虚假推送**：`waiter.resolve` 是 noop，实际靠 500ms 永久轮询投递。10 个 Dashboard 标签页 = 每秒 4 万次字符串比较。改为真正推送 + 2s 安全网轮询。
+>
+> **2. 高优先级 Bug 修复（High）**
+> - **setInterval 内存泄漏**：`loadOverview` 与 `setInterval(loadStats,10000)` 未保存 handle，退出登录后定时器继续触发，闭包无法 GC。新增 `uptimeIntervalId` / `statsIntervalId`，`doLogout` 中清理。
+> - **`submitCallback` 不刷新账号列表**：粘贴回调 URL 完成授权后，新账号不出现在多账号管理表格，需手动刷新页面。补加 `loadAccountsList()`。
+> - **`renameAccount` / `changePlan` 不刷新账号列表**：内联编辑成功后列表不更新；失败时下拉框停留在用户选择值，不回退到持久化值。成功/失败均刷新列表。
+> - **`/admin/api/endpoints` 缺 URL 校验**：直接 `Object.assign`，缺 `https://` 等错误格式被静默接受，所有后续请求 404。新增 URL 协议校验 + 拒绝未知字段。
+> - **`/admin/api/oauth/init` 缺 provider 校验**：未校验 `as "zai" | "bigmodel"` 强制转换，未知 provider 深入到 OAuth 客户端构造函数才崩。新增 400 校验。
+> - **`loadStats` 页面可见性检测错误**：用 `style.display !== 'none'` 判断页面是否可见，但页面切换是通过 `.active` 类实现的，判断永远为 true，导致非账号页时也疯狂 `filterAccounts()`。改为 `classList.contains('active')`。
+> - **重复 stats 轮询**：`loadUptimeFromServer` (1s) 与 `loadStats` (10s) 同时 fetch 同一端点。uptime 间隔改为 2s 并复用响应中的 `byCredential` 缓存，减少冗余请求。
+>
+> **3. 中优先级优化（Medium）**
+> - **`recordStat` trim 后重试重复计数**：`stats.requests` 满 200 trim 到 100，被裁掉的 id 重试到达时被误判为新请求，total +1。新增 `seenIds` 生命周期 Set（上限 5000），即使被裁也能识别。
+> - **`byCredential` 重试成功漏补加**：失败 → 成功的状态翻转时，`byCredential` 计数未补加，凭证使用次数少计。更新路径检测 `!wasSuccess && isSuccess` 时补加。
+> - **`stats.models` Map 无上限**：客户端发各种自定义模型名（经 mappings 映射），Map 无限增长。上限 100 个，超出聚合到 `_other`。
+> - **`appendLog` 截断依赖脆弱子串**：`message.includes("[verbose]")` 判断 verbose 日志，但任何偶然包含该子串的日志都会绕过截断。改为 `level === "debug" || message.includes("[verbose]")`。
+> - **`/admin/api/accounts/quota` 缺速率限制**：上游计费查询非免费，疯狂点击会耗尽 JWT 或触发 IP 限流。新增 15s 缓存，命中返回 `cached: true`。
+> - **错误响应格式不一致**：前端 `addApiKey` / `importKey` / `renameAccount` 等只读 `d.error`，丢失真实错误信息。统一 `d.error?.message || d.error || '默认'` 兜底。
+>
+> **4. 测试覆盖**
+> - 新增 12 个回归测试覆盖上述修复（post-trim dedup、models cap、byCredential re-classification、oauth/init validation、endpoints URL validation、clearCredentials 热清除、quota id 校验等）。
+> - 全套 472/472 通过，TypeScript 零错误。
+
 > **vceshi0.0.6 — 输入 token 计数 + 详细日志模式 + 凭证禁用/启用 + 使用次数**
 >
 > 用户反馈 4 项需求全部实现：统计页只看到输出 token、日志不够详细、凭证无法禁用、看不到凭证使用次数。

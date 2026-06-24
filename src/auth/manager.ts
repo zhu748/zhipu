@@ -66,6 +66,18 @@ export class AuthManager {
   }
 
   /**
+   * Clear the in-memory OAuth credential (vceshi0.0.7+).
+   *
+   * Called by the dashboard's "Clear all credentials" handler so that running
+   * requests stop using the just-deleted credential. Without this, the proxy
+   * would keep serving from the stale in-memory credential until restart —
+   * defeating the purpose of the clear action.
+   */
+  clearOAuthCredential(): void {
+    this.oauthCred = null;
+  }
+
+  /**
    * Switch to a different stored credential, skipping the current credential
    * and any credentials in `excludeApiKeys` (credentials already tried and
    * failed in the same request). Returns the new credential, or null if no

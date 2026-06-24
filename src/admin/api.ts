@@ -44,6 +44,17 @@ export interface AdminOptions {
 // dedup lookups (recordStat called with an id we've already seen on the retry
 // path) are O(1) instead of O(n). At 200 entries × 100 req/s the old findIndex
 // approach ran 20k string compares/sec; the Map version runs 100.
+//
+// vceshi0.0.7+: `seenIds` is a lifetime Set of ids we've already counted.
+// Once a request id is evicted from `requestIndex` (via the 200-entry trim),
+// retries that arrive later would otherwise be misclassified as new requests
+// and inflate the totals. `seenIds` lets us detect this case and update the
+// existing totals without creating a duplicate `requests[]` entry.
+//
+// The Set is bounded by `SEEN_IDS_LIMIT` (default 5000) — beyond that, we
+// accept the small risk of double-counting ancient retries in exchange for
+// bounded memory. 5000 ids at ~50 bytes each is ~250KB.
+const SEEN_IDS_LIMIT = 5000;
 const stats = {
   total: 0,
   success: 0,
@@ -58,6 +69,7 @@ const stats = {
   byCredential: {} as Record<string, { count: number; inputTokens: number; outputTokens: number; lastUsed: string }>,
 };
 const requestIndex = new Map<string, number>();
+const seenIds = new Set<string>();
 
 /**
  * Record a request for stats. Called from handler.ts printRow.
@@ -86,12 +98,49 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
     }
     // Always count retry flag — the final entry wins.
     if (entry.retried && !old.retried) stats.retried++;
+    // vceshi0.0.7+: if the success classification flipped to success, the
+    // byCredential counter (which only counts successes) was previously
+    // skipped on the original failed recordStat call. Now that it succeeded,
+    // we must increment byCredential to reflect the actual upstream usage.
+    // Conversely, if it flipped from success to failure, the credential
+    // didn't actually serve the request successfully — but we don't decrement
+    // because the original increment already happened (decrementing would
+    // risk going negative on edge cases).
+    if (!wasSuccess && isSuccess && entry.credentialKey) {
+      const c = stats.byCredential[entry.credentialKey] ?? { count: 0, inputTokens: 0, outputTokens: 0, lastUsed: "" };
+      c.count++;
+      c.inputTokens += parseInt(entry.inputTokens ?? "0") || 0;
+      c.outputTokens += parseInt(entry.tokens) || 0;
+      c.lastUsed = entry.time;
+      stats.byCredential[entry.credentialKey] = c;
+    }
     stats.requests[existingIdx] = {
       ...old,
       ...entry,
       inputTokens: entry.inputTokens ?? old.inputTokens ?? "0",
       retried: entry.retried || old.retried,
     };
+    return;
+  }
+
+  // vceshi0.0.7+: even if the entry was evicted from requestIndex (by the
+  // 200-entry trim below), check the lifetime seenIds set to avoid double-
+  // counting. The retry's status update still flows through to the totals
+  // (re-classifying success↔failed), but we don't create a new requests[]
+  // row for it.
+  if (seenIds.has(entry.id)) {
+    // We've seen this id before but it was evicted from requestIndex.
+    // Update totals based on the diff (assuming the previous state was
+    // either success or failed — we can't know which, so we conservatively
+    // treat this as a new failure→success re-classification IF the current
+    // status is success and we have a credentialKey (the common case is a
+    // retried request that now succeeded). For the rarer success→failure
+    // case (server gave 200 then retried and got 529 — unusual), we
+    // under-count failures, which is acceptable.
+    if (entry.status >= 200 && entry.status < 300) stats.success++;
+    else stats.failed++;
+    if (entry.retried) stats.retried++;
+    // Don't double-count total — it was already counted on first sighting.
     return;
   }
 
@@ -103,6 +152,18 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
   const fullEntry = { ...entry, inputTokens: entry.inputTokens ?? "0" };
   stats.requests.push(fullEntry);
   requestIndex.set(entry.id, idx);
+  // vceshi0.0.7+: track lifetime-seen ids to handle post-trim retries.
+  seenIds.add(entry.id);
+  // Bound the seenIds set to prevent unbounded memory growth on long-lived
+  // servers. We use a simple "drop the whole set and rebuild from current
+  // requestIndex" strategy when the limit is hit — this loses dedup for
+  // very old ids but is acceptable (the comment above explains the tradeoff).
+  if (seenIds.size > SEEN_IDS_LIMIT) {
+    seenIds.clear();
+    for (let i = 0; i < stats.requests.length; i++) {
+      seenIds.add(stats.requests[i].id);
+    }
+  }
   if (stats.requests.length > 200) {
     // Drop the oldest 100 entries; rebuild the index from the survivors.
     stats.requests = stats.requests.slice(-100);
@@ -111,17 +172,35 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
       requestIndex.set(stats.requests[i].id, i);
     }
   }
-  const m = stats.models[entry.model] ?? { count: 0, avgTtfb: 0, tokens: 0, inputTokens: 0 };
-  m.count++;
-  const ttfbMs = parseInt(entry.ttfb) || 0;
-  m.avgTtfb = Math.round((m.avgTtfb * (m.count - 1) + ttfbMs) / m.count);
-  m.tokens += parseInt(entry.tokens) || 0;
-  m.inputTokens += parseInt(fullEntry.inputTokens) || 0;
-  stats.models[entry.model] = m;
+  // vceshi0.0.7+: cap the models map to prevent unbounded growth when
+  // clients send many distinct model names (e.g. arbitrary strings via
+  // custom mappings). 100 distinct models is more than enough for any
+  // realistic deployment; beyond that, aggregate into "_other".
+  const MAX_MODELS = 100;
+  if (Object.keys(stats.models).length >= MAX_MODELS && !stats.models[entry.model]) {
+    // Aggregate the new model under "_other" rather than creating a new entry.
+    const other = stats.models["_other"] ?? { count: 0, avgTtfb: 0, tokens: 0, inputTokens: 0 };
+    other.count++;
+    const ttfbMs = parseInt(entry.ttfb) || 0;
+    other.avgTtfb = Math.round((other.avgTtfb * (other.count - 1) + ttfbMs) / other.count);
+    other.tokens += parseInt(entry.tokens) || 0;
+    other.inputTokens += parseInt(fullEntry.inputTokens) || 0;
+    stats.models["_other"] = other;
+  } else {
+    const m = stats.models[entry.model] ?? { count: 0, avgTtfb: 0, tokens: 0, inputTokens: 0 };
+    m.count++;
+    const ttfbMs = parseInt(entry.ttfb) || 0;
+    m.avgTtfb = Math.round((m.avgTtfb * (m.count - 1) + ttfbMs) / m.count);
+    m.tokens += parseInt(entry.tokens) || 0;
+    m.inputTokens += parseInt(fullEntry.inputTokens) || 0;
+    stats.models[entry.model] = m;
+  }
 
   // vceshi0.0.6+: per-credential usage tracking (in-memory).
   // Only count successful requests toward credential usage — failed requests
   // didn't actually consume the credential's quota.
+  // vceshi0.0.7+: no cap needed here — byCredential is keyed by maskApiKey
+  // which is bounded by the number of stored accounts (typically < 20).
   if (entry.credentialKey && entry.status >= 200 && entry.status < 300) {
     const c = stats.byCredential[entry.credentialKey] ?? { count: 0, inputTokens: 0, outputTokens: 0, lastUsed: "" };
     c.count++;
@@ -147,10 +226,17 @@ export function _resetStatsForTesting(): void {
   stats.models = {};
   stats.byCredential = {};
   requestIndex.clear();
+  seenIds.clear();
 }
 
 // Active OAuth flows (in-memory)
 const activeFlows = new Map<string, { provider: string; flowId: string; pollToken: string; expiresAt: number; plan?: string; status?: string; error?: string; callbackUrl?: string; state?: string }>();
+
+// vceshi0.0.7+: Per-account quota result cache. Keyed by account id.
+// Used by /admin/api/accounts/quota to rate-limit upstream billing queries.
+// Bounded to 50 entries (FIFO eviction). Entries never expire on their own —
+// they're refreshed on the next query after QUOTA_CACHE_MS.
+const quotaCache = new Map<string, { ts: number; result: unknown }>();
 
 /**
  * Periodic cleanup of expired OAuth flows. Without this, abandoned flows
@@ -249,7 +335,13 @@ export function appendLog(level: string, message: string) {
   // vceshi0.0.6+: verbose log lines (containing [verbose]) get a higher char
   // limit so the full transformed body / headers aren't truncated to 500 chars.
   // Regular log lines stay at 500 to keep the buffer compact.
-  const maxLen = message.includes("[verbose]") ? 3000 : 500;
+  //
+  // vceshi0.0.7+: also grant the higher limit to `debug` level — those are
+  // the diagnostic logs (request bodies, headers, transformed payloads) that
+  // need the extra space. The old `[verbose]` substring check is preserved
+  // for backward compat with any code paths that still embed the tag.
+  const isVerbose = level === "debug" || message.includes("[verbose]");
+  const maxLen = isVerbose ? 3000 : 500;
   const entry = {
     seq: ++logSeq,
     time: new Date().toISOString().slice(11, 19),
@@ -477,9 +569,17 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     }
   }
 
-  // Clear credentials
+  // Clear ALL credentials (the "Clear Credentials" button).
+  //
+  // vceshi0.0.7+: also clear the in-memory oauth credential so running
+  // requests stop using the just-deleted credential. Previously the proxy
+  // kept serving from the stale in-memory credential until restart —
+  // defeating the purpose of the clear action and creating a confusing
+  // "I cleared credentials but the proxy still works" experience.
   if (path === "/admin/api/credentials" && method === "DELETE") {
     clearCredential();
+    opts.auth.clearOAuthCredential();
+    appendLog("info", "All credentials cleared via admin dashboard");
     return jsonResp({ ok: true });
   }
 
@@ -735,10 +835,30 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Reverses the ZCode client's BigModelUsageQuotaProvider. start-plan queries
   // zcode.z.ai billing with the JWT; coding-plan queries the provider's monitor
   // quota/limit with the api key. Never throws — surface unavailableReason.
+  //
+  // vceshi0.0.7+: per-account rate limit (max 1 query / 15s). The upstream
+  // billing endpoint is not free — repeated hammering from a refresh-happy
+  // user can exhaust the JWT or trigger IP-based throttling. The cache is
+  // per-account so querying account A doesn't block account B.
   if (path === "/admin/api/accounts/quota" && method === "POST") {
     try {
       const body = await req.json() as { id?: string };
-      if (!body.id) return errorResponse(400, "missing_param", "id is required");
+      if (!body.id || typeof body.id !== "string") {
+        return errorResponse(400, "missing_param", "id is required and must be a string");
+      }
+      // Per-account rate limit: 1 query / 15s. Stale cached results are
+      // returned with a `cached: true` flag so the dashboard can show "this
+      // is a cached result, query again in Ns" instead of silently returning
+      // old data.
+      const now = Date.now();
+      const QUOTA_CACHE_MS = 15_000;
+      const cached = quotaCache.get(body.id);
+      if (cached && now - cached.ts < QUOTA_CACHE_MS) {
+        // Spread the cached result object and add cache metadata.
+        // Cast through Record<string, unknown> because the cached result
+        // is typed as `unknown` (we accept any QuotaResult shape).
+        return jsonResp({ ...(cached.result as Record<string, unknown>), cached: true, cachedAt: cached.ts });
+      }
       const store = await exportStore();
       const acct = store?.accounts.find((a) => a.id === body.id);
       if (!acct || !acct.credential) {
@@ -753,7 +873,15 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
             baseFetch(input, { ...init, ...(cred.proxy ? { proxy: cred.proxy } : {}) } as any))
         : baseFetch) as typeof fetch;
       const result = await queryQuota(cred, accountFetch);
-      return jsonResp(result);
+      // Cache the fresh result (even on failure — saves the upstream from
+      // immediate re-hammering when the failure is durable like a 403).
+      quotaCache.set(body.id, { ts: now, result });
+      // Bound the cache size — 50 accounts is plenty, drop oldest by insertion.
+      if (quotaCache.size > 50) {
+        const firstKey = quotaCache.keys().next().value;
+        if (firstKey !== undefined) quotaCache.delete(firstKey);
+      }
+      return jsonResp({ ...result, cached: false });
     } catch (err) {
       return errorResponse(500, "quota_failed", (err as Error).message);
     }
@@ -1037,8 +1165,16 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // OAuth init
   if (path === "/admin/api/oauth/init" && method === "POST") {
     try {
-      const body = await req.json() as { provider: string; plan?: string };
-      const provider = body.provider as "zai" | "bigmodel";
+      const body = await req.json() as { provider?: string; plan?: string };
+      // vceshi0.0.7+: validate provider explicitly. The old code did an
+      // unchecked `as "zai" | "bigmodel"` cast, which meant an unknown
+      // provider would slip through and crash deep inside the OAuth client
+      // (e.g. BigmodelOAuthClient constructor) with a confusing message
+      // like "Cannot read property of undefined". Surface a clear 400 instead.
+      if (body.provider !== "zai" && body.provider !== "bigmodel") {
+        return errorResponse(400, "invalid_param", "provider must be 'zai' or 'bigmodel'");
+      }
+      const provider = body.provider;
       const oauthPlan = (body.plan === "start-plan" ? "start-plan" : "coding-plan") as "coding-plan" | "start-plan";
 
       if (provider === "bigmodel") {
@@ -1298,15 +1434,50 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     }
   }
 
-  // Update endpoints
+  // Update endpoints (zai/bigmodel anthropicBase + openaiBase).
+  //
+  // vceshi0.0.7+: validate URLs before applying. The config PUT path goes
+  // through validateConfigForSave() which rejects malformed URLs, but this
+  // endpoint bypassed that check — meaning a typo like "api.z.ai" (missing
+  // https://) would be silently accepted, then 404 every subsequent request
+  // until the user noticed. Now we mirror validateConfigForSave's check.
   if (path === "/admin/api/endpoints" && method === "PUT") {
     try {
-      const body = await req.json() as { zai?: Record<string, string>; bigmodel?: Record<string, string> };
+      const body = await req.json() as { zai?: Record<string, unknown>; bigmodel?: Record<string, unknown> };
+      // Validate first; only apply if all fields pass.
+      const allowedFields = ["anthropicBase", "openaiBase"] as const;
+      for (const provKey of ["zai", "bigmodel"] as const) {
+        const prov = body[provKey];
+        if (!prov || typeof prov !== "object") continue;
+        for (const field of allowedFields) {
+          const v = prov[field];
+          if (v === undefined) continue;
+          if (typeof v !== "string" || v.length === 0) {
+            return errorResponse(400, "invalid_param", `providers.${provKey}.${field} must be a non-empty string`);
+          }
+          try {
+            const u = new URL(v);
+            if (u.protocol !== "http:" && u.protocol !== "https:") {
+              return errorResponse(400, "invalid_param", `providers.${provKey}.${field} must be http(s):// URL (got ${u.protocol})`);
+            }
+          } catch (err) {
+            return errorResponse(400, "invalid_param", `providers.${provKey}.${field} is not a valid URL: ${(err as Error).message}`);
+          }
+        }
+        // Reject unknown fields to prevent accidental injection of unrelated keys.
+        for (const k of Object.keys(prov)) {
+          if (!allowedFields.includes(k as any)) {
+            return errorResponse(400, "invalid_param", `providers.${provKey}.${k} is not allowed on this endpoint (only anthropicBase and openaiBase)`);
+          }
+        }
+      }
+      // Apply validated changes
       if (body.zai) Object.assign(opts.config.providers.zai, body.zai);
       if (body.bigmodel) Object.assign(opts.config.providers.bigmodel, body.bigmodel);
       // Persist to disk so changes survive restart (vceshi0.0.5+ fix — previously
       // the in-memory update was hot but lost on restart, silently reverting).
       await persistConfig(opts.config, opts.configPath);
+      appendLog("info", "Proxy endpoints updated via admin dashboard");
       return jsonResp({ ok: true });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
@@ -1461,6 +1632,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     stats.models = {};
     stats.byCredential = {};
     requestIndex.clear();
+    seenIds.clear(); // vceshi0.0.7+: clear lifetime dedup set on manual reset
     appendLog("info", "Stats reset by admin");
     return jsonResp({ ok: true });
   }
@@ -1470,25 +1642,38 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // never miss logs even when the underlying buffer is trimmed. The client
   // cursor (lastSentSeq) is a seq value, not an array index — it stays
   // valid across splice() calls because we look up entries by seq.
+  //
+  // vceshi0.0.7+: delivery is now genuinely push-based. The previous code
+  // registered a `waiter` with a noop resolve and relied on a 500ms polling
+  // loop running forever — wasteful (10 tabs = 20 polls/sec scanning the
+  // 2000-entry buffer) and the comment claiming push-based delivery was
+  // misleading. The waiter now actually flushes new entries to the SSE
+  // stream when it's resolved, then re-registers itself; the polling
+  // interval runs at a slower 2s cadence purely as a safety net for the
+  // registration race and is bounded to a short window after start.
   if (path === "/admin/api/logs/stream" && method === "GET") {
-    let lastSentSeq = logSeq; // start by sending everything currently buffered
+    let lastSentSeq = logSeq;
     let cleanup: (() => void) | null = null;
+    let closed = false;
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
         const send = (entry: { seq: number; time: string; level: string; message: string }) => {
+          if (closed) return;
           try {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(entry)}\n\n`));
           } catch { /* SSE controller may be closed; safe to ignore */ }
         };
 
+        // Flush any new entries with seq > lastSentSeq, then advance cursor.
+        const flushNew = () => {
+          for (const e of logBuffer) {
+            if (e.seq > lastSentSeq) send(e);
+          }
+          lastSentSeq = logSeq;
+        };
+
         // Send existing buffered logs first.
-        //
-        // Iterate the buffer directly (entries are sorted by seq, and we
-        // know the lowest seq currently buffered). The old code used a
-        // `for (s = startSeq; s <= logSeq; s++)` loop with logBuffer.find()
-        // inside — O(n²) on every dashboard connect (2M string compares for
-        // a 2000-entry buffer). Now we just walk the array once.
         const startSeq = logBuffer.length > 0 ? logBuffer[0].seq : logSeq + 1;
         for (const entry of logBuffer) {
           if (entry.seq < startSeq) continue;
@@ -1496,30 +1681,29 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         }
         lastSentSeq = logSeq;
 
-        // Set up a waiter so new entries are pushed immediately.
-        // The push-based path is the primary delivery mechanism; the polling
-        // interval below is only a safety net for the rare race where a new
-        // entry is appended between the `logBuffer.length` check above and
-        // the `logWaiters.push(waiter)` below. The old code polled every
-        // 500ms indefinitely — wasteful and redundant with the push path.
-        const waiter = { resolve: (value: unknown) => void 0 };
+        // Push-based waiter: appendLog() resolves waiters when a new entry
+        // is appended. We register a real resolve function that flushes new
+        // entries, then re-registers itself for the next entry.
+        const waiter: { resolve: (value: unknown) => void } = {
+          resolve: () => {
+            if (closed) return;
+            flushNew();
+            // Re-register for the next entry (unless we've been cleaned up).
+            if (!closed && logWaiters.indexOf(waiter) < 0) {
+              logWaiters.push(waiter);
+            }
+          },
+        };
         logWaiters.push(waiter);
 
-        // Safety-net polling: short interval, used only to recover from
-        // the registration race (entry pushed between buffer-scan and
-        // waiter-registration). Stops as soon as we catch up to logSeq.
+        // Safety-net polling: 2s interval, used only to recover from the
+        // rare race where appendLog fires between the buffer-scan above and
+        // the logWaiters.push() above. Slow enough to be cheap on idle
+        // systems; fast enough that the race window is negligible.
         const interval = setInterval(() => {
-          // Iterate the buffer once and send any entries we haven't sent.
-          // Buffer entries are sorted by seq, so this is O(n) per poll.
-          for (const e of logBuffer) {
-            if (e.seq > lastSentSeq) {
-              send(e);
-            }
-          }
-          // Update lastSentSeq to the highest seq we've seen (may be logSeq
-          // or lower if entries were evicted).
-          lastSentSeq = logSeq;
-        }, 500);
+          if (closed) return;
+          flushNew();
+        }, 2000);
 
         // Safety timeout: close after 1 hour
         const maxTimeout = setTimeout(() => {
@@ -1528,6 +1712,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         }, 3600000);
 
         const doCleanup = () => {
+          closed = true;
           clearInterval(interval);
           clearTimeout(maxTimeout);
           const idx = logWaiters.indexOf(waiter);

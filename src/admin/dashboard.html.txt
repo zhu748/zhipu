@@ -949,7 +949,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>vceshi0.0.6</span>
+        <span>vceshi0.0.7</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1852,6 +1852,14 @@ async function doLogin(){
 }
 document.getElementById('loginKey').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});
 
+// vceshi0.0.7+: handles for the periodic intervals set up by loadOverview()
+// and the stats refresh loop. Tracked so doLogout() can clear them —
+// otherwise the timers keep firing forever even after the user logs out,
+// leaking memory and preventing garbage collection of the closures.
+let uptimeIntervalId=null;
+// statsIntervalId is declared further down (near its setInterval call)
+// to keep the related logic together.
+
 // Auto-login on page load if a token was previously stored.
 // Surfaces a visible warning when the server has no proxyApiKey configured
 // so the user knows the dashboard is open to anyone with network access.
@@ -1887,6 +1895,13 @@ function doLogout(){
   try{sessionStorage.removeItem('zcodeProxyAuth')}catch{}
   try{localStorage.removeItem('zcodeProxyAuth')}catch{}
   if(logEventSource){try{logEventSource.close()}catch{};logEventSource=null}
+  // vceshi0.0.7+: clear periodic intervals so they don't keep firing
+  // (and holding their closures alive) after logout.
+  if(uptimeIntervalId){clearInterval(uptimeIntervalId);uptimeIntervalId=null}
+  if(statsIntervalId){clearInterval(statsIntervalId);statsIntervalId=null}
+  // vceshi0.0.7+: cancel any in-flight OAuth poll loop.
+  oauthPollCancelled=true;
+  if(oauthExpiryTimer){clearInterval(oauthExpiryTimer);oauthExpiryTimer=null}
   document.getElementById('app').classList.remove('show');
   document.getElementById('loginWrap').style.display='flex';
   document.getElementById('loginKey').value='';
@@ -1965,11 +1980,16 @@ async function loadOverview(){
     }
   }catch(e){console.error('loadOverview failed:',e);document.getElementById('healthInfo').innerHTML='<span class="badge badge-danger">加载失败</span>'}
   loadUptimeFromServer();
-  setInterval(loadUptimeFromServer,1000);
+  // vceshi0.0.7+: poll every 2s instead of 1s. The 1s interval was overkill
+  // for a uptime display (humans don't perceive 1s vs 2s freshness) and
+  // duplicated work that the 10s loadStats interval was already doing.
+  // The handle is tracked so doLogout() can clear it (previously leaked).
+  if(uptimeIntervalId)clearInterval(uptimeIntervalId);
+  uptimeIntervalId=setInterval(loadUptimeFromServer,2000);
 }
 async function loadUptimeFromServer(){
   // Guard: skip the request when not authenticated (e.g. after logout).
-  // Without this, the 1-second interval keeps firing 401s forever.
+  // Without this, the interval keeps firing 401s forever.
   if(!authToken)return;
   try{
     const r=await fetch(API+'/admin/api/stats',{headers:authHeaders()});
@@ -1983,6 +2003,17 @@ async function loadUptimeFromServer(){
     // page doesn't sit stale while the user is on it.
     document.getElementById('statRequests').textContent=d.total||0;
     document.getElementById('statRetries').textContent=d.retried||0;
+    // vceshi0.0.7+: also update _cachedByCredential so the accounts page
+    // usage counts stay fresh without waiting for the 10s loadStats interval.
+    // Only re-render the accounts table if it's currently visible.
+    if(d.byCredential){
+      _cachedByCredential=d.byCredential;
+      const accountsPage=document.getElementById('page-accounts');
+      // Use classList check — pages use .active class to show/hide.
+      if(accountsPage&&accountsPage.classList.contains('active')&&_cachedAccounts.length>0){
+        filterAccounts();
+      }
+    }
   }catch{}
 }
 
@@ -2129,8 +2160,16 @@ async function addApiKey(){
   if(!key)return toast('请输入 API Key','error');
   try{
     const r=await fetch(API+'/admin/api/credentials',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,apiKey:key,plan})});
-    if(r.ok){toast('API Key 已添加（'+plan+'）','success');loadAccountInfo();loadAccountsList();loadCredStore();document.getElementById('addKeyValue').value=''}
-    else toast('添加失败','error');
+    if(r.ok){
+      toast('API Key 已添加（'+plan+'）','success');
+      loadAccountInfo();loadAccountsList();loadCredStore();
+      document.getElementById('addKeyValue').value='';
+    }else{
+      // vceshi0.0.7+: surface the real server error (e.g. "provider must be
+      // 'zai' or 'bigmodel'") instead of the generic "添加失败".
+      const d=await r.json().catch(()=>({}));
+      toast(d.error?.message||d.error||'添加失败','error');
+    }
   }catch(e){console.error('addApiKey failed:',e);toast('添加失败','error')}
 }
 async function importKey(){
@@ -2139,8 +2178,14 @@ async function importKey(){
   try{
     const r=await fetch(API+'/admin/api/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,plan})});
     const d=await r.json();
-    if(r.ok){toast('Key 已导入：'+d.apiKeyMask,'success');loadAccountInfo();loadAccountsList();loadCredStore()}
-    else toast(d.error||'导入失败','error');
+    if(r.ok){
+      toast('Key 已导入：'+d.apiKeyMask,'success');
+      loadAccountInfo();loadAccountsList();loadCredStore();
+    }else{
+      // vceshi0.0.7+: surface the real server error (e.g. "ZCode config not
+      // found at ...") instead of the generic "导入失败".
+      toast(d.error?.message||d.error||'导入失败','error');
+    }
   }catch(e){console.error('importKey failed:',e);toast('导入失败','error')}
 }
 
@@ -2272,9 +2317,20 @@ async function activateAccount(id){
 async function renameAccount(id,label){
   try{
     const r=await fetch(API+'/admin/api/accounts/label',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,label})});
-    if(r.ok)toast('标签已更新','success');
-    else toast('重命名失败','error');
-  }catch(e){console.error('renameAccount failed:',e);toast('重命名失败','error')}
+    if(r.ok){
+      toast('标签已更新','success');
+      // vceshi0.0.7+: refresh the accounts list so the displayed name
+      // matches the server-side normalized value (e.g. trimmed). Previously
+      // the inline input showed whatever the user typed, which could
+      // diverge from the persisted value.
+      loadAccountsList();
+    }else{
+      const d=await r.json().catch(()=>({}));
+      toast(d.error?.message||d.error||'重命名失败','error');
+      // Refresh on failure too — the input value reverts to the persisted value.
+      loadAccountsList();
+    }
+  }catch(e){console.error('renameAccount failed:',e);toast('重命名失败','error');loadAccountsList()}
 }
 async function deleteAccount(id,label){
   if(!confirm(`确认删除账号"${label}"？此操作不可撤销。`))return;
@@ -2287,9 +2343,18 @@ async function deleteAccount(id,label){
 async function changePlan(id,plan){
   try{
     const r=await fetch(API+'/admin/api/accounts/plan',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,plan})});
-    if(r.ok){toast('套餐已更新为 '+plan,'success');loadAccountInfo();loadCredStore()}
-    else toast('套餐更新失败','error');
-  }catch(e){console.error('changePlan failed:',e);toast('套餐更新失败','error')}
+    if(r.ok){
+      toast('套餐已更新为 '+plan,'success');
+      // vceshi0.0.7+: refresh the accounts list so the plan badge updates.
+      // Previously the dropdown showed the new value but the rest of the row
+      // (and any plan-based filtering) was stale until manual refresh.
+      loadAccountInfo();loadCredStore();loadAccountsList();
+    }else{
+      const d=await r.json().catch(()=>({}));
+      toast(d.error?.message||d.error||'套餐更新失败','error');
+      loadAccountsList(); // revert the dropdown to the persisted value
+    }
+  }catch(e){console.error('changePlan failed:',e);toast('套餐更新失败','error');loadAccountsList()}
 }
 async function changeProxy(id,proxy){
   // Legacy inline-edit path — kept for backward compat but no longer wired up
@@ -2353,12 +2418,36 @@ async function openAccountDetail(id){
     ];
     const rowsHtml=rows.map(([k,v])=>{
       if(v&&typeof v==='object'&&v.secret){
-        // Sensitive field with show/hide toggle
-        const fieldId='secret-'+k.replace(/[^a-zA-Z0-9]/g,'')+'-'+Date.now();
-        return `<tr><td class="td-mute">${k}</td><td><span class="td-mono" id="${fieldId}">${escapeHtml(v.mask)}</span> <button class="btn btn-ghost btn-sm" onclick="toggleSecret('${fieldId}','${escapeHtml(v.secret).replace(/'/g,"\\'")}')">显示</button></td></tr>`;
+        // Sensitive field with show/hide toggle.
+        // vceshi0.0.7+: use data-secret attribute + event delegation instead
+        // of inline onclick with the secret embedded. The old code did
+        // `onclick="toggleSecret('${fieldId}','${escapeHtml(v.secret).replace(/'/g,"\\'")}')"`,
+        // which broke when the secret contained a single quote: escapeHtml
+        // converts ' to &#39;, the HTML parser decodes it back to ', and the
+        // JS engine sees `toggleSecret('id','...with ' in it...')` — broken JS.
+        // Storing the secret in a data attribute and reading it via DOM
+        // avoids the JS-context escaping problem entirely.
+        const fieldId='secret-'+k.replace(/[^a-zA-Z0-9]/g,'')+'-'+Date.now()+'-'+Math.random().toString(36).slice(2,6);
+        const secretAttr=escapeHtml(JSON.stringify(v.secret));
+        return `<tr><td class="td-mute">${k}</td><td><span class="td-mono" id="${fieldId}">${escapeHtml(v.mask)}</span> <button class="btn btn-ghost btn-sm" data-toggle-secret="${fieldId}" data-secret="${secretAttr}">显示</button></td></tr>`;
       }
       return `<tr><td class="td-mute">${k}</td><td>${escapeHtml(String(v))}</td></tr>`;
     }).join('');
+    // vceshi0.0.7+: wire up data-toggle-secret buttons via addEventListener
+    // (the buttons are created above with data attributes; we attach handlers
+    // after injecting the HTML into the modal). Uses setTimeout(0) so the
+    // modal body is in the DOM before we query for buttons.
+    setTimeout(()=>{
+      document.querySelectorAll('button[data-toggle-secret]').forEach(btn=>{
+        btn.addEventListener('click',()=>{
+          const fieldId=btn.getAttribute('data-toggle-secret');
+          const secretJson=btn.getAttribute('data-secret')||'""';
+          let secret='';
+          try{secret=JSON.parse(secretJson)}catch{}
+          toggleSecret(fieldId,secret);
+        });
+      });
+    },0);
     const html=`<div class="modal-overlay" onclick="if(event.target===this)closeModal('accountDetailModal')">
       <div class="modal" style="max-width:640px">
         <div class="modal-header">
@@ -2906,6 +2995,10 @@ function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':
 let currentFlowId=sessionStorage.getItem('zcodeOAuthFlowId')||null;
 let oauthExpiryTimer=null;
 let oauthExpiresAt=0;
+// vceshi0.0.7+: cancellation flag for the pollOAuth loop. Set to true when
+// a new OAuth flow starts (so the previous loop stops) or when the user
+// submits a callback URL (so the loop stops because we have the result).
+let oauthPollCancelled=false;
 async function loadCredStore(){
   try{
     const r=await fetch(API+'/admin/api/credentials',{headers:authHeaders()});
@@ -2927,6 +3020,13 @@ async function startOAuth(){
     const r=await fetch(API+'/admin/api/oauth/init',{method:'POST',headers:authHeaders(),body:JSON.stringify({provider,plan})});
     const d=await r.json();
     if(!r.ok)throw new Error(d.error||'Init failed');
+    // vceshi0.0.7+: cancel any previous poll loop before starting a new one.
+    // Without this, starting a new OAuth flow while the old one was still
+    // polling would leave both loops running — the old loop could update
+    // the UI with stale "ready" status after the user moved on.
+    if(oauthPollCancelled===false){
+      oauthPollCancelled=true; // signal the previous loop to stop
+    }
     currentFlowId=d.flowId;
     sessionStorage.setItem('zcodeOAuthFlowId',d.flowId);
     document.getElementById('oauthDot').className='oauth-dot on';
@@ -2935,6 +3035,9 @@ async function startOAuth(){
     document.getElementById('oauthUrl').value=d.authorizeUrl;
     oauthExpiresAt=d.expiresAt||0;
     startOauthCountdown();
+    // Reset the cancellation flag for the new poll loop, then start it.
+    // The flag is captured by closure so the loop can check it on each iteration.
+    oauthPollCancelled=false;
     pollOAuth(d.flowId);
   }catch(e){toast(e.message,'error');document.getElementById('oauthStatusText').textContent='失败：'+e.message}
 }
@@ -2955,8 +3058,17 @@ function startOauthCountdown(){
   oauthExpiryTimer=setInterval(update,1000);
 }
 async function pollOAuth(flowId){
+  // vceshi0.0.7+: capture the cancellation flag at loop start. If a new
+  // flow starts later, it will set oauthPollCancelled=true; we check the
+  // shared flag on each iteration and exit if it's been flipped.
   for(let i=0;i<120;i++){
+    // Bail out if a new OAuth flow was started (or callback submitted).
+    if(oauthPollCancelled){
+      // Don't update UI — the new flow's pollOAuth will handle it.
+      return;
+    }
     await new Promise(r=>setTimeout(r,2000));
+    if(oauthPollCancelled)return; // re-check after the 2s sleep
     try{
       const r=await fetch(API+'/admin/api/oauth/poll?flowId='+flowId,{headers:authHeaders()});
       const d=await r.json();
@@ -2968,14 +3080,35 @@ async function pollOAuth(flowId){
         toast('OAuth 登录成功','success');
         currentFlowId=null;
         sessionStorage.removeItem('zcodeOAuthFlowId');
-        loadAccountInfo();loadCredStore();
+        // vceshi0.0.7+: refresh the accounts list too — the new account
+        // won't appear in the multi-account table without this.
+        loadAccountInfo();loadCredStore();loadAccountsList();
         return;
       }
       if(d.status==='failed'){
         document.getElementById('oauthDot').className='oauth-dot off';
         document.getElementById('oauthStatusText').textContent='授权失败';
         if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
-        toast('OAuth 失败','error');return;
+        // vceshi0.0.5+: surface the error message if present (previously
+        // the dashboard couldn't tell the user WHY the flow failed).
+        if(d.error){
+          toast('OAuth 失败：'+d.error,'error');
+        }else{
+          toast('OAuth 失败','error');
+        }
+        return;
+      }
+      // vceshi0.0.7+: handle 'expired' status — backend returns this when
+      // the flow's expiresAt has passed. Previously the dashboard would
+      // keep polling for 4 minutes, showing nothing to the user.
+      if(d.status==='expired'){
+        document.getElementById('oauthDot').className='oauth-dot off';
+        document.getElementById('oauthStatusText').textContent='授权已过期，请重新开始登录';
+        if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
+        toast('OAuth 授权已过期，请重新开始','warn');
+        currentFlowId=null;
+        sessionStorage.removeItem('zcodeOAuthFlowId');
+        return;
       }
     }catch(e){console.error('pollOAuth fetch failed:',e)}
   }
@@ -3028,10 +3161,15 @@ async function submitCallback(){
       resultBox.innerHTML=`<div class="hint" style="background:var(--success-soft);border-color:var(--success);border-left-color:var(--success)"><span class="hint-icon" style="color:var(--success)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span><div><strong>授权成功！</strong><br>提供商：<strong>${d.provider}</strong> &nbsp; API Key：<code class="code-inline">${d.apiKeyMask}</code>${d.userId?`<br>用户 ID：<code class="code-inline">${d.userId}</code>`:''}</div></div>`;
       toast('凭证保存成功','success');
       if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
+      // vceshi0.0.7+: cancel any in-flight poll loop so it doesn't update
+      // the UI with stale "pending" status after we've already shown success.
+      oauthPollCancelled=true;
       document.getElementById('oauthDot').className='oauth-dot on';
       document.getElementById('oauthStatusText').innerHTML='<span class="badge badge-success"><span class="badge-dot"></span>已通过回调 URL 授权</span>';
       currentFlowId=null;
-      loadAccountInfo();loadCredStore();
+      // vceshi0.0.7+: refresh the accounts list too — the new account
+      // wouldn't appear in the multi-account table without this.
+      loadAccountInfo();loadCredStore();loadAccountsList();
     }else{
       resultBox.innerHTML=`<div class="hint hint-danger"><span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></span><div><strong>失败：</strong>${d.error||'换取失败'}${d.message?`<br>${d.message}`:''}</div></div>`;
       toast(d.error||'回调换取失败','error');
@@ -3341,9 +3479,14 @@ async function loadStats(){
     // vceshi0.0.6+: cache byCredential stats + re-render accounts table to
     // refresh usage counts without a full loadAccountsList fetch.
     _cachedByCredential=d.byCredential||{};
-    // Only re-render if the accounts page is currently visible (avoid unnecessary DOM work)
+    // vceshi0.0.7+: use classList check instead of style.display — pages
+    // toggle visibility via the .active class (added/removed by nav clicks),
+    // not by setting style.display directly. The old check
+    // `style.display!=='none'` was always true (since we never set
+    // display:none on the page element), so filterAccounts() ran on every
+    // poll even when the user was on a different page — wasteful DOM work.
     const accountsPage=document.getElementById('page-accounts');
-    if(accountsPage&&accountsPage.style.display!=='none'&&_cachedAccounts.length>0){
+    if(accountsPage&&accountsPage.classList.contains('active')&&_cachedAccounts.length>0){
       filterAccounts();
     }
   }catch(e){console.error('loadStats failed:',e)}
@@ -3403,7 +3546,12 @@ async function clearDebugDumps(){
 // vceshi0.0.6+: cache byCredential stats so filterAccounts can render usage
 // counts without a separate fetch. Updated by loadStats, read by filterAccounts.
 let _cachedByCredential={};
-setInterval(()=>{if(authToken)loadStats()},10000);
+// vceshi0.0.7+: track the interval handle so doLogout() can clear it.
+// The old code leaked the interval forever (even after logout) — the inner
+// guard `if(authToken)loadStats()` prevented the actual fetch, but the timer
+// itself leaked. Now we clear it on logout.
+let statsIntervalId=null;
+statsIntervalId=setInterval(()=>{if(authToken)loadStats()},10000);
 
 async function resetStats(){
   if(!confirm('确认重置所有统计数据？此操作不可撤销。'))return;
