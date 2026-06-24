@@ -1,5 +1,20 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.0.2 — 凭证额度查询功能（测试版）**
+>
+> 新增「额度查询」：dashboard 账号表格每个账号的「操作」列新增「额度」按钮，点击后实时查询上游真实额度并弹窗展示。
+>
+> **功能内容**：
+> - start-plan 账号：查询 zcode.z.ai 的套餐（`billing/current`）+ 余额（`billing/balance`），显示套餐名、到期时间、每个模型（如 GLM-5.2 / GLM-5-Turbo）的剩余 token 与每日重置时间
+> - coding-plan 账号：查询提供商（api.z.ai / open.bigmodel.cn）的额度上限（`/api/monitor/usage/quota/limit`），显示套餐等级与各项额度明细
+> - 额度接口逆向自 ZCode 客户端，每个模型额度独立展示（不混算成单一百分比，避免「某模型已用完但整体显示 40%」的误导）
+> - 支持为配了出口代理的账号查询（复用该账号的 proxy 配置）
+> - 新增 10 个单元测试，全套 422 测试通过，TypeScript 类型检查零错误
+>
+> 全套 422 测试通过，TypeScript 类型检查零错误。
+>
+> ---
+
 > **vceshi0.0.1 — OAuth 凭证切换失效修复（测试版）**
 >
 > 修复 dashboard 通过 OAuth 登录的账号在切换后立即失效的问题。原现象：OAuth 账号切换后 Claude Code 报 `API returned an empty or malformed response (HTTP 200)`，但从 ZCode 桌面版导入的账号切换后正常工作。

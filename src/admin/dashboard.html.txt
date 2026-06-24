@@ -888,7 +888,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>vceshi0.0.1</span>
+        <span>vceshi0.0.2</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -2050,6 +2050,7 @@ async function loadAccountsList(){
         <td class="td-mute">${escapeHtml(created)}</td>
         <td>${isActive?'<span class="badge badge-success"><span class="badge-dot"></span>已激活</span>':'<span class="badge badge-muted">未激活</span>'}</td>
         <td class="td-actions">
+          <button class="btn btn-ghost btn-sm" onclick="checkQuota('${escapeHtml(a.id)}')" title="查询上游额度">额度</button>
           <button class="btn btn-ghost btn-sm" onclick="openProxyModal('${escapeHtml(a.id)}','${escapeHtml(a.proxy||'')}',this.getAttribute('data-provider'))" data-provider="${escapeHtml(a.provider)}" title="配置代理">代理</button>
           ${isActive?'':`<button class="btn btn-primary btn-sm" onclick="activateAccount('${escapeHtml(a.id)}')">激活</button> `}
           <button class="btn btn-danger btn-sm" onclick="deleteAccount('${escapeHtml(a.id)}','${escapeHtml(a.label).replace(/'/g,'\\\'')}')">删除</button>
@@ -2199,6 +2200,98 @@ function closeProxyModal(){
   document.getElementById('proxyModal').style.display='none';
   proxyModalAccountId=null;
   proxyModalProvider=null;
+}
+
+/** Query and display the upstream quota/balance for an account. */
+async function checkQuota(id){
+  const modal=document.getElementById('quotaModal');
+  const body=document.getElementById('quotaBody');
+  // Loading state
+  body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;gap:10px;padding:24px;color:var(--text-2);font-size:13px;animation:pulse 1.4s ease-in-out infinite;">正在查询上游额度…</div>';
+  modal.style.display='flex';
+  try{
+    const r=await fetch(API+'/admin/api/accounts/quota',{method:'POST',headers:authHeaders(),body:JSON.stringify({id})});
+    if(!r.ok){const t=await r.text().catch(()=>'');throw new Error('HTTP '+r.status+(t?' '+t:''))}
+    const d=await r.json();
+    renderQuota(d);
+  }catch(e){
+    console.error('checkQuota failed:',e);
+    body.innerHTML='<div style="padding:20px;color:var(--danger);font-size:13px;line-height:1.6;">查询失败：'+escapeHtml(e instanceof Error?e.message:String(e))+'<br><span style="color:var(--text-3)">请检查网络或上游服务是否可达。</span></div>';
+  }
+}
+
+/** Format a unix-seconds timestamp (or ISO string) for display. */
+function formatQuotaTime(v){
+  if(v===null||v===undefined||v==='')return null;
+  const n=typeof v==='number'?v:Date.parse(v);
+  if(typeof n==='number'&&Number.isFinite(n)){
+    // Treat plain integers as unix seconds (billing/ends_at), ms otherwise
+    const ms=n>1e12?n:n*1000;
+    const dt=new Date(ms);
+    const s=dt.toLocaleString();
+    return Number.isFinite(dt.getTime())?s:null;
+  }
+  return null;
+}
+
+/** Render a QuotaResult into the modal body. */
+function renderQuota(d){
+  const body=document.getElementById('quotaBody');
+  const reason=d.unavailableReason;
+  const reasonMap={'no_plan':'该凭证没有有效的套餐（可能未开通 coding/start plan）','unavailable':'上游暂时无法返回额度信息（可能凭证已过期或上游限流）','not_configured':'凭证未配置，无法查询'};
+  if(reason){
+    body.innerHTML='<div style="padding:20px;color:var(--warning,var(--text-2));font-size:13px;line-height:1.6;">'+escapeHtml(reasonMap[reason]||'无法查询额度')+'</div>';
+    return;
+  }
+  const planLine=d.planName?('<div style="color:var(--text-2);font-size:12px;margin-bottom:4px;">套餐：<b style="color:var(--text);">'+escapeHtml(d.planName)+'</b></div>'):'';
+  const exp=formatQuotaTime(d.expireTime);
+  const expLine=exp?('<div style="color:var(--text-3);font-size:12px;margin-bottom:14px;">到期：'+escapeHtml(exp)+'</div>'):'';
+  // Header row: plan + provider
+  const header='<div style="font-size:11px;color:var(--text-3);margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em;">'+escapeHtml(d.plan)+' · '+escapeHtml(d.provider)+'</div>';
+  // Build the main body from per-limit entries. Each limit gets its own
+  // progress bar — important because start-plan grants are per-MODEL (e.g.
+  // GLM-5.2 exhausted while GLM-5-Turbo is full), and summing them into one
+  // percentage would mislead ("40%" when one model is at 0%).
+  const limits=(Array.isArray(d.limits)?d.limits:[]).filter(l=>l.remaining!=null&&l.total!=null);
+  let limitsBlock='';
+  if(limits.length){
+    limitsBlock='<div style="display:flex;flex-direction:column;gap:12px;">'+
+      limits.map(l=>{
+        const pct=l.total>0?Math.round(l.remaining/l.total*1000)/10:0;
+        const color=pct<20?'var(--danger)':(pct<50?'var(--warning,#e0a800)':'var(--success,#22c55e)');
+        const next=formatQuotaTime(l.nextResetTime);
+        return '<div>'+
+          '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">'+
+            '<span style="font-size:13px;color:var(--text);font-weight:500;">'+escapeHtml(l.label||l.type||'-')+'</span>'+
+            '<span style="font-size:12px;color:var(--text-2);"><b style="color:'+color+';font-size:14px;">'+pct+'%</b> 剩余 '+escapeHtml(fmtNum(l.remaining))+' / '+escapeHtml(fmtNum(l.total))+'</span>'+
+          '</div>'+
+          '<div style="height:8px;background:var(--bg-elev,var(--border));border-radius:4px;overflow:hidden;">'+
+            '<div style="height:100%;width:'+Math.max(0,Math.min(100,pct))+'%;background:'+color+';transition:width .3s;"></div>'+
+          '</div>'+
+          (next?'<div style="font-size:11px;color:var(--text-3);margin-top:3px;">每日重置 · '+escapeHtml(next)+'</div>':'')+
+        '</div>';
+      }).join('')+
+    '</div>';
+  }else{
+    // No per-limit data (e.g. coding-plan returned a level but no limits, or
+    // balance had no totals). Fall back to the aggregate remaining if present.
+    const rem=d.remaining;
+    if(rem&&rem.total>0){
+      const pct=Math.round(rem.percentage);
+      const color=pct<20?'var(--danger)':(pct<50?'var(--warning,#e0a800)':'var(--success,#22c55e)');
+      limitsBlock='<div style="font-size:14px;color:var(--text-2);">剩余 <b style="color:'+color+';font-size:18px;">'+pct+'%</b>（'+escapeHtml(fmtNum(rem.count))+' / '+escapeHtml(fmtNum(rem.total))+'）</div>';
+    }else{
+      limitsBlock='<div style="color:var(--text-3);font-size:12px;">无可用额度数据</div>';
+    }
+  }
+  body.innerHTML=header+planLine+expLine+limitsBlock;
+}
+/** Format a large token count with thousands separators for readability. */
+function fmtNum(n){return (n==null||n===undefined)?'-':String(n).replace(/\B(?=(\d{3})+(?!\d))/g,',');}
+
+
+function closeQuotaModal(){
+  document.getElementById('quotaModal').style.display='none';
 }
 
 /** Enable/disable host/port/user/pass fields based on selected proxy type. */
@@ -2987,12 +3080,30 @@ function toast(msg,type='success'){
   </div>
 </div>
 
+<!-- ============================================================ -->
+<!-- Quota modal (v2.1.4.2+)                                       -->
+<!-- ============================================================ -->
+<div id="quotaModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);backdrop-filter:blur(2px);align-items:center;justify-content:center;z-index:1100;padding:20px;">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r-xl);max-width:520px;width:100%;box-shadow:var(--shadow-lg);">
+    <div style="padding:var(--s-5) var(--s-6);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+      <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:var(--s-2);">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--primary);"><path d="M20.91 8.84 8.56 21.18a4.25 4.25 0 0 1-6-6L14.9 2.84a2.83 2.83 0 0 1 4 4L6.31 19.47"/></svg>
+        凭证额度
+      </h3>
+      <button onclick="closeQuotaModal()" style="background:none;border:none;font-size:22px;color:var(--text-2);cursor:pointer;line-height:1;padding:0 4px;">×</button>
+    </div>
+    <div id="quotaBody" style="padding:var(--s-6);min-height:120px;"></div>
+  </div>
+</div>
+
 <script>
-// Escape key closes the proxy modal
+// Escape key closes the proxy / quota modals
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){
-    const m=document.getElementById('proxyModal');
-    if(m&&m.style.display==='flex'){closeProxyModal()}
+    const pm=document.getElementById('proxyModal');
+    if(pm&&pm.style.display==='flex'){closeProxyModal()}
+    const qm=document.getElementById('quotaModal');
+    if(qm&&qm.style.display==='flex'){closeQuotaModal()}
   }
 });
 </script>

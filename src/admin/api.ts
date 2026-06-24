@@ -10,6 +10,7 @@ import type { Credential as AppCredential } from "../auth/types.js";
 import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, exportAccounts, exportStore, importAccounts, maskApiKey } from "../auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
+import { queryQuota } from "../auth/quota.js";
 import { errorResponse } from "../proxy/handler.js";
 import { timingSafeEqual } from "../utils/crypto.js";
 import { atomicWriteFile, createMutex } from "../utils/fs.js";
@@ -638,6 +639,34 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       }
     } catch (err) {
       return errorResponse(500, "test_failed", (err as Error).message);
+    }
+  }
+
+  // Query upstream quota / balance for an account (v2.1.4.2+)
+  // Reverses the ZCode client's BigModelUsageQuotaProvider. start-plan queries
+  // zcode.z.ai billing with the JWT; coding-plan queries the provider's monitor
+  // quota/limit with the api key. Never throws — surface unavailableReason.
+  if (path === "/admin/api/accounts/quota" && method === "POST") {
+    try {
+      const body = await req.json() as { id?: string };
+      if (!body.id) return errorResponse(400, "missing_param", "id is required");
+      const store = await exportStore();
+      const acct = store?.accounts.find((a) => a.id === body.id);
+      if (!acct || !acct.credential) {
+        return errorResponse(404, "not_found", "Account not found");
+      }
+      const cred = acct.credential;
+      // Honour a per-account outbound proxy if configured, matching how real
+      // LLM requests are routed (proxy-test handler uses the same { proxy } opt).
+      const baseFetch = opts.fetchImpl ?? fetch;
+      const accountFetch = (cred.proxy && cred.proxy.trim()
+        ? ((input: RequestInfo | URL, init?: RequestInit) =>
+            baseFetch(input, { ...init, ...(cred.proxy ? { proxy: cred.proxy } : {}) } as any))
+        : baseFetch) as typeof fetch;
+      const result = await queryQuota(cred, accountFetch);
+      return jsonResp(result);
+    } catch (err) {
+      return errorResponse(500, "quota_failed", (err as Error).message);
     }
   }
 
