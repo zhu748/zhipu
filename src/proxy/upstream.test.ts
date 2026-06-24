@@ -194,7 +194,7 @@ describe("proxyRequest", () => {
     models: ["glm-4.6"],
     identity: IDENTITY,
     logging: { level: "info" },
-    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0 },
+    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
   };
 
   it("forwards request to upstream with injected auth", async () => {
@@ -332,7 +332,7 @@ describe("proxyRequest — OpenAI translation mode (coding-plan)", () => {
     models: ["glm-4.6"],
     identity: IDENTITY,
     logging: { level: "info" },
-    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0 },
+    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
   };
 
   function makeOpenAIReq(body: string, headers: Record<string, string> = {}): Request {
@@ -562,7 +562,7 @@ describe("proxyRequest — regression: Anthropic passthrough unchanged", () => {
     models: ["glm-4.6"],
     identity: IDENTITY,
     logging: { level: "info" },
-    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0 },
+    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
   };
 
   it("Anthropic client request uses decompress:false passthrough", async () => {
@@ -652,7 +652,7 @@ describe("proxyRequest — per-account outbound proxy (v2.1.4.1test5)", () => {
     models: ["glm-4.6"],
     identity: IDENTITY,
     logging: { level: "info" },
-    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0 },
+    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
   };
 
   const successBody = JSON.stringify({

@@ -727,7 +727,12 @@ export function maskApiKey(apiKey: string): string {
   return apiKey.slice(0, 8) + "..." + apiKey.slice(-4);
 }
 
-/** List all stored accounts (without exposing secret material — apiKey is masked). */
+/** List all stored accounts (without exposing secret material — apiKey is masked).
+ *
+ * Accounts are returned sorted by `createdAt` ascending (oldest first),
+ * matching the user's expectation that the account list reflects the order
+ * in which credentials were added. vceshi0.0.4+.
+ */
 export async function listAccounts(): Promise<{
   accounts: Array<Omit<StoredAccount, "credential"> & {
     provider: string;
@@ -739,14 +744,23 @@ export async function listAccounts(): Promise<{
     plan: string;
     /** Outbound HTTP proxy URL configured for this account (empty string if none). */
     proxy: string;
+    /** Human-readable name (vceshi0.0.4+). Empty string when not set — the
+     *  dashboard should fall back to `label` for display in that case. */
+    name: string;
+    /** OAuth account email (vceshi0.0.4+). Empty string for ZCode imports
+     *  and manually-added API keys (no email available in those flows). */
+    email: string;
   }>;
   activeId: string | null;
 }> {
   const store = await readStore();
   if (!store) return { accounts: [], activeId: null };
+  // Sort by createdAt ascending (oldest first). Array.prototype.sort is stable
+  // in modern V8/Bun, so accounts with identical createdAt keep insertion order.
+  const sortedAccounts = [...store.accounts].sort((a, b) => a.createdAt - b.createdAt);
   return {
     activeId: store.activeId,
-    accounts: store.accounts.map(a => ({
+    accounts: sortedAccounts.map(a => ({
       id: a.id,
       label: a.label,
       createdAt: a.createdAt,
@@ -766,6 +780,11 @@ export async function listAccounts(): Promise<{
       // direct connection — surfaced as "" rather than undefined so the
       // dashboard can always render the input with the current value.
       proxy: a.credential.proxy ?? "",
+      // vceshi0.0.4+: expose name/email for display + editing. Empty string
+      // (not undefined) so the dashboard can always render the input with
+      // the current value, mirroring the `proxy` field convention.
+      name: a.credential.name ?? "",
+      email: a.credential.email ?? "",
     })),
   };
 }
@@ -854,6 +873,82 @@ export async function setAccountProxy(id: string, proxy: string): Promise<boolea
   }
   await writeStore(store);
   return true;
+}
+
+/**
+ * Update an account's human-readable name (vceshi0.0.4+).
+ *
+ * Pass an empty string to clear the name — the dashboard will fall back to
+ * the auto-generated `label` for display. The name shows up in the account
+ * list "名称" column when set, otherwise the auto-generated label is shown.
+ */
+export async function setAccountName(id: string, name: string): Promise<boolean> {
+  const store = await readStore();
+  if (!store) return false;
+  const account = store.accounts.find(a => a.id === id);
+  if (!account) return false;
+  const trimmed = (name ?? "").trim();
+  if (trimmed) {
+    account.credential.name = trimmed;
+  } else {
+    // Clear the field entirely so the serialized credential stays clean.
+    delete account.credential.name;
+  }
+  await writeStore(store);
+  return true;
+}
+
+/**
+ * Update an account's email (vceshi0.0.4+).
+ *
+ * Pass an empty string to clear the email. No validation is performed here —
+ * the dashboard may do a basic format check, but we accept any string to
+ * accommodate edge cases (e.g. upstream returning a non-standard email format).
+ */
+export async function setAccountEmail(id: string, email: string): Promise<boolean> {
+  const store = await readStore();
+  if (!store) return false;
+  const account = store.accounts.find(a => a.id === id);
+  if (!account) return false;
+  const trimmed = (email ?? "").trim();
+  if (trimmed) {
+    account.credential.email = trimmed;
+  } else {
+    delete account.credential.email;
+  }
+  await writeStore(store);
+  return true;
+}
+
+/**
+ * Export a single account's full credential JSON (vceshi0.0.4+).
+ *
+ * Returns the account metadata (id/label/createdAt) plus the FULL credential
+ * (apiKey + secret + jwt + userId + plan + proxy + name + email) — suitable
+ * for backup/import on another machine. Returns null if the account id is
+ * not found.
+ *
+ * The exported JSON contains plaintext credentials — callers should treat it
+ * as sensitive (don't log it, recommend the user store it securely).
+ */
+export async function exportSingleAccount(id: string): Promise<{
+  id: string;
+  label: string;
+  createdAt: number;
+  credential: Credential;
+} | null> {
+  const store = await readStore();
+  if (!store) return null;
+  const account = store.accounts.find(a => a.id === id);
+  if (!account) return null;
+  // Return a deep copy so the caller can JSON.stringify without worrying
+  // about the in-memory cache being mutated.
+  return {
+    id: account.id,
+    label: account.label,
+    createdAt: account.createdAt,
+    credential: { ...account.credential },
+  };
 }
 
 /** Export all accounts (excluding encryption — returns plain JSON for backup). */

@@ -392,7 +392,10 @@ export async function proxyRequest(
     // EMPTY-STREAM counter: tracks consecutive empty-stream 529s with the
     // current credential. When it hits EMPTY_STREAM_SWITCH_THRESHOLD, switch
     // to the next credential (regardless of the generic switchThreshold).
-    const EMPTY_STREAM_SWITCH_THRESHOLD = 3;
+    // Threshold is configurable via config.retry.emptyStreamSwitchThreshold
+    // (env var: ZCODE_RETRY_EMPTY_STREAM_SWITCH_THRESHOLD). Default 3.
+    // Set to 0 to disable (fall back to the generic credentialSwitchThreshold).
+    const EMPTY_STREAM_SWITCH_THRESHOLD = config.retry.emptyStreamSwitchThreshold ?? 3;
     let consecutiveEmptyStreams = isEmptyStream529 ? 1 : 0;
     // Track whether we already forcibly bumped maxRetries to give the empty-stream
     // path enough attempts to cycle through alternative credentials. The user's
@@ -446,11 +449,13 @@ export async function proxyRequest(
       // values automatically on the next fetch.
       //
       // EMPTY-STREAM SHORTCUT: if we've seen EMPTY_STREAM_SWITCH_THRESHOLD
-      // (3) consecutive empty-stream 529s with the current credential,
+      // (default 3) consecutive empty-stream 529s with the current credential,
       // switch IMMEDIATELY regardless of switchThreshold. Empty streams are
       // a much stronger "credential is dead" signal than a generic 529, so
       // we don't make the user wait through 5 generic failures first.
-      const shouldSwitchForEmptyStream = isEmptyStream529 &&
+      // When EMPTY_STREAM_SWITCH_THRESHOLD is 0, the shortcut is disabled
+      // (falls back to the generic credentialSwitchThreshold only).
+      const shouldSwitchForEmptyStream = EMPTY_STREAM_SWITCH_THRESHOLD > 0 &&
         consecutiveEmptyStreams >= EMPTY_STREAM_SWITCH_THRESHOLD;
       if (shouldSwitchForEmptyStream ||
           (switchThreshold > 0 && consecutiveCredFailures >= switchThreshold)) {

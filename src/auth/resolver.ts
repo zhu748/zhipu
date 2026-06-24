@@ -123,6 +123,7 @@ export class KeyResolver {
     provider: ProviderId,
     userId?: string,
     plan: PlanId = "coding-plan",
+    email?: string,
   ): Promise<Credential> {
     if (provider === "zai") {
       const bizToken = await this.resolveZaiBizToken(accessToken);
@@ -136,7 +137,9 @@ export class KeyResolver {
         secret = await this.getSecretKey(host, authorization, orgId, projectId, apiKey);
       } catch { /* credential will be apiKey-only */ }
 
-      return { apiKey, secret: secret || undefined, provider: "zai", plan, userId };
+      const cred: Credential = { apiKey, secret: secret || undefined, provider: "zai", plan, userId };
+      if (email) cred.email = email;
+      return cred;
     }
 
     const host = "https://bigmodel.cn";
@@ -151,7 +154,9 @@ export class KeyResolver {
       if (secret) fullKey = `${apiKey}.${secret}`;
     } catch { /* use apiKey only */ }
 
-    return { apiKey: fullKey, provider: "bigmodel", plan, userId };
+    const cred: Credential = { apiKey: fullKey, provider: "bigmodel", plan, userId };
+    if (email) cred.email = email;
+    return cred;
   }
 
   /**
@@ -178,10 +183,11 @@ export class KeyResolver {
     userId: string | undefined,
     plan: PlanId,
     jwt?: string,
+    email?: string,
   ): Promise<Credential> {
     // coding-plan: no fallback — biz API is the only credential source.
     if (plan !== "start-plan") {
-      const cred = await this.resolveCodingPlanCredential(accessToken, provider, userId, plan);
+      const cred = await this.resolveCodingPlanCredential(accessToken, provider, userId, plan, email);
       if (jwt) cred.jwt = jwt;
       return cred;
     }
@@ -189,7 +195,7 @@ export class KeyResolver {
     // start-plan: try biz API for the decorative apiKey/secret, but tolerate
     // failure by falling back to a JWT-only credential.
     try {
-      const cred = await this.resolveCodingPlanCredential(accessToken, provider, userId, plan);
+      const cred = await this.resolveCodingPlanCredential(accessToken, provider, userId, plan, email);
       if (jwt) cred.jwt = jwt;
       return cred;
     } catch (err) {
@@ -209,6 +215,7 @@ export class KeyResolver {
         jwt,
         userId,
       };
+      if (email) cred.email = email;
       return cred;
     }
   }

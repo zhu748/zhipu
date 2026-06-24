@@ -888,7 +888,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>vceshi0.0.3</span>
+        <span>vceshi0.0.4</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1117,6 +1117,11 @@ td input{font-family:var(--font-mono)}
                   <input id="cfgRetryCredSwitch" type="number" min="0">
                   <div class="form-help">同一凭证连续失败此次数（含首次请求）后自动切换到另一个已存储的凭证。设为 0 禁用。需先在「账号管理」中添加多个账号。默认 5。</div>
                 </div>
+                <div class="form-group">
+                  <label class="form-label">空回切换阈值</label>
+                  <input id="cfgRetryEmptyStreamSwitch" type="number" min="0">
+                  <div class="form-help">同一凭证连续返回 200 空响应（额度耗尽特征）此次数后立即切换凭证，不等普通阈值。设为 0 禁用（回退到普通凭证切换阈值）。默认 3。仅多账号时生效。</div>
+                </div>
               </div>
             </div>
           </div>
@@ -1240,8 +1245,8 @@ td input{font-family:var(--font-mono)}
           </div>
           <div class="table-wrap">
             <table id="accountsTable">
-              <thead><tr><th>标签</th><th>提供商</th><th>套餐</th><th>API Key</th><th>创建时间</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
-              <tbody id="accountsList"><tr><td colspan="7"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">加载中...</div></div></td></tr></tbody>
+              <thead><tr><th>名称</th><th>提供商</th><th>套餐</th><th>API Key</th><th>邮箱</th><th>创建时间</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
+              <tbody id="accountsList"><tr><td colspan="8"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">加载中...</div></div></td></tr></tbody>
             </table>
           </div>
         </div>
@@ -1932,6 +1937,7 @@ async function loadSettings(){
     document.getElementById('cfgRetryBackoff').value=c.retry?.backoffFactor??2;
     document.getElementById('cfgRetryStatuses').value=(c.retry?.retryableStatuses||[529]).join(',');
     document.getElementById('cfgRetryCredSwitch').value=c.retry?.credentialSwitchThreshold??5;
+    document.getElementById('cfgRetryEmptyStreamSwitch').value=c.retry?.emptyStreamSwitchThreshold??3;
     document.getElementById('cfgAppVer').value=c.identity?.appVersion||'';
     document.getElementById('cfgSrcTitle').value=c.identity?.sourceTitle||'';
     document.getElementById('cfgReferer').value=c.identity?.refererOrigin||'';
@@ -1948,6 +1954,7 @@ async function saveSettings(){
   const backoffFactor=parseFloat(document.getElementById('cfgRetryBackoff').value);
   const statusesRaw=document.getElementById('cfgRetryStatuses').value;
   const credSwitch=parseInt(document.getElementById('cfgRetryCredSwitch').value,10);
+  const emptyStreamSwitch=parseInt(document.getElementById('cfgRetryEmptyStreamSwitch').value,10);
   // 与服务端 validateConfigForSave 一致：100-599
   const statuses=statusesRaw.split(',').map(s=>s.trim()).filter(Boolean)
     .map(s=>parseInt(s,10))
@@ -1972,6 +1979,10 @@ async function saveSettings(){
   if(Number.isFinite(credSwitch)&&credSwitch<0){
     toast('凭证切换阈值必须 >= 0（0 = 禁用）','error');return;
   }
+  // 空回切换阈值：非负整数，0 = 禁用（回退到普通阈值）
+  if(Number.isFinite(emptyStreamSwitch)&&emptyStreamSwitch<0){
+    toast('空回切换阈值必须 >= 0（0 = 禁用，回退到普通凭证切换阈值）','error');return;
+  }
 
   const cfg={
     server:{port:+document.getElementById('cfgPort').value,host:document.getElementById('cfgHost').value},
@@ -1989,6 +2000,7 @@ async function saveSettings(){
       backoffFactor:Number.isFinite(backoffFactor)&&backoffFactor>0?backoffFactor:2,
       retryableStatuses:statuses.length>0?statuses:[529],
       credentialSwitchThreshold:Number.isFinite(credSwitch)&&credSwitch>=0?credSwitch:5,
+      emptyStreamSwitchThreshold:Number.isFinite(emptyStreamSwitch)&&emptyStreamSwitch>=0?emptyStreamSwitch:3,
     },
     identity:{appVersion:document.getElementById('cfgAppVer').value,sourceTitle:document.getElementById('cfgSrcTitle').value,refererOrigin:document.getElementById('cfgReferer').value},
     logging:{level:document.getElementById('cfgLogLevel').value}
@@ -2086,7 +2098,7 @@ async function loadAccountsList(){
     filterAccounts();
   }catch(e){
     console.error('loadAccountsList failed:',e);
-    tb.innerHTML='<tr><td colspan="7"><div class="empty-state" style="color:var(--danger)">加载账号列表失败</div></td></tr>';
+    tb.innerHTML='<tr><td colspan="8"><div class="empty-state" style="color:var(--danger)">加载账号列表失败</div></td></tr>';
   }
 }
 
@@ -2126,11 +2138,11 @@ function filterAccounts(){
   }
   const activeId=_cachedActiveId;
   if(!_cachedAccounts.length){
-    tb.innerHTML='<tr><td colspan="7"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">暂无存储的账号</div><div class="empty-hint">请使用 OAuth 或"添加 API Key"创建</div></div></td></tr>';
+    tb.innerHTML='<tr><td colspan="8"><div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><div class="empty-text">暂无存储的账号</div><div class="empty-hint">请使用 OAuth 或"添加 API Key"创建</div></div></td></tr>';
     return;
   }
   if(!accounts.length){
-    tb.innerHTML='<tr><td colspan="7"><div class="empty-state"><div class="empty-text">没有匹配的账号</div><div class="empty-hint">尝试调整搜索条件或过滤器</div></div></td></tr>';
+    tb.innerHTML='<tr><td colspan="8"><div class="empty-state"><div class="empty-text">没有匹配的账号</div><div class="empty-hint">尝试调整搜索条件或过滤器</div></div></td></tr>';
     return;
   }
   tb.innerHTML=accounts.map(a=>{
@@ -2139,18 +2151,28 @@ function filterAccounts(){
     const planVal=a.plan||'coding-plan';
     const hasProxy=!!(a.proxy&&a.proxy.trim());
     const proxyBadge=hasProxy?`<span class="badge badge-info" title="${escapeHtml(a.proxy)}">代理</span> `:'';
+    // vceshi0.0.4+: 名称 column shows `name` if set, otherwise falls back
+    // to the auto-generated `label`. The label is still editable inline for
+    // backward compat (renames the auto-generated fallback), but the primary
+    // editable field is now `name` (via the edit modal).
+    const displayName=a.name||a.label;
+    const emailCell=a.email?`<span class="td-mute" title="${escapeHtml(a.email)}">${escapeHtml(a.email)}</span>`:'<span class="td-mute">—</span>';
     return `<tr>
-      <td><input value="${escapeHtml(a.label)}" onchange="renameAccount('${escapeHtml(a.id)}',this.value)"></td>
+      <td><input value="${escapeHtml(displayName)}" onchange="renameAccount('${escapeHtml(a.id)}',this.value)" title="${a.name?'编辑名称（清空将回退到自动标签）':'编辑自动标签'}"></td>
       <td><span class="badge badge-info">${escapeHtml(a.provider)}</span></td>
       <td><select onchange="changePlan('${escapeHtml(a.id)}',this.value)"><option value="coding-plan"${planVal==='coding-plan'?' selected':''}>Coding</option><option value="start-plan"${planVal==='start-plan'?' selected':''}>Start</option></select></td>
       <td class="td-mono">${proxyBadge}${escapeHtml(a.apiKeyMask)}${a.hasSecret?' <span class="badge badge-success">secret</span>':''}${a.hasJwt?' <span class="badge badge-success">jwt</span>':''}</td>
+      <td>${emailCell}</td>
       <td class="td-mute">${escapeHtml(created)}</td>
       <td>${isActive?'<span class="badge badge-success"><span class="badge-dot"></span>已激活</span>':'<span class="badge badge-muted">未激活</span>'}</td>
       <td class="td-actions">
+        <button class="btn btn-ghost btn-sm" onclick="openAccountDetail('${escapeHtml(a.id)}')" title="查看完整凭证信息">查看</button>
+        <button class="btn btn-ghost btn-sm" onclick="openEditModal('${escapeHtml(a.id)}')" title="编辑名称和邮箱">编辑</button>
+        <button class="btn btn-ghost btn-sm" onclick="exportSingleAccountJson('${escapeHtml(a.id)}')" title="导出此账号的 JSON 凭证">导出</button>
         <button class="btn btn-ghost btn-sm" onclick="checkQuota('${escapeHtml(a.id)}')" title="查询上游额度">额度</button>
         <button class="btn btn-ghost btn-sm" onclick="openProxyModal('${escapeHtml(a.id)}','${escapeHtml(a.proxy||'')}',this.getAttribute('data-provider'))" data-provider="${escapeHtml(a.provider)}" title="配置代理">代理</button>
         ${isActive?'':`<button class="btn btn-primary btn-sm" onclick="activateAccount('${escapeHtml(a.id)}')">激活</button> `}
-        <button class="btn btn-danger btn-sm" onclick="deleteAccount('${escapeHtml(a.id)}','${escapeHtml(a.label).replace(/'/g,'\\\'')}')">删除</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteAccount('${escapeHtml(a.id)}','${escapeHtml(displayName).replace(/'/g,'\\\'')}')">删除</button>
       </td>
     </tr>`;
   }).join('');
@@ -2205,6 +2227,196 @@ async function changeProxy(id,proxy){
       loadAccountsList();
     }
   }catch(e){console.error('changeProxy failed:',e);toast('代理更新失败','error');loadAccountsList()}
+}
+
+// ============================================================
+// Per-account detail modal + edit modal + JSON export (vceshi0.0.4+)
+// ============================================================
+// Detail modal: read-only view of all credential fields (including full apiKey
+// when user clicks "show"). Edit modal: change name + email only (the only
+// fields the user is allowed to edit post-creation). JSON export: downloads
+// a single account's full credential JSON as a file.
+
+/** Open a read-only detail modal showing all credential info. */
+async function openAccountDetail(id){
+  try{
+    const r=await fetch(API+'/admin/api/accounts/export-single?id='+encodeURIComponent(id),{headers:authHeaders()});
+    if(!r.ok){
+      const d=await r.json().catch(()=>({}));
+      toast(d.error||'查看失败','error');return;
+    }
+    const d=await r.json();
+    const acc=d.account;
+    if(!acc){toast('账号不存在','error');return;}
+    const cred=acc.credential||{};
+    const created=new Date(acc.createdAt).toLocaleString();
+    // Build a structured key-value table for display. Sensitive fields
+    // (apiKey/secret/jwt) are masked by default with a "show" toggle.
+    const rows=[
+      ['名称',cred.name||acc.label||'(无)'],
+      ['自动标签',acc.label],
+      ['邮箱',cred.email||'(无)'],
+      ['提供商',cred.provider],
+      ['套餐',cred.plan||'(未设置)'],
+      ['创建时间',created],
+      ['账号 ID',acc.id],
+      ['API Key',{secret:cred.apiKey,mask:maskForDisplay(cred.apiKey)}],
+      ['Secret',cred.secret?{secret:cred.secret,mask:maskForDisplay(cred.secret)}:'(无)'],
+      ['JWT',cred.jwt?{secret:cred.jwt,mask:cred.jwt.substring(0,12)+'...'}:'(无)'],
+      ['User ID',cred.userId||'(无)'],
+      ['代理',cred.proxy||'(无)'],
+    ];
+    const rowsHtml=rows.map(([k,v])=>{
+      if(v&&typeof v==='object'&&v.secret){
+        // Sensitive field with show/hide toggle
+        const fieldId='secret-'+k.replace(/[^a-zA-Z0-9]/g,'')+'-'+Date.now();
+        return `<tr><td class="td-mute">${k}</td><td><span class="td-mono" id="${fieldId}">${escapeHtml(v.mask)}</span> <button class="btn btn-ghost btn-sm" onclick="toggleSecret('${fieldId}','${escapeHtml(v.secret).replace(/'/g,"\\'")}')">显示</button></td></tr>`;
+      }
+      return `<tr><td class="td-mute">${k}</td><td>${escapeHtml(String(v))}</td></tr>`;
+    }).join('');
+    const html=`<div class="modal-overlay" onclick="if(event.target===this)closeModal('accountDetailModal')">
+      <div class="modal" style="max-width:640px">
+        <div class="modal-header">
+          <h3>账号详情</h3>
+          <button class="modal-close" onclick="closeModal('accountDetailModal')">×</button>
+        </div>
+        <div class="modal-body">
+          <table style="width:100%;font-size:13px"><tbody>${rowsHtml}</tbody></table>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-primary" onclick="closeModal('accountDetailModal')">关闭</button>
+        </div>
+      </div>
+    </div>`;
+    showModal('accountDetailModal',html);
+  }catch(e){console.error('openAccountDetail failed:',e);toast('查看失败','error')}
+}
+
+/** Mask a sensitive string for display: show first 8 + last 4 chars. */
+function maskForDisplay(s){
+  if(!s)return '';
+  if(s.length<=12)return s;
+  return s.substring(0,8)+'...'+s.slice(-4);
+}
+
+/** Toggle a secret field between masked and plaintext. */
+function toggleSecret(fieldId,fullValue){
+  const el=document.getElementById(fieldId);
+  if(!el)return;
+  if(el.dataset.revealed==='1'){
+    el.textContent=maskForDisplay(fullValue);
+    el.dataset.revealed='0';
+    el.nextElementSibling.textContent='显示';
+  }else{
+    el.textContent=fullValue;
+    el.dataset.revealed='1';
+    el.nextElementSibling.textContent='隐藏';
+  }
+}
+
+/** Open the edit modal to change name + email. */
+async function openEditModal(id){
+  // Find the account in the cached list to pre-fill the form
+  const acc=_cachedAccounts.find(a=>a.id===id);
+  if(!acc){toast('账号不存在','error');return;}
+  const currentName=acc.name||'';
+  const currentEmail=acc.email||'';
+  const html=`<div class="modal-overlay" onclick="if(event.target===this)closeModal('editModal')">
+    <div class="modal" style="max-width:480px">
+      <div class="modal-header">
+        <h3>编辑账号</h3>
+        <button class="modal-close" onclick="closeModal('editModal')">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label class="form-label">名称</label>
+          <input id="editName" value="${escapeHtml(currentName)}" placeholder="留空则使用自动生成的标签">
+          <div class="form-help">账号显示名称。OAuth 登录时自动设为「邮箱-套餐」；ZCode 导入时自动设为「zcode(N)-套餐」。可手动修改。</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">邮箱</label>
+          <input id="editEmail" value="${escapeHtml(currentEmail)}" placeholder="留空表示无邮箱">
+          <div class="form-help">OAuth 登录时自动从回调获取。ZCode 导入和手动添加的 Key 默认无邮箱。可手动修改。</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('editModal')">取消</button>
+        <button class="btn btn-primary" onclick="saveAccountEdit('${escapeHtml(id)}')">保存</button>
+      </div>
+    </div>
+  </div>`;
+  showModal('editModal',html);
+}
+
+/** Save name + email from the edit modal. */
+async function saveAccountEdit(id){
+  const name=document.getElementById('editName').value;
+  const email=document.getElementById('editEmail').value;
+  try{
+    const r=await fetch(API+'/admin/api/accounts/edit',{method:'PUT',headers:authHeaders(),body:JSON.stringify({id,name,email})});
+    if(r.ok){
+      toast('账号已更新','success');
+      closeModal('editModal');
+      loadAccountInfo();loadAccountsList();loadCredStore();
+    }else{
+      const d=await r.json().catch(()=>({}));
+      toast(d.error||'保存失败','error');
+    }
+  }catch(e){console.error('saveAccountEdit failed:',e);toast('保存失败','error')}
+}
+
+/** Export a single account's full credential JSON as a downloadable file. */
+async function exportSingleAccountJson(id){
+  try{
+    const r=await fetch(API+'/admin/api/accounts/export-single?id='+encodeURIComponent(id),{headers:authHeaders()});
+    if(!r.ok){
+      const d=await r.json().catch(()=>({}));
+      toast(d.error||'导出失败','error');return;
+    }
+    const d=await r.json();
+    const acc=d.account;
+    if(!acc){toast('账号不存在','error');return;}
+    // Build a clean JSON object: account metadata + full credential
+    const exportObj={
+      id:acc.id,
+      label:acc.label,
+      name:acc.credential?.name||null,
+      email:acc.credential?.email||null,
+      createdAt:acc.createdAt,
+      credential:acc.credential,
+    };
+    const jsonStr=JSON.stringify(exportObj,null,2);
+    // Trigger browser download
+    const blob=new Blob([jsonStr],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    // Filename: use name or label, sanitize for filesystem
+    const baseName=(acc.credential?.name||acc.label||'account').replace(/[^a-zA-Z0-9_\-.@]/g,'_');
+    a.href=url;
+    a.download=`${baseName}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast('已导出 JSON 文件','success');
+  }catch(e){console.error('exportSingleAccountJson failed:',e);toast('导出失败','error')}
+}
+
+/** Show a modal by injecting HTML into a container div. */
+function showModal(containerId,html){
+  let container=document.getElementById(containerId);
+  if(!container){
+    container=document.createElement('div');
+    container.id=containerId;
+    document.body.appendChild(container);
+  }
+  container.innerHTML=html;
+}
+
+/** Close a modal by clearing its container. */
+function closeModal(containerId){
+  const container=document.getElementById(containerId);
+  if(container)container.innerHTML='';
 }
 
 // ============================================================

@@ -1,5 +1,31 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.0.4 — 空回阈值可配置 + 凭证名称/邮箱 + 单账号导出（测试版）**
+>
+> 用户反馈：3 次空回切换凭证的阈值应该可配置；凭证 JSON 格式应该有 name + email；账号管理 UI 应该可以查看/编辑/导出单账号。本版全部实现。
+>
+> **1. 空回切换阈值可在面板配置**
+> - 之前：硬编码 3 次，用户无法调整。
+> - 现在：dashboard「重试配置」标签页新增「空回切换阈值」输入框（默认 3，设为 0 禁用回退到普通凭证切换阈值）。YAML 配置 `retry.emptyStreamSwitchThreshold`，环境变量 `ZCODE_RETRY_EMPTY_STREAM_SWITCH_THRESHOLD`。
+>
+> **2. 凭证 JSON 格式增加 name + email 字段**
+> - OAuth 登录：自动从回调响应的 `data.user.email` 提取邮箱，名称自动命名为 `邮箱-套餐`（如 `alice@x.com-start-plan`）。
+> - ZCode 导入：邮箱为空，名称自动命名为 `zcode(N)-套餐`（N = 当前已导入的 zcode 账号数 + 1，如 `zcode(1)-coding-plan`）。
+> - 手动添加 API Key：name 和 email 都为空，dashboard 显示自动生成的标签作 fallback。
+> - dashboard「账号管理」表头从「标签」改为「名称」，按凭证创建时间正序排（最旧的排最前），无 name 时回退到自动 label。
+>
+> **3. 账号管理每行新增 查看/编辑/导出 按钮**
+> - **查看**：模态框显示完整凭证信息（含 API Key/Secret/JWT 的「显示/隐藏」切换）。
+> - **编辑**：模态框可改 name + email（保存即生效，热替换内存凭证）。
+> - **导出**：浏览器下载该账号的完整 JSON 凭证文件，文件名 = 名称或标签，含完整 apiKey/secret/jwt/email/name — 可用于备份或迁移到其他机器。
+>
+> **4. 新增环境变量**
+> - `ZCODE_RETRY_EMPTY_STREAM_SWITCH_THRESHOLD` — 空回切换阈值，默认 3
+>
+> 全套 445 测试通过（vceshi0.0.3 是 430），TypeScript 类型检查零错误。
+>
+> ---
+
 > **vceshi0.0.3 — 凭证加密根因修复 + 空回重试 + Dashboard 优化（测试版）**
 >
 > 一次性修复 vceshi0.0.2 暴露的 6 个用户痛点 + UI 优化。所有改动都有回归测试覆盖（430 测试通过，TypeScript 类型检查零错误）。

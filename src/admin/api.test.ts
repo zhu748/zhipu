@@ -23,7 +23,8 @@ import {
 } from "./api.js";
 import type { ProxyConfig } from "../config/types.js";
 import { AuthManager } from "../auth/manager.js";
-import { saveCredential, clearCredential } from "../auth/store.js";
+import { saveCredential, clearCredential, listAccounts, _resetKeyCacheForTesting } from "../auth/store.js";
+import type { Credential } from "../auth/types.js";
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -43,7 +44,7 @@ function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
     models: ["glm-4.6"],
     identity: { appVersion: "test-1.0.0", sourceTitle: "cli", refererOrigin: "https://zcode.z.ai" },
     logging: { level: "info" },
-    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0 },
+    retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
     ...overrides,
   };
 }
@@ -396,7 +397,7 @@ describe("/admin/api/config PUT — validation", () => {
       body: JSON.stringify({
         provider: "zai", plan: "coding-plan",
         defaultModel: "glm-4.6", models: ["glm-4.6"],
-        retry: { maxRetries: 50, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0 },
+        retry: { maxRetries: 50, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
       }),
     }), opts);
     expect(resp!.status).toBe(200);
@@ -411,7 +412,7 @@ describe("/admin/api/config PUT — validation", () => {
       body: JSON.stringify({
         provider: "zai", plan: "coding-plan",
         defaultModel: "glm-4.6", models: ["glm-4.6"],
-        retry: { maxRetries: -1, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0 },
+        retry: { maxRetries: -1, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
       }),
     }), opts);
     expect(resp!.status).toBe(500);
@@ -426,7 +427,7 @@ describe("/admin/api/config PUT — validation", () => {
       body: JSON.stringify({
         provider: "zai", plan: "coding-plan",
         defaultModel: "glm-4.6", models: ["glm-4.6"],
-        retry: { maxRetries: 3, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: -1 },
+        retry: { maxRetries: 3, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: -1, emptyStreamSwitchThreshold: 3 },
       }),
     }), opts);
     expect(resp!.status).toBe(500);
@@ -441,7 +442,7 @@ describe("/admin/api/config PUT — validation", () => {
       body: JSON.stringify({
         provider: "zai", plan: "coding-plan",
         defaultModel: "glm-4.6", models: ["glm-4.6"],
-        retry: { maxRetries: 3, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0 },
+        retry: { maxRetries: 3, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
       }),
     }), opts);
     expect(resp!.status).toBe(200);
@@ -489,7 +490,7 @@ describe("/admin/api/config PUT — requiresRestart detection", () => {
         defaultModel: "glm-4.6", models: ["glm-4.6"],
         identity: { appVersion: "1.0", sourceTitle: "cli", refererOrigin: "https://z.ai" },
         logging: { level: "info" },
-        retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0 },
+        retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
       }),
     }), opts);
     const body = await resp!.json();
@@ -507,7 +508,7 @@ describe("/admin/api/config PUT — requiresRestart detection", () => {
         defaultModel: "glm-4.6", models: ["glm-4.6"],
         identity: { appVersion: "1.0", sourceTitle: "cli", refererOrigin: "https://z.ai" },
         logging: { level: "info" },
-        retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0 },
+        retry: { maxRetries: 0, initialDelayMs: 1000, maxDelayMs: 8000, backoffFactor: 2, retryableStatuses: [529], credentialSwitchThreshold: 0, emptyStreamSwitchThreshold: 3 },
       }),
     }), opts);
     const body = await resp!.json();
@@ -1069,5 +1070,143 @@ describe("/admin/api/accounts/proxy-test — proxy connectivity check", () => {
     // completes normally. We only assert the response shape.
     expect(typeof body.ok).toBe("boolean");
     expect(typeof body.latencyMs).toBe("number");
+  });
+});
+
+// /admin/api/accounts/edit + /admin/api/accounts/export-single (vceshi0.0.4+)
+describe("/admin/api/accounts/edit — name/email editing", () => {
+  beforeEach(() => {
+    clearCredential();
+    _resetKeyCacheForTesting();
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "test-secret-for-edit";
+  });
+  afterEach(() => {
+    clearCredential();
+    _resetKeyCacheForTesting();
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+  });
+
+  it("returns 400 when id is missing", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/accounts/edit", {
+        method: "PUT",
+        body: JSON.stringify({ name: "x" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+    const body = await resp!.json();
+    expect(body.error.type).toBe("missing_param");
+  });
+
+  it("returns 400 when neither name nor email is provided", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/accounts/edit", {
+        method: "PUT",
+        body: JSON.stringify({ id: "some-id" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+  });
+
+  it("updates name + email for an existing account", async () => {
+    // First save a credential to get a real account id
+    await saveCredential({ apiKey: "test-key-edit", provider: "zai" });
+    const list = await listAccounts();
+    const id = list.accounts[0].id;
+
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/accounts/edit", {
+        method: "PUT",
+        body: JSON.stringify({ id, name: "edited-name", email: "edited@x.com" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+    expect(body.ok).toBe(true);
+
+    // Verify the update persisted
+    const list2 = await listAccounts();
+    expect(list2.accounts[0].name).toBe("edited-name");
+    expect(list2.accounts[0].email).toBe("edited@x.com");
+  });
+
+  it("returns 404 for unknown account id", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/accounts/edit", {
+        method: "PUT",
+        body: JSON.stringify({ id: "nonexistent-id", name: "x" }),
+      }),
+      opts,
+    );
+    expect(resp!.status).toBe(404);
+  });
+});
+
+describe("/admin/api/accounts/export-single — single account JSON export", () => {
+  beforeEach(() => {
+    clearCredential();
+    _resetKeyCacheForTesting();
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "test-secret-for-export";
+  });
+  afterEach(() => {
+    clearCredential();
+    _resetKeyCacheForTesting();
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+  });
+
+  it("returns 400 when id query param is missing", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/accounts/export-single", { method: "GET" }),
+      opts,
+    );
+    expect(resp!.status).toBe(400);
+  });
+
+  it("returns 404 for unknown account id", async () => {
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq("/admin/api/accounts/export-single?id=nonexistent", { method: "GET" }),
+      opts,
+    );
+    expect(resp!.status).toBe(404);
+  });
+
+  it("exports full account JSON including secrets", async () => {
+    const cred: Credential = {
+      apiKey: "export-test-key-1234567890",
+      secret: "secret-abc",
+      provider: "zai",
+      plan: "coding-plan",
+      userId: "user-xyz",
+      name: "bob@x.com-coding-plan",
+      email: "bob@x.com",
+    };
+    await saveCredential(cred);
+    const list = await listAccounts();
+    const id = list.accounts[0].id;
+
+    const opts = makeAdminOpts();
+    const resp = await handleAdminRoute(
+      authedReq(`/admin/api/accounts/export-single?id=${id}`, { method: "GET" }),
+      opts,
+    );
+    expect(resp!.status).toBe(200);
+    const body = await resp!.json();
+    expect(body.ok).toBe(true);
+    expect(body.account).toBeDefined();
+    expect(body.account.id).toBe(id);
+    // Full credential with secrets (NOT masked)
+    expect(body.account.credential.apiKey).toBe("export-test-key-1234567890");
+    expect(body.account.credential.secret).toBe("secret-abc");
+    expect(body.account.credential.email).toBe("bob@x.com");
+    expect(body.account.credential.name).toBe("bob@x.com-coding-plan");
   });
 });

@@ -38,6 +38,26 @@ export interface Credential {
    * Introduced in v2.1.4.1test5 for per-account proxy support.
    */
   proxy?: string;
+  /**
+   * Human-readable name for this credential (vceshi0.0.4+).
+   *
+   * OAuth flow: auto-generated as `{email}-{plan}` (e.g. "alice@x.com-start-plan").
+   * ZCode import: auto-generated as `zcode(N)-{plan}` where N is the count of
+   *   existing zcode-imported accounts + 1 (e.g. "zcode(1)-coding-plan").
+   * Manual add: empty (dashboard shows the auto-generated label as fallback).
+   *
+   * The dashboard's account list prefers `name` over the auto-generated `label`
+   * when both are present. Empty `name` falls back to `label` for display.
+   */
+  name?: string;
+  /**
+   * Email associated with the OAuth account (vceshi0.0.4+).
+   *
+   * Captured from the OAuth callback response (`data.user.email`). Empty for
+   * ZCode imports and manually-added API keys (no email information available
+   * in those flows). Editable via the dashboard.
+   */
+  email?: string;
 }
 
 /**

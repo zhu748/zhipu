@@ -22,6 +22,7 @@ const ENV = {
   RETRY_BACKOFF_FACTOR: "ZCODE_RETRY_BACKOFF_FACTOR",
   RETRY_STATUSES: "ZCODE_RETRY_STATUSES",
   RETRY_CREDENTIAL_SWITCH_THRESHOLD: "ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD",
+  RETRY_EMPTY_STREAM_SWITCH_THRESHOLD: "ZCODE_RETRY_EMPTY_STREAM_SWITCH_THRESHOLD",
 } as const;
 
 const DEFAULTS = {
@@ -44,6 +45,7 @@ const DEFAULTS = {
   RETRY_BACKOFF_FACTOR: 2,
   RETRY_STATUSES: [529],
   RETRY_CREDENTIAL_SWITCH_THRESHOLD: 5,
+  RETRY_EMPTY_STREAM_SWITCH_THRESHOLD: 3,
 };
 
 /** Printable-ASCII gate copied from the ZCode bundle's `rYn` helper. */
@@ -237,7 +239,15 @@ function resolveRetry(raw?: unknown): RetryConfig {
     DEFAULTS.RETRY_CREDENTIAL_SWITCH_THRESHOLD,
   );
 
-  return { maxRetries, initialDelayMs, maxDelayMs, backoffFactor, retryableStatuses, credentialSwitchThreshold };
+  // emptyStreamSwitchThreshold (vceshi0.0.4+): number of consecutive
+  // empty-stream 529s before forcing a credential switch. Defaults to 3.
+  // Set to 0 to disable (fall back to the generic credentialSwitchThreshold).
+  const emptyStreamSwitchThreshold = resolveNonNegativeInt(
+    process.env[ENV.RETRY_EMPTY_STREAM_SWITCH_THRESHOLD] ?? r.emptyStreamSwitchThreshold,
+    DEFAULTS.RETRY_EMPTY_STREAM_SWITCH_THRESHOLD,
+  );
+
+  return { maxRetries, initialDelayMs, maxDelayMs, backoffFactor, retryableStatuses, credentialSwitchThreshold, emptyStreamSwitchThreshold };
 }
 
 /** Resolve a non-negative integer from a raw value, falling back to default. */

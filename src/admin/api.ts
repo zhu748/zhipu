@@ -7,7 +7,7 @@
 import type { ProxyConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
-import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, exportAccounts, exportStore, importAccounts, maskApiKey, invalidateStoreCache } from "../auth/store.js";
+import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, setAccountName, setAccountEmail, exportSingleAccount, exportAccounts, exportStore, importAccounts, maskApiKey, invalidateStoreCache } from "../auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { queryQuota } from "../auth/quota.js";
@@ -742,6 +742,71 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   //     multi: boolean, accountCount: number, instructions: <string> }
   // The `credential` field is what you paste into Render's ZCODE_OAUTH_CREDENTIAL.
   // The `json` field is the decoded payload for human inspection.
+  // ---------------------------------------------------------------------
+  // vceshi0.0.4+: Edit account name/email + export single account JSON
+  // ---------------------------------------------------------------------
+
+  // Edit account name/email (vceshi0.0.4+).
+  // Body: { id, name?, email? } — only provided fields are updated; omitted
+  // fields preserve their current value. Empty string clears the field.
+  if (path === "/admin/api/accounts/edit" && method === "PUT") {
+    try {
+      const body = await req.json() as { id?: string; name?: string; email?: string };
+      if (!body.id) {
+        return errorResponse(400, "missing_param", "id is required");
+      }
+      // At least one of name/email must be provided (otherwise the call is a no-op).
+      if (body.name === undefined && body.email === undefined) {
+        return errorResponse(400, "missing_param", "At least one of name or email must be provided");
+      }
+
+      // Update name if provided (including empty string to clear)
+      if (body.name !== undefined) {
+        const ok = await setAccountName(body.id, body.name);
+        if (!ok) return errorResponse(404, "not_found", "Account not found");
+      }
+      // Update email if provided (including empty string to clear)
+      if (body.email !== undefined) {
+        const ok = await setAccountEmail(body.id, body.email);
+        if (!ok) return errorResponse(404, "not_found", "Account not found");
+      }
+
+      // If the active account was edited, hot-swap the in-memory credential so
+      // the new name/email take effect immediately for any running requests
+      // (email is read by some upstreams via metadata.user_id — though name
+      // is purely for display, hot-swapping is cheap and keeps things consistent).
+      invalidateStoreCache();
+      const cred = await loadCredential();
+      if (cred) opts.auth.setOAuthCredential(cred);
+
+      appendLog("info", `Account ${body.id} edited (name=${body.name !== undefined ? "updated" : "kept"}, email=${body.email !== undefined ? "updated" : "kept"})`);
+      return jsonResp({ ok: true });
+    } catch (err) {
+      return errorResponse(500, "edit_failed", (err as Error).message);
+    }
+  }
+
+  // Export single account as JSON (vceshi0.0.4+).
+  // Query param: ?id=<accountId>
+  // Returns the full account record including plaintext credential — caller
+  // should treat the response as sensitive (recommend downloading as a file
+  // rather than logging).
+  if (path === "/admin/api/accounts/export-single" && method === "GET") {
+    try {
+      const id = url.searchParams.get("id");
+      if (!id) {
+        return errorResponse(400, "missing_param", "id query param is required");
+      }
+      const account = await exportSingleAccount(id);
+      if (!account) {
+        return errorResponse(404, "not_found", "Account not found");
+      }
+      return jsonResp({ ok: true, account });
+    } catch (err) {
+      return errorResponse(500, "export_failed", (err as Error).message);
+    }
+  }
+
   if (path === "/admin/api/accounts/render-export" && method === "GET") {
     try {
       const store = await exportStore();
@@ -873,9 +938,15 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         (async () => {
           try {
             const authCode = await oauth.waitForCallback(300_000);
-            const { accessToken, userId, jwt } = await oauth.exchangeCode(authCode, callbackUrl, state);
+            const { accessToken, userId, jwt, email } = await oauth.exchangeCode(authCode, callbackUrl, state);
             const resolver = new KeyResolver();
-            const cred = await resolver.resolveCredential(accessToken, provider, userId, oauthPlan, jwt);
+            const cred = await resolver.resolveCredential(accessToken, provider, userId, oauthPlan, jwt, email);
+            // Auto-generate name from email + plan (vceshi0.0.4+).
+            // Falls back to no name (label will be auto-generated by store) if
+            // email is missing — e.g. older OAuth responses without email field.
+            if (email) {
+              cred.name = `${email}-${oauthPlan}`;
+            }
             // keepActive:true — do NOT silently swap the user's currently-active
             // credential out from under them. The new account appears in the
             // dashboard list; the user explicitly clicks "Activate" to switch.
@@ -927,9 +998,13 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       (async () => {
         try {
           const authCode = await oauth.waitForCallback(init.expiresAt - Date.now() || 300_000);
-          const { accessToken, userId, jwt } = await oauth.exchangeCode(authCode, init.callbackUrl, init.state);
+          const { accessToken, userId, jwt, email } = await oauth.exchangeCode(authCode, init.callbackUrl, init.state);
           const resolver = new KeyResolver();
-          const cred = await resolver.resolveCredential(accessToken, provider, userId, oauthPlan, jwt);
+          const cred = await resolver.resolveCredential(accessToken, provider, userId, oauthPlan, jwt, email);
+          // Auto-generate name from email + plan (vceshi0.0.4+).
+          if (email) {
+            cred.name = `${email}-${oauthPlan}`;
+          }
           // keepActive:true — see bigmodel path comment above.
           await saveCredential(cred, { keepActive: true });
           const existingActive = await loadCredential();
@@ -1013,10 +1088,14 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         if (state !== flow.state) {
           return errorResponse(400, "state_mismatch", "Callback state does not match the OAuth flow. Please restart the login.");
         }
-        const { accessToken, userId, jwt } = await oauth.exchangeCode(code, storedCallbackUrl, state);
+        const { accessToken, userId, jwt, email } = await oauth.exchangeCode(code, storedCallbackUrl, state);
         const resolver = new KeyResolver();
         const flowPlan = ((flow as any).plan ?? "coding-plan") as "coding-plan" | "start-plan";
-        const cred = await resolver.resolveCredential(accessToken, "zai", userId, flowPlan, jwt);
+        const cred = await resolver.resolveCredential(accessToken, "zai", userId, flowPlan, jwt, email);
+        // Auto-generate name from email + plan (vceshi0.0.4+).
+        if (email) {
+          cred.name = `${email}-${flowPlan}`;
+        }
         // keepActive:true — manual callback path matches auto-poll path behavior.
         await saveCredential(cred, { keepActive: true });
         const existingActive = await loadCredential();
@@ -1045,10 +1124,14 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         if (!storedCallbackUrl) {
           return errorResponse(500, "missing_callback", "Original localhost callback URL not found. Please restart the login.");
         }
-        const { accessToken, userId, jwt } = await oauth.exchangeCode(code, storedCallbackUrl, state);
+        const { accessToken, userId, jwt, email } = await oauth.exchangeCode(code, storedCallbackUrl, state);
         const resolver = new KeyResolver();
         const flowPlan = ((flow as any).plan ?? "coding-plan") as "coding-plan" | "start-plan";
-        const cred = await resolver.resolveCredential(accessToken, "bigmodel", userId, flowPlan, jwt);
+        const cred = await resolver.resolveCredential(accessToken, "bigmodel", userId, flowPlan, jwt, email);
+        // Auto-generate name from email + plan (vceshi0.0.4+).
+        if (email) {
+          cred.name = `${email}-${flowPlan}`;
+        }
         // keepActive:true — matches zai manual path + auto-poll path behavior.
         await saveCredential(cred, { keepActive: true });
         const existingActive = await loadCredential();

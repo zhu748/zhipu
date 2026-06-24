@@ -91,6 +91,22 @@ export interface RetryConfig {
    * Default: 5
    */
   credentialSwitchThreshold: number;
+  /**
+   * Number of consecutive empty-stream 529 responses (HTTP 200 + text/event-stream
+   * with zero SSE events — the typical "quota exhausted" signature) with the same
+   * credential before automatically switching to another stored credential.
+   *
+   * This is separate from `credentialSwitchThreshold` because empty-stream is a
+   * high-confidence "this credential is dead" signal — we don't want to wait
+   * through 5 generic failures first. Set to 0 to disable (fall back to the
+   * generic threshold). Set to 1 to switch immediately on the first empty stream.
+   *
+   * Only effective when more than one credential is stored (multi-account mode).
+   * Default: 3
+   *
+   * Environment variable: ZCODE_RETRY_EMPTY_STREAM_SWITCH_THRESHOLD
+   */
+  emptyStreamSwitchThreshold: number;
 }
 
 /** Custom routing rule — overrides the default provider/endpoint for requests

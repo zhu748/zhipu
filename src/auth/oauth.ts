@@ -72,6 +72,10 @@ export interface OAuthResult {
   userId?: string;
   /** ZCode plan JWT for start-plan (zcode.z.ai). The OAuth poll/exchange response includes this alongside the provider access_token. */
   jwt?: string;
+  /** User email captured from the OAuth callback response (`data.user.email`).
+   *  Used to auto-generate the credential name as `{email}-{plan}`. Optional
+   *  because some OAuth responses (or older versions) don't include it. */
+  email?: string;
 }
 
 export type FetchFn = typeof fetch;
@@ -268,7 +272,7 @@ export class ZaiOAuthClient {
     authCode: string,
     redirectUri: string,
     state: string,
-  ): Promise<{ accessToken: string; userId?: string; jwt?: string }> {
+  ): Promise<{ accessToken: string; userId?: string; jwt?: string; email?: string }> {
     const resp = await this.fetchImpl(`${ZCODE_OAUTH_BASE}/oauth/token`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -283,7 +287,8 @@ export class ZaiOAuthClient {
     const raw = safeJsonParse(await resp.text()) as ZaiEnvelope & {
       data?: {
         token?: string;
-        user?: { user_id?: string };
+        user?: { user_id?: string; email?: string };
+        email?: string;
         zai?: { access_token?: string };
       };
     } | null;
@@ -300,7 +305,13 @@ export class ZaiOAuthClient {
     }
     const userId = raw?.data?.user?.user_id;
     const jwt = raw?.data?.token?.trim() ?? undefined;
-    return { accessToken, userId: typeof userId === "string" ? userId : undefined, jwt };
+    const email = raw?.data?.user?.email ?? raw?.data?.email;
+    return {
+      accessToken,
+      userId: typeof userId === "string" ? userId : undefined,
+      jwt,
+      email: typeof email === "string" ? email.trim() || undefined : undefined,
+    };
   }
 
   /** Run the full Z.AI OAuth flow: start → wait → exchange. Closes the server on exit. */
@@ -312,8 +323,8 @@ export class ZaiOAuthClient {
     onAuthorizeUrl?.(init.authorizeUrl);
     try {
       const authCode = await this.waitForCallback(timeoutMs);
-      const { accessToken, userId, jwt } = await this.exchangeCode(authCode, init.callbackUrl, init.state);
-      return { accessToken, provider: "zai", userId, jwt };
+      const { accessToken, userId, jwt, email } = await this.exchangeCode(authCode, init.callbackUrl, init.state);
+      return { accessToken, provider: "zai", userId, jwt, email };
     } finally {
       await this.close();
     }
@@ -461,7 +472,7 @@ export class BigmodelOAuthClient {
     authCode: string,
     redirectUri: string,
     state: string,
-  ): Promise<{ accessToken: string; userId?: string; jwt?: string }> {
+  ): Promise<{ accessToken: string; userId?: string; jwt?: string; email?: string }> {
     const resp = await this.fetchImpl(ZCODE_TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -477,7 +488,8 @@ export class BigmodelOAuthClient {
       code?: number;
       data?: {
         token?: string;
-        user?: { user_id?: string };
+        user?: { user_id?: string; email?: string };
+        email?: string;
         bigmodel?: { access_token?: string };
       };
       msg?: string;
@@ -496,7 +508,13 @@ export class BigmodelOAuthClient {
     }
     const userId = raw?.data?.user?.user_id;
     const jwt = raw?.data?.token?.trim() ?? undefined;
-    return { accessToken, userId: typeof userId === "string" ? userId : undefined, jwt };
+    const email = raw?.data?.user?.email ?? raw?.data?.email;
+    return {
+      accessToken,
+      userId: typeof userId === "string" ? userId : undefined,
+      jwt,
+      email: typeof email === "string" ? email.trim() || undefined : undefined,
+    };
   }
 
   async authorize(
@@ -508,8 +526,8 @@ export class BigmodelOAuthClient {
 
     try {
       const authCode = await this.waitForCallback(timeoutMs);
-      const { accessToken, userId, jwt } = await this.exchangeCode(authCode, callbackUrl, state);
-      return { accessToken, provider: "bigmodel", userId, jwt };
+      const { accessToken, userId, jwt, email } = await this.exchangeCode(authCode, callbackUrl, state);
+      return { accessToken, provider: "bigmodel", userId, jwt, email };
     } finally {
       await this.close();
     }

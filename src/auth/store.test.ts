@@ -12,6 +12,9 @@ import {
   removeAccount,
   setAccountLabel,
   setAccountProxy,
+  setAccountName,
+  setAccountEmail,
+  exportSingleAccount,
   maskApiKey,
   invalidateStoreCache,
   _resetKeyCacheForTesting,
@@ -442,5 +445,131 @@ describe("multi-account store", () => {
     const reloaded = await loadCredential();
     expect(reloaded).not.toBeNull();
     expect(reloaded!.apiKey).toBe("test-key");
+  });
+
+  // --- vceshi0.0.4: name + email fields, sorting, edit, export ---
+
+  it("saveCredential preserves name + email fields when provided", async () => {
+    const cred: Credential = {
+      apiKey: "test-key-with-name-email",
+      provider: "zai",
+      plan: "start-plan",
+      name: "alice@example.com-start-plan",
+      email: "alice@example.com",
+    };
+    await saveCredential(cred);
+
+    const loaded = await loadCredential();
+    expect(loaded).not.toBeNull();
+    expect(loaded!.name).toBe("alice@example.com-start-plan");
+    expect(loaded!.email).toBe("alice@example.com");
+
+    const list = await listAccounts();
+    expect(list.accounts).toHaveLength(1);
+    expect(list.accounts[0].name).toBe("alice@example.com-start-plan");
+    expect(list.accounts[0].email).toBe("alice@example.com");
+  });
+
+  it("listAccounts returns name/email as empty strings when not set", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const list = await listAccounts();
+    expect(list.accounts[0].name).toBe("");
+    expect(list.accounts[0].email).toBe("");
+  });
+
+  it("listAccounts sorts accounts by createdAt ascending (oldest first)", async () => {
+    // Save 3 accounts with controlled createdAt via direct manipulation.
+    // We can't set createdAt directly via saveCredential (it uses Date.now()),
+    // so we save them in order with small artificial delays to ensure distinct
+    // timestamps. Bun's Date.now() resolution is millisecond-level.
+    await saveCredential({ apiKey: "first", provider: "zai" });
+    await new Promise(r => setTimeout(r, 5));
+    await saveCredential({ apiKey: "second", provider: "bigmodel" });
+    await new Promise(r => setTimeout(r, 5));
+    await saveCredential({ apiKey: "third", provider: "zai" });
+
+    const list = await listAccounts();
+    expect(list.accounts).toHaveLength(3);
+    // Oldest first (lowest createdAt first)
+    expect(list.accounts[0].apiKeyMask).toBe("first");
+    expect(list.accounts[1].apiKeyMask).toBe("second");
+    expect(list.accounts[2].apiKeyMask).toBe("third");
+  });
+
+  it("setAccountName updates the name and clears when empty", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const list = await listAccounts();
+    const id = list.accounts[0].id;
+    expect(list.accounts[0].name).toBe("");
+
+    // Set a name
+    let ok = await setAccountName(id, "my-account-name");
+    expect(ok).toBe(true);
+    let list2 = await listAccounts();
+    expect(list2.accounts[0].name).toBe("my-account-name");
+
+    // Clear the name (empty string)
+    ok = await setAccountName(id, "   ");
+    expect(ok).toBe(true);
+    list2 = await listAccounts();
+    expect(list2.accounts[0].name).toBe("");
+  });
+
+  it("setAccountEmail updates the email and clears when empty", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai", email: "orig@x.com" });
+    const list = await listAccounts();
+    const id = list.accounts[0].id;
+    expect(list.accounts[0].email).toBe("orig@x.com");
+
+    // Update email
+    let ok = await setAccountEmail(id, "new@x.com");
+    expect(ok).toBe(true);
+    let list2 = await listAccounts();
+    expect(list2.accounts[0].email).toBe("new@x.com");
+
+    // Clear email
+    ok = await setAccountEmail(id, "");
+    expect(ok).toBe(true);
+    list2 = await listAccounts();
+    expect(list2.accounts[0].email).toBe("");
+  });
+
+  it("setAccountName / setAccountEmail return false for unknown id", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    expect(await setAccountName("nonexistent", "x")).toBe(false);
+    expect(await setAccountEmail("nonexistent", "x@y.com")).toBe(false);
+  });
+
+  it("exportSingleAccount returns full credential JSON (with secrets)", async () => {
+    const cred: Credential = {
+      apiKey: "full-api-key-1234567890",
+      secret: "secret-456",
+      provider: "zai",
+      plan: "coding-plan",
+      userId: "user-789",
+      name: "alice@x.com-coding-plan",
+      email: "alice@x.com",
+    };
+    await saveCredential(cred);
+    const list = await listAccounts();
+    const id = list.accounts[0].id;
+
+    const exported = await exportSingleAccount(id);
+    expect(exported).not.toBeNull();
+    expect(exported!.id).toBe(id);
+    expect(exported!.label).toBeTruthy();
+    expect(exported!.createdAt).toBeGreaterThan(0);
+    // Full credential with secrets (NOT masked)
+    expect(exported!.credential.apiKey).toBe("full-api-key-1234567890");
+    expect(exported!.credential.secret).toBe("secret-456");
+    expect(exported!.credential.userId).toBe("user-789");
+    expect(exported!.credential.name).toBe("alice@x.com-coding-plan");
+    expect(exported!.credential.email).toBe("alice@x.com");
+  });
+
+  it("exportSingleAccount returns null for unknown id", async () => {
+    await saveCredential({ apiKey: "k", provider: "zai" });
+    const exported = await exportSingleAccount("nonexistent-id");
+    expect(exported).toBeNull();
   });
 });
