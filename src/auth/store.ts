@@ -7,6 +7,14 @@
  * Backward compat: if the on-disk file is the original v1 format ({ encrypted: ... }),
  * it is migrated on first load (decrypted, wrapped in a single account, marked active).
  *
+ * Encryption: AES-256-GCM with a FIXED key derived from SHA-256("520").
+ * The same key is used on every machine, every OS, every run — so credentials.json
+ * is portable across devices and never breaks due to key drift. This is a conscious
+ * trade-off: we give up encryption-at-rest strength (anyone with the source code
+ * can decrypt the file) in exchange for never losing user data to key-derivation
+ * bugs. For a local dev tool where the credentials file lives on the user's own
+ * machine, this is the right trade-off.
+ *
  * @see .omo/plans/zcode-proxy.md Task 14
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
@@ -30,11 +38,10 @@ import type { Credential } from "./types.js";
  */
 const STORE_DIR = process.env.ZCODE_PROXY_STORE_DIR ?? join(homedir(), ".zcode-proxy");
 const STORE_FILE = join(STORE_DIR, "credentials.json");
-const KEY_FILE = join(STORE_DIR, ".secret-key");
-const ENV_SECRET = "ZCODE_PROXY_CREDENTIAL_SECRET";
-/** Optional env var: if set, its value is used as the legacy seed for decrypt
+/** Optional env var: if set, its value is used as a legacy seed for decrypt
  *  fallback (lets users recover credentials.json encrypted by an old version
- *  whose homedir/platform/arch differed from the current one). */
+ *  whose homedir/platform/arch differed from the current one). Only used in
+ *  the decrypt fallback — new encryption always uses the fixed key. */
 const ENV_LEGACY_SEED = "ZCODE_PROXY_LEGACY_SEED";
 
 /**
@@ -80,15 +87,40 @@ interface StoreV2 {
 // ---------------------------------------------------------------------------
 
 /**
- * In-memory cache of the encryption key. Set once on first call to avoid
- * re-reading the key file (or re-deriving from seed) on every encrypt/decrypt.
- * Reset by `_resetKeyCacheForTesting` between unit tests.
+ * The fixed encryption key seed. AES-256 requires a 32-byte key, so we derive
+ * the actual key via SHA-256. The seed value "520" is intentionally trivial —
+ * the goal is NOT cryptographic security (anyone with the source can decrypt
+ * the file), but rather a stable, portable obfuscation that prevents casual
+ * shoulder-surfing of plaintext credentials in `credentials.json`.
+ *
+ * Why a fixed key instead of per-machine key derivation:
+ *   - The previous scheme derived the key from `${homedir}-${platform}-${arch}`,
+ *     which broke whenever the user changed username, upgraded OS, switched
+ *     32-bit↔64-bit binaries, or copied credentials.json to another machine.
+ *     Each of those scenarios silently rotated the key and locked the user out
+ *     of their own credentials — leading to data loss.
+ *   - A fixed key eliminates that entire class of bugs. The same credentials.json
+ *     file works on every machine, every OS, every Bun version, forever.
+ *
+ * If you ever need to change this value, ALL existing credentials.json files
+ * will become unreadable (the decrypt fallback will try the old key via the
+ * legacy-seed mechanism, but only if ZCODE_PROXY_LEGACY_SEED is set to "520").
+ */
+const FIXED_KEY_SEED = "520";
+
+/**
+ * In-memory cache of the fixed encryption key. Set once on first call to
+ * avoid re-hashing on every encrypt/decrypt. Reset by `_resetKeyCacheForTesting`
+ * between unit tests (harmless no-op for the fixed key — kept for backward
+ * compat with test code that calls it).
  */
 let cachedKey: Buffer | null = null;
 
 /**
- * Reset the key cache. Internal — used by unit tests so they can simulate
- * "first run after upgrade" scenarios by clearing the cache between tests.
+ * Reset the key cache. Internal — used by unit tests. With the fixed-key
+ * scheme this is effectively a no-op (the cache will be repopulated with the
+ * same SHA-256("520") on the next call), but it's kept so existing test code
+ * that calls it between cases doesn't break.
  * @internal
  */
 export function _resetKeyCacheForTesting(): void {
@@ -96,8 +128,8 @@ export function _resetKeyCacheForTesting(): void {
 }
 
 /**
- * SHA-256–derive a 256-bit key from a seed string. Used by both the current
- * key derivation and the multi-seed fallback in decrypt().
+ * SHA-256–derive a 256-bit key from a seed string. Used by the fixed-key
+ * derivation and by the legacy multi-seed fallback in decrypt().
  */
 function deriveSha256Key(seed: string): Buffer {
   return createHash("sha256").update(seed).digest();
@@ -106,7 +138,8 @@ function deriveSha256Key(seed: string): Buffer {
 /**
  * Derive the legacy XOR-fold key (zcode-api-ref / early zhipu format).
  * NOT cryptographic — kept only so users with credentials.json from the
- * open-source zcode-api-ref repo can be transparently migrated.
+ * open-source zcode-api-ref repo can be transparently migrated via the
+ * decrypt fallback.
  */
 function deriveXorFoldKey(seed: string): Buffer {
   const hash = Buffer.alloc(32);
@@ -118,115 +151,49 @@ function deriveXorFoldKey(seed: string): Buffer {
 }
 
 /**
- * Persist a key (32 raw bytes) to the key file so future runs read it
- * directly instead of re-deriving from seed. Called:
- *   - After first-run legacy seed derivation (getEncryptionKeyBuffer fallback)
- *   - After a multi-seed fallback in decrypt() finds the working key
+ * Get the encryption key. Always returns SHA-256("520") — a fixed, portable
+ * key that never changes across machines, OS versions, or Bun versions.
  *
- * IMPORTANT: always writes, even when ZCODE_PROXY_CREDENTIAL_SECRET is set.
- * The env var check belongs in getEncryptionKeyBuffer (priority 1 skips key
- * file READ), not here. If decrypt's fallback found a working key, that key
- * MUST be persisted — the user might clear the env var later (e.g. they set
- * it only for the recovery attempt), and without the key file the next run
- * would be locked out again.
+ * This eliminates the entire class of "key drift" bugs that previously caused
+ * credential corruption:
+ *   - homedir() resolving differently across Bun versions
+ *   - USERPROFILE vs HOMEDRIVE+HOMEPATH on Windows
+ *   - 32-bit vs 64-bit binary switching arch
+ *   - username changes / OS reinstalls
+ *   - copying credentials.json between machines
+ *   - ZCODE_PROXY_CREDENTIAL_SECRET env var being set during one run and not
+ *     the next (the most recent incarnation of the bug)
  *
- * Failures are non-fatal — we still set cachedKey so the current process works.
- */
-function persistKeyToKeyFile(key: Buffer): void {
-  try {
-    mkdirSync(dirname(KEY_FILE), { recursive: true });
-    writeFileSync(KEY_FILE, key.toString("base64"), { mode: 0o600 });
-    cachedKey = key;
-    console.log(`[store] Encryption key persisted to ${KEY_FILE}. Future runs will read this file directly, immune to homedir/platform/arch changes.`);
-  } catch (err) {
-    console.warn(`[store] Could not persist encryption key to ${KEY_FILE}: ${(err as Error).message}. Using in-memory only — credentials will not survive a restart if the key file can't be written.`);
-  }
-}
-
-/**
- * Get the encryption key.
- *
- * Priority:
- *   1. `ZCODE_PROXY_CREDENTIAL_SECRET` env var → SHA-256(env var value)
- *      Used by tests, Render cloud deploy, and power users who want to
- *      explicitly pin the key. Skips key file entirely.
- *   2. `~/.zcode-proxy/.secret-key` file → 32 random bytes (base64)
- *      The PREFERRED mechanism for desktop users. Once written, this file
- *      is the single source of truth for the encryption key — independent
- *      of homedir(), process.platform, process.arch, or Bun version. This
- *      means a version update (or even an OS upgrade that changes how
- *      homedir() resolves) will NOT lock the user out of their existing
- *      credentials.
- *   3. Legacy seed-based derivation → SHA-256(`${homedir()}-${platform}-${arch}`)
- *      Used ONLY on first run after upgrade from a pre-key-file version. The
- *      derived key is immediately persisted to the key file (priority 2 on
- *      next run) so future runs no longer depend on the seed.
- *
- * WHY this design: the original seed-based derivation was vulnerable to any
- * change in homedir/platform/arch — Bun version upgrades, Windows username
- * changes, 32-bit-vs-64-bit binary switches, etc. would all silently rotate
- * the key and lock users out of their own credentials.json. The key file
- * breaks that coupling: once the key is on disk, it's stable forever.
+ * The fixed key is cached after the first call. There is no env var override,
+ * no key file, no seed derivation — just one constant key, everywhere, always.
  */
 function getEncryptionKeyBuffer(): Buffer {
-  // Priority 1: explicit env var (testing / Render cloud / power users)
-  // NOT cached — env var can change mid-process (e.g. tests changing it between
-  // cases), and SHA-256 is fast enough that re-deriving on every call is fine.
-  // Caching here would silently use a stale key when the env var changes.
-  const envSecret = process.env[ENV_SECRET];
-  if (envSecret) {
-    return deriveSha256Key(envSecret);
-  }
-
-  // Priority 2 & 3 are cached (file I/O is slow). cachedKey only holds the
-  // key-file or legacy-seed derived key — never the env-var key.
   if (cachedKey) return cachedKey;
-
-  // Priority 2: persistent key file (preferred — immune to homedir/platform/arch)
-  try {
-    if (existsSync(KEY_FILE)) {
-      const raw = readFileSync(KEY_FILE, "utf-8").trim();
-      const key = Buffer.from(raw, "base64");
-      if (key.length === 32) {
-        cachedKey = key;
-        return cachedKey;
-      }
-      console.warn(`[store] ${KEY_FILE} present but malformed (expected 32 bytes base64, got ${key.length} bytes). Will fall back to seed derivation and overwrite.`);
-    }
-  } catch (err) {
-    console.warn(`[store] Could not read key file ${KEY_FILE}: ${(err as Error).message}. Falling back to seed derivation.`);
-  }
-
-  // Priority 3: legacy seed-based derivation + persist to key file for next run
-  const legacySeed = `${homedir()}-${process.platform}-${process.arch}`;
-  const legacyKey = deriveSha256Key(legacySeed);
-  cachedKey = legacyKey; // set cache first so even if persist fails, this process works
-  persistKeyToKeyFile(legacyKey);
-  return legacyKey;
+  cachedKey = deriveSha256Key(FIXED_KEY_SEED);
+  return cachedKey;
 }
 
 /**
- * Build a list of candidate encryption keys to try during decrypt.
+ * Build a list of candidate encryption keys to try during decrypt fallback.
  *
- * The current key (from getEncryptionKeyBuffer) is tried first by the caller.
- * If that fails (e.g. credentials.json was encrypted by an older version with
- * a different homedir/platform/arch — the original "version update locks me
- * out" bug), we try a series of fallback seeds covering common version-drift
- * scenarios:
+ * This is ONLY used when the fixed key fails to decrypt the file — i.e. the
+ * file was encrypted by an OLDER version of this code that used seed-based
+ * or env-var-based key derivation. Once the fallback succeeds, the file is
+ * re-encrypted with the fixed key on the next writeStore() call, so the
+ * fallback is a one-time migration path.
  *
- *   - `${home}-${plat}-${arch}`     current (already tried by caller)
+ * Candidate seeds cover common version-drift scenarios:
+ *   - `${home}-${plat}-${arch}`     historical seed template
  *   - `${home}-${plat}`             arch differed (32-bit vs 64-bit binary)
  *   - `${home}-${arch}`             platform differed (unlikely but cheap)
  *   - `${home}`                     old version may have only used homedir
  *   - `ZCODE_PROXY_LEGACY_SEED`     user-supplied (manual recovery)
+ *   - `ZCODE_PROXY_CREDENTIAL_SECRET`  old env-var-derived key (recovery)
  *
  * For each seed we generate both SHA-256 (zhipu) and XOR-fold (zcode-api-ref)
  * derived keys, matching the historical key derivation functions.
- *
- * If any candidate succeeds, the caller persists its key to the key file so
- * future runs skip the fallback dance entirely.
  */
-function buildCandidateKeysForDecrypt(): Array<{ label: string; key: Buffer; seed: string; derivation: string }> {
+function buildCandidateKeysForDecrypt(): Array<{ label: string; key: Buffer }> {
   const home = homedir();
   const plat = process.platform;
   const arch = process.arch;
@@ -242,21 +209,16 @@ function buildCandidateKeysForDecrypt(): Array<{ label: string; key: Buffer; see
   //     HOMEPATH points to the canonical local path).
   const homeVariants = new Set<string>();
   homeVariants.add(home);
-  // Windows env vars
   const userProfile = process.env.USERPROFILE;
   if (userProfile) homeVariants.add(userProfile);
   const homeDrive = process.env.HOMEDRIVE;
   const homePath = process.env.HOMEPATH;
   if (homeDrive && homePath) homeVariants.add(`${homeDrive}${homePath}`);
-  // Unix env var
   const homeEnv = process.env.HOME;
   if (homeEnv) homeVariants.add(homeEnv);
 
   // For each home variant, build the full seed combinations an older version
-  // might have used. The historical seed template was `${home}-${plat}-${arch}`,
-  // but during development there were brief periods where the template was
-  // `${home}-${plat}` or `${home}-${arch}` or just `${home}`. We try all of
-  // them to maximize recovery odds.
+  // might have used.
   const seeds = new Set<string>();
   for (const h of homeVariants) {
     seeds.add(`${h}-${plat}-${arch}`);
@@ -267,18 +229,23 @@ function buildCandidateKeysForDecrypt(): Array<{ label: string; key: Buffer; see
   // User-supplied legacy seed (manual recovery)
   const legacyEnv = process.env[ENV_LEGACY_SEED];
   if (legacyEnv) seeds.add(legacyEnv);
+  // Old env-var-derived key recovery: if the file was encrypted by the
+  // previous version of this code which consulted ZCODE_PROXY_CREDENTIAL_SECRET,
+  // the user can set it again to recover.
+  const oldEnvSecret = process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+  if (oldEnvSecret) seeds.add(oldEnvSecret);
 
-  const candidates: Array<{ label: string; key: Buffer; seed: string; derivation: string }> = [];
+  const candidates: Array<{ label: string; key: Buffer }> = [];
   for (const seed of seeds) {
     const shortSeed = seed.length > 60 ? seed.slice(0, 57) + "..." : seed;
-    candidates.push({ label: `SHA-256("${shortSeed}")`, key: deriveSha256Key(seed), seed, derivation: "SHA-256" });
-    candidates.push({ label: `XOR-fold("${shortSeed}")`, key: deriveXorFoldKey(seed), seed, derivation: "XOR-fold" });
+    candidates.push({ label: `SHA-256("${shortSeed}")`, key: deriveSha256Key(seed) });
+    candidates.push({ label: `XOR-fold("${shortSeed}")`, key: deriveXorFoldKey(seed) });
   }
   return candidates;
 }
 
 /**
- * Encrypt plaintext using AES-256-GCM (Node.js crypto).
+ * Encrypt plaintext using AES-256-GCM (Node.js crypto) with the fixed key.
  * Output format: base64( IV[16] + AUTH_TAG[16] + CIPHERTEXT )
  */
 async function encrypt(plaintext: string): Promise<string> {
@@ -291,61 +258,30 @@ async function encrypt(plaintext: string): Promise<string> {
 }
 
 /**
- * Decrypt ciphertext. Tries multiple formats + multiple keys in order:
+ * Decrypt ciphertext. Tries the fixed key first, then falls back to legacy
+ * candidate keys for one-time recovery of files encrypted by older versions.
  *
- *   1. Current Node.js crypto format (IV[16] + AUTH_TAG[16] + CIPHERTEXT)
- *      with the current key (env var > key file > legacy seed).
- *   2. If #1 fails (credentials.json was encrypted by an older version whose
- *      homedir/platform/arch differed from the current one), try the current
- *      key in legacy WebCrypto format (IV[12] + encrypted+tag).
- *   3. If #2 fails, iterate through ALL candidate seeds (buildCandidateKeysForDecrypt)
- *      in BOTH formats. This handles the "version update locks me out" bug where
- *      Bun 1.1's homedir() returned a different path than Bun 1.3's.
+ *   1. Fixed key (SHA-256("520")), Node.js crypto format (IV[16] + AUTH_TAG[16] + CIPHERTEXT).
+ *      This handles ALL files encrypted by the current code — the normal path.
  *
- * If ANY candidate succeeds, the winning key is persisted to the key file
- * (~/.zcode-proxy/.secret-key) so future runs read it directly — no more
- * multi-seed fallback needed. This is the migration path from the old
- * fragile seed-based scheme to the new stable key-file scheme.
+ *   2. Fixed key in legacy WebCrypto format (IV[12] + encrypted+tag).
+ *      Handles files encrypted by very old zhipu versions that used WebCrypto
+ *      with the same key but a different cipher implementation.
+ *
+ *   3. Multi-seed fallback: iterate through ALL candidate seeds (homedir
+ *      variants, ZCODE_PROXY_LEGACY_SEED, ZCODE_PROXY_CREDENTIAL_SECRET) in
+ *      BOTH SHA-256 and XOR-fold derivations, in BOTH Node and WebCrypto
+ *      formats. This recovers files encrypted by older versions of this code
+ *      that used seed-based or env-var-based key derivation.
+ *
+ * On fallback success, the file is NOT re-encrypted with the fallback key.
+ * Instead, the plaintext is returned to the caller (readStoreUncached), which
+ * parses it into a StoreV2. The next writeStore() call will re-encrypt with
+ * the fixed key — so the fallback is a one-time migration path, not a
+ * permanent dependency on the old key.
  */
 async function decrypt(ciphertext: string): Promise<string> {
   const data = Buffer.from(ciphertext, "base64");
-
-  // --- Try 1: current key, Node.js crypto format (IV[16] + AUTH_TAG[16] + CIPHERTEXT) ---
-  // This is the only format using a 16-byte IV (WebCrypto uses 12-byte).
-  if (data.length >= 32) {
-    try {
-      const key = getEncryptionKeyBuffer();
-      const iv = data.subarray(0, 16);
-      const tag = data.subarray(16, 32);
-      const encrypted = data.subarray(32);
-      const decipher = createDecipheriv("aes-256-gcm", key, iv);
-      decipher.setAuthTag(tag);
-      return decipher.update(encrypted, undefined, "utf8") + decipher.final("utf8");
-    } catch {
-      // Current key didn't work in Node format — fall through
-    }
-  }
-
-  // --- Try 2: build candidate keys (current + multi-seed fallback) ---
-  // The first entry is always the current key (already tried in Node format
-  // above, but we retry it in WebCrypto format which uses a 12-byte IV).
-  // Subsequent entries are the multi-seed fallback for version-drift recovery.
-  const candidates = [
-    // Always start with the current key in case it works in WebCrypto format
-    // (the credentials.json was encrypted with WebCrypto by an older zhipu version
-    // that used the same key derivation but a different cipher implementation).
-    {
-      label: "current key (WebCrypto format)",
-      key: getEncryptionKeyBuffer(),
-      persistable: false, // already persisted (or env var) — no need to re-persist
-    },
-    // Multi-seed fallback: try every plausible seed an older version might have used
-    ...buildCandidateKeysForDecrypt().map(c => ({
-      label: c.label,
-      key: c.key,
-      persistable: true, // if this works, persist to key file for future runs
-    })),
-  ];
 
   // Helper: try decrypting with a key in Node.js crypto format (IV[16] + tag[16] + ct)
   const tryNodeFormat = (key: Buffer): string | null => {
@@ -387,39 +323,48 @@ async function decrypt(ciphertext: string): Promise<string> {
     }
   };
 
-  // Iterate candidates: try each in both Node format and WebCrypto format
-  for (const { label, key, persistable } of candidates) {
-    // Node format (16-byte IV) — try first since it's faster (no async)
-    let plaintext = tryNodeFormat(key);
+  // --- Try 1: fixed key, Node.js crypto format (the normal path) ---
+  const fixedKey = getEncryptionKeyBuffer();
+  let plaintext = tryNodeFormat(fixedKey);
+  if (plaintext !== null) return plaintext;
+
+  // --- Try 2: fixed key in legacy WebCrypto format ---
+  plaintext = await tryWebCryptoFormat(fixedKey);
+  if (plaintext !== null) return plaintext;
+
+  // --- Try 3: multi-seed fallback (legacy file recovery) ---
+  // Only reached if the file was encrypted by an older version with a different
+  // key. We try every plausible candidate; on success, the caller will
+  // re-encrypt with the fixed key on the next writeStore().
+  const seen = new Set<string>([fixedKey.toString("hex")]);
+  for (const { label, key } of buildCandidateKeysForDecrypt()) {
+    // Skip duplicate keys (different seeds can derive the same key).
+    const hex = key.toString("hex");
+    if (seen.has(hex)) continue;
+    seen.add(hex);
+
+    plaintext = tryNodeFormat(key);
     if (plaintext !== null) {
-      // Success! If this was a fallback key (not the current key), persist it
-      // to the key file so future runs don't need to fall back again.
-      if (persistable) {
-        console.log(`[store] Decryption succeeded with fallback key: ${label}. Persisting to key file for future runs.`);
-        persistKeyToKeyFile(key);
-      }
+      console.log(`[store] Decryption succeeded with legacy fallback key: ${label}. File will be re-encrypted with the fixed key on next save.`);
       return plaintext;
     }
 
-    // WebCrypto format (12-byte IV) — slower async path
     plaintext = await tryWebCryptoFormat(key);
     if (plaintext !== null) {
-      if (persistable) {
-        console.log(`[store] Decryption succeeded with fallback key (WebCrypto format): ${label}. Persisting to key file for future runs.`);
-        persistKeyToKeyFile(key);
-      }
+      console.log(`[store] Decryption succeeded with legacy fallback key (WebCrypto format): ${label}. File will be re-encrypted with the fixed key on next save.`);
       return plaintext;
     }
     void label; // label retained for future debug logging
   }
 
   throw new Error(
-    "Failed to decrypt credential store. Tried: current key (Node + WebCrypto formats), " +
+    "Failed to decrypt credential store. Tried: fixed key (Node + WebCrypto formats), " +
     "multi-seed fallback covering homedir/platform/arch variations across Bun versions " +
     "(Bun 1.1/1.2/1.3 homedir() differences, USERPROFILE vs HOMEDRIVE+HOMEPATH, etc.). " +
     "If your credentials.json was encrypted on a different machine / OS / username, " +
     "set ZCODE_PROXY_LEGACY_SEED to the old seed string (e.g. \"C:\\\\Users\\\\OldName-win32-x64\") " +
-    "and retry. As a last resort, run `zcode-proxy auth logout` to discard and re-login."
+    "or ZCODE_PROXY_CREDENTIAL_SECRET to the old env var value, and retry. " +
+    "As a last resort, run `zcode-proxy auth logout` to discard and re-login."
   );
 }
 
@@ -709,15 +654,8 @@ export function clearCredential(): void {
   if (existsSync(STORE_FILE)) {
     unlinkSync(STORE_FILE);
   }
-  // Also remove the key file — once the user explicitly clears credentials,
-  // there's no reason to keep the encryption key around (it would just be a
-  // stale orphan that future runs would read but never be able to use, since
-  // the credentials.json it encrypted is gone).
-  if (existsSync(KEY_FILE)) {
-    try { unlinkSync(KEY_FILE); } catch { /* best-effort */ }
-  }
   cachedStore = null; // invalidate store cache
-  cachedKey = null;   // invalidate key cache
+  cachedKey = null;   // invalidate key cache (will be repopulated with the same fixed key)
   // Clear the guard flag — once the user has explicitly cleared credentials,
   // they're free to save new ones without the "refusing to overwrite" error.
   undecryptableFilePresent = false;

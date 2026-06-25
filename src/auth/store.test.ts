@@ -20,16 +20,16 @@ import {
   invalidateStoreCache,
   _resetKeyCacheForTesting,
 } from "./store.js";
-import { existsSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { Credential } from "./types.js";
 
-const TEST_SECRET = "test-encryption-secret-for-zcode-proxy";
-
+// With the fixed-key scheme (SHA-256("520")), there's no per-test secret to
+// set. The env vars below are only used by the legacy-fallback recovery tests
+// to simulate files encrypted by older versions of this code.
 describe("credential store", () => {
   beforeEach(() => {
-    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = TEST_SECRET;
     _resetKeyCacheForTesting();
     clearCredential();
   });
@@ -95,13 +95,14 @@ describe("credential store", () => {
 
 describe("multi-account store", () => {
   beforeEach(() => {
-    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = TEST_SECRET;
+    _resetKeyCacheForTesting();
     clearCredential();
   });
 
   afterEach(() => {
     clearCredential();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+    delete process.env.ZCODE_PROXY_LEGACY_SEED;
   });
 
   it("saveCredential marks new account as active", async () => {
@@ -329,69 +330,110 @@ describe("multi-account store", () => {
     expect(keys).toEqual(["first-key", "second-key"]);
   });
 
-  it("multi-seed fallback recovers credentials when ZCODE_PROXY_LEGACY_SEED matches the old seed", async () => {
-    // Simulates the REAL upgrade scenario:
-    //   1. v1.x binary encrypts credentials.json with seed = "old-bun-homedir-win32-x64"
-    //      (Bun 1.1 returned a different homedir() than Bun 1.3)
-    //   2. v2.x binary (new Bun) computes a different homedir() → different default seed
-    //      → decryption fails with the current key
-    //   3. User sets ZCODE_PROXY_LEGACY_SEED to the old seed → multi-seed fallback
-    //      finds it, decrypts successfully, AND persists the recovered key to the
-    //      key file so subsequent runs don't need the env var anymore.
+  it("legacy fallback recovers credentials encrypted by an older version's seed-based key", async () => {
+    // Simulates the upgrade scenario for users with EXISTING credentials.json
+    // files encrypted by an older version of this code (which used
+    // `${homedir}-${platform}-${arch}` as the encryption key seed):
+    //   1. Old binary encrypts credentials.json with seed = "old-bun-homedir-win32-x64"
+    //   2. New binary uses the fixed key SHA-256("520") → fixed key can't decrypt
+    //   3. Multi-seed fallback tries the old seed → succeeds → file is re-encrypted
+    //      with the fixed key on the next writeStore() call.
     //
-    // Step 1: encrypt with the "old" seed via ZCODE_PROXY_LEGACY_SEED
-    //         (we use the env var path to force a specific seed for the encryption,
-    //         simulating what the old binary did)
-    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "old-seed-simulating-bun-1.1-homedir";
-    _resetKeyCacheForTesting();
-    await saveCredential({ apiKey: "original-key", provider: "zai" });
-    expect(await loadCredential()).not.toBeNull();
+    // We can't easily change os.homedir() in a test, so we simulate the
+    // "different machine / different seed" scenario by:
+    //   - Manually writing a credentials.json encrypted with a seed that ISN'T
+    //     the current homedir seed (so the fixed key fails AND the current
+    //     homedir seed fails, but ZCODE_PROXY_LEGACY_SEED provides the recovery seed).
 
-    // Step 2: change the env var to a DIFFERENT value (simulating new Bun's homedir)
-    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "new-seed-simulating-bun-1.3-homedir";
+    const crypto = await import("node:crypto");
+    const oldSeed = "old-bun-homedir-win32-x64";
+    const oldKey = crypto.createHash("sha256").update(oldSeed).digest();
+    const storeJson = JSON.stringify({
+      version: 2,
+      activeId: "legacy-acct",
+      accounts: [{
+        id: "legacy-acct",
+        label: "legacy",
+        createdAt: Date.now(),
+        credential: { apiKey: "legacy-key", provider: "zai" },
+      }],
+    });
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv("aes-256-gcm", oldKey, iv);
+    const enc = Buffer.concat([cipher.update(storeJson, "utf8"), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    const encrypted = Buffer.concat([iv, tag, enc]).toString("base64");
+
+    // Write the legacy-encrypted credentials.json directly to disk.
+    const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
+    mkdirSync(join(homedir(), ".zcode-proxy"), { recursive: true });
+    writeFileSync(storePath, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
+
+    // Step 1: without LEGACY_SEED, the fixed key + current homedir seeds all fail.
+    // The file is marked undecryptable, loadCredential returns null.
     _resetKeyCacheForTesting();
     invalidateStoreCache();
+    const failedLoad = await loadCredential();
+    expect(failedLoad).toBeNull();
 
-    // Now the current key can't decrypt. Without fallback, loadCredential returns null.
-    // But with ZCODE_PROXY_LEGACY_SEED set to the old seed, the multi-seed fallback
-    // should find it and recover the credential.
-    process.env.ZCODE_PROXY_LEGACY_SEED = "old-seed-simulating-bun-1.1-homedir";
+    // Step 2: set ZCODE_PROXY_LEGACY_SEED to the old seed → fallback finds it,
+    // decrypts successfully. The guard should auto-clear.
+    process.env.ZCODE_PROXY_LEGACY_SEED = oldSeed;
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
     const recovered = await loadCredential();
     expect(recovered).not.toBeNull();
-    expect(recovered!.apiKey).toBe("original-key");
+    expect(recovered!.apiKey).toBe("legacy-key");
 
-    // The key file should now be persisted with the recovered key — clear the
-    // env vars entirely and verify the credential still loads (key file takes over).
-    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+    // Step 3: after a write (which re-encrypts with the fixed key), the
+    // LEGACY_SEED env var is no longer needed — the fixed key alone decrypts.
+    await setAccountLabel((await listAccounts()).accounts[0].id, "new-label");
     delete process.env.ZCODE_PROXY_LEGACY_SEED;
     _resetKeyCacheForTesting();
     invalidateStoreCache();
-    const fromKeyFile = await loadCredential();
-    expect(fromKeyFile).not.toBeNull();
-    expect(fromKeyFile!.apiKey).toBe("original-key");
+    const afterReEncrypt = await loadCredential();
+    expect(afterReEncrypt).not.toBeNull();
+    expect(afterReEncrypt!.apiKey).toBe("legacy-key");
   });
 
-  it("REFUSES to overwrite credentials.json when ALL fallback keys fail", async () => {
-    // When the multi-seed fallback can't find any working key (e.g. credentials.json
-    // was copied from a completely different machine with unknown homedir), the
-    // guard kicks in and prevents saveCredential from silently destroying the
-    // unreadable file.
+  it("REFUSES to overwrite credentials.json when ALL fallback keys fail (corrupt / unknown-origin file)", async () => {
+    // With the fixed-key scheme, this scenario can only happen if:
+    //   - The file was encrypted by a completely unknown key (e.g. manually
+    //     corrupted, or encrypted by a fork of this project with a different seed), AND
+    //   - None of the legacy fallback candidates (homedir variants, LEGACY_SEED,
+    //     CREDENTIAL_SECRET) match that key.
     //
-    // Step 1: encrypt with a secret that won't be in any fallback candidate list
-    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "completely-unique-secret-not-in-any-fallback-list";
-    _resetKeyCacheForTesting();
-    await saveCredential({ apiKey: "original-key", provider: "zai" });
-    expect(await loadCredential()).not.toBeNull();
+    // In that case, the guard kicks in and prevents saveCredential from silently
+    // destroying the unreadable file — the user must explicitly clear it first.
+    //
+    // Step 1: manually write a credentials.json encrypted with a random key
+    // that won't be in any fallback candidate list.
+    const crypto = await import("node:crypto");
+    const unknownKey = crypto.randomBytes(32); // 32 random bytes — not derived from any seed
+    const storeJson = JSON.stringify({
+      version: 2,
+      activeId: "x",
+      accounts: [{
+        id: "x",
+        label: "unknown",
+        createdAt: Date.now(),
+        credential: { apiKey: "unknown-key", provider: "zai" },
+      }],
+    });
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv("aes-256-gcm", unknownKey, iv);
+    const enc = Buffer.concat([cipher.update(storeJson, "utf8"), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    const encrypted = Buffer.concat([iv, tag, enc]).toString("base64");
 
-    // Step 2: switch to a DIFFERENT secret (no LEGACY_SEED set → no fallback recovery)
-    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "a-different-secret-also-not-in-fallback";
-    delete process.env.ZCODE_PROXY_LEGACY_SEED;
+    const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
+    mkdirSync(join(homedir(), ".zcode-proxy"), { recursive: true });
+    writeFileSync(storePath, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
+
+    // Step 2: try to read — fixed key + all fallback candidates fail.
+    // loadCredential returns null AND the guard flag is set.
     _resetKeyCacheForTesting();
     invalidateStoreCache();
-
-    // The multi-seed fallback should fail (none of the homedir/USERPROFILE/etc.
-    // seeds will match "completely-unique-secret-not-in-any-fallback-list"),
-    // so loadCredential returns null AND the guard flag is set.
     const loaded = await loadCredential();
     expect(loaded).toBeNull();
 
@@ -401,7 +443,6 @@ describe("multi-account store", () => {
     ).rejects.toThrow(/Refusing to overwrite/);
 
     // The original credentials.json should still exist on disk (not deleted)
-    const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
     expect(existsSync(storePath)).toBe(true);
 
     // After clearCredential (user explicitly confirms discard), saving works again
@@ -412,40 +453,94 @@ describe("multi-account store", () => {
     expect(fresh!.apiKey).toBe("fresh-key");
   });
 
-  it("key file is written on first run and reused on subsequent runs (immune to homedir changes)", async () => {
-    // Verify the core fix: once the key file exists, homedir/platform/arch changes
-    // don't affect decryption. This is the "version update no longer locks me out"
-    // guarantee.
+  it("fixed key is used regardless of env var state (core guarantee of the simplified encryption)", async () => {
+    // This is the CORE regression test for the user-reported bug:
+    //   "我更新的时候，偶尔会遇到那个无法解密凭证的情况，导致把我的凭证全部损坏掉了"
     //
-    // Step 1: first run with no key file — derives key from seed, persists to key file
-    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
+    // The old code had ZCODE_PROXY_CREDENTIAL_SECRET as priority 1, consulted on
+    // every call (uncached). If the env var was set during one run and unset
+    // during the next, the encryption key would silently rotate and lock the
+    // user out of their own credentials.json.
+    //
+    // The fix: a FIXED key (SHA-256("520")) is ALWAYS used. Env vars are
+    // completely ignored for new encryption. This guarantees the same key
+    // across every run, every machine, every env var state — the encryption
+    // key can NEVER silently rotate.
+    //
+    // Step 1: save with env var set — file is encrypted with the FIXED key
+    // (env var is ignored for new encryption).
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "user-set-this-once-for-testing";
     _resetKeyCacheForTesting();
-    await saveCredential({ apiKey: "test-key", provider: "zai" });
+    await saveCredential({ apiKey: "important-key", provider: "zai" });
+    expect(await loadCredential()).not.toBeNull();
 
-    const keyFilePath = join(homedir(), ".zcode-proxy", ".secret-key");
-    expect(existsSync(keyFilePath)).toBe(true);
-
-    // Step 2: simulate homedir change by overriding the env var with a different
-    // "fake homedir" — but since the key file takes priority over seed derivation,
-    // the credential should still load.
-    // We can't actually change os.homedir() in a test, but we can verify the key
-    // file is being READ (not re-derived) by checking that the credential loads
-    // even when ZCODE_PROXY_CREDENTIAL_SECRET is unset (which forces the key file
-    // path; if the key file weren't being read, the seed derivation would produce
-    // a different key and decryption would fail).
+    // Step 2: simulate a subsequent run where the env var is NO LONGER SET.
+    // The fixed key is still used → decryption succeeds.
+    delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
     _resetKeyCacheForTesting();
     invalidateStoreCache();
     const loaded = await loadCredential();
     expect(loaded).not.toBeNull();
-    expect(loaded!.apiKey).toBe("test-key");
+    expect(loaded!.apiKey).toBe("important-key");
 
-    // Step 3: even after clearing the in-memory key cache (simulating a process
-    // restart), the key file is re-read and decryption still works.
+    // Step 3: even after a write (which re-encrypts the file), the fixed key
+    // is still used. So subsequent reads continue to work.
+    await setAccountLabel((await listAccounts()).accounts[0].id, "new-label");
+    invalidateStoreCache();
+    const afterWrite = await loadCredential();
+    expect(afterWrite).not.toBeNull();
+    expect(afterWrite!.apiKey).toBe("important-key");
+
+    // Step 4: simulate yet another run with the env var set to a DIFFERENT
+    // value. The fixed key should STILL be used — the env var is ignored.
+    // This guarantees the encryption key never silently rotates.
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "a-different-value-that-should-be-ignored";
     _resetKeyCacheForTesting();
     invalidateStoreCache();
-    const reloaded = await loadCredential();
-    expect(reloaded).not.toBeNull();
-    expect(reloaded!.apiKey).toBe("test-key");
+    const loaded2 = await loadCredential();
+    expect(loaded2).not.toBeNull();
+    expect(loaded2!.apiKey).toBe("important-key");
+
+    // Step 5: the env var IS still useful as a legacy-fallback recovery seed —
+    // if a file was encrypted by the old buggy code with K_env, setting the env
+    // var lets the decrypt fallback find K_env and recover the file. Verify this
+    // recovery path still works for legacy files.
+    clearCredential();
+    _resetKeyCacheForTesting();
+    const crypto = await import("node:crypto");
+    const legacyEnvSecret = "legacy-env-secret-from-old-version";
+    const legacyKey = crypto.createHash("sha256").update(legacyEnvSecret).digest();
+    const storeJson = JSON.stringify({
+      version: 2,
+      activeId: "legacy",
+      accounts: [{
+        id: "legacy",
+        label: "legacy",
+        createdAt: Date.now(),
+        credential: { apiKey: "legacy-env-key", provider: "zai" },
+      }],
+    });
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv("aes-256-gcm", legacyKey, iv);
+    const enc = Buffer.concat([cipher.update(storeJson, "utf8"), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    const encrypted = Buffer.concat([iv, tag, enc]).toString("base64");
+    const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
+    mkdirSync(join(homedir(), ".zcode-proxy"), { recursive: true });
+    writeFileSync(storePath, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
+
+    // Without the env var: fixed key + homedir seeds all fail → null.
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
+    expect(await loadCredential()).toBeNull();
+
+    // With the env var set to the old secret: fallback finds K_env → recovers.
+    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = legacyEnvSecret;
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
+    const recovered = await loadCredential();
+    expect(recovered).not.toBeNull();
+    expect(recovered!.apiKey).toBe("legacy-env-key");
   });
 
   // --- vceshi0.0.4: name + email fields, sorting, edit, export ---
@@ -625,19 +720,36 @@ describe("multi-account store", () => {
 
   // --- vceshi0.0.5: undecryptableFilePresent guard auto-clears on success ---
 
-  it("undecryptableFilePresent guard auto-clears when decryption succeeds on retry", async () => {
-    // Simulate the recovery scenario:
-    //   1. Save a credential with secret A
-    //   2. Change secret so decryption fails → guard set to true
-    //   3. Change secret back → decryption succeeds → guard should auto-clear
-    //   4. saveCredential should now work (no "Refusing to overwrite" error)
-    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "secret-A";
-    _resetKeyCacheForTesting();
-    await saveCredential({ apiKey: "original-key", provider: "zai" });
-    expect(await loadCredential()).not.toBeNull();
+  it("undecryptableFilePresent guard auto-clears when decryption succeeds on retry (via legacy fallback)", async () => {
+    // Simulate the recovery scenario with the fixed-key scheme:
+    //   1. A legacy file (encrypted by an older version with an unknown seed)
+    //      is on disk → fixed key + homedir seeds all fail → guard set
+    //   2. User sets ZCODE_PROXY_LEGACY_SEED to the old seed → fallback succeeds
+    //      → guard auto-clears
+    //   3. saveCredential should now work (re-encrypts with the fixed key)
+    const crypto = await import("node:crypto");
+    const oldSeed = "another-old-seed-from-a-prior-install";
+    const oldKey = crypto.createHash("sha256").update(oldSeed).digest();
+    const storeJson = JSON.stringify({
+      version: 2,
+      activeId: "x",
+      accounts: [{
+        id: "x",
+        label: "old",
+        createdAt: Date.now(),
+        credential: { apiKey: "original-key", provider: "zai" },
+      }],
+    });
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv("aes-256-gcm", oldKey, iv);
+    const enc = Buffer.concat([cipher.update(storeJson, "utf8"), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    const encrypted = Buffer.concat([iv, tag, enc]).toString("base64");
+    const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
+    mkdirSync(join(homedir(), ".zcode-proxy"), { recursive: true });
+    writeFileSync(storePath, JSON.stringify({ version: 2, encrypted }), { mode: 0o600 });
 
-    // Step 2: change secret, invalidate cache, read → fails, guard set
-    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "secret-B-wrong";
+    // Step 1: without LEGACY_SEED, all keys fail → guard set.
     _resetKeyCacheForTesting();
     invalidateStoreCache();
     const failedLoad = await loadCredential();
@@ -648,16 +760,21 @@ describe("multi-account store", () => {
       saveCredential({ apiKey: "should-fail", provider: "zai" }),
     ).rejects.toThrow(/Refusing to overwrite/);
 
-    // Step 3: change secret back, invalidate cache, read → succeeds, guard clears
-    process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "secret-A";
+    // Step 2: set LEGACY_SEED → fallback finds the key → succeeds → guard clears.
+    process.env.ZCODE_PROXY_LEGACY_SEED = oldSeed;
     _resetKeyCacheForTesting();
     invalidateStoreCache();
     const recoveredLoad = await loadCredential();
     expect(recoveredLoad).not.toBeNull();
     expect(recoveredLoad!.apiKey).toBe("original-key");
 
-    // Step 4: saveCredential should now work (guard auto-cleared)
+    // Step 3: saveCredential should now work (guard auto-cleared).
+    // The new save re-encrypts with the fixed key, so LEGACY_SEED is no longer
+    // needed for subsequent reads.
     await saveCredential({ apiKey: "new-after-recovery", provider: "zai" });
+    delete process.env.ZCODE_PROXY_LEGACY_SEED;
+    _resetKeyCacheForTesting();
+    invalidateStoreCache();
     const finalLoad = await loadCredential();
     expect(finalLoad!.apiKey).toBe("new-after-recovery");
   });

@@ -1248,7 +1248,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>vceshi0.1.0</span>
+        <span>vceshi0.1.1</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -3383,12 +3383,33 @@ async function importAccountsFromFile(input){
   try{
     const text=await file.text();
     const data=JSON.parse(text);
-    if(!data.accounts||!Array.isArray(data.accounts)){toast('文件无效：缺少 accounts 数组','error');return}
-    if(!confirm(`从"${file.name}"导入 ${data.accounts.length} 个账号？\nID 匹配的现有账号将被更新。`))return;
-    const r=await fetch(API+'/admin/api/accounts/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({accounts:data.accounts})});
-    const d=await r.json();
+    // Accept multiple export formats so users can re-import files produced by
+    // any of the dashboard's export buttons (single-account JSON, multi-account
+    // backup, or full v2 store envelope). Previously only `{accounts:[...]}` was
+    // accepted, which silently rejected the per-row "导出" button's output
+    // (shape: `{id,label,name,email,createdAt,credential}`) with a misleading
+    // "缺少 accounts 数组" error.
+    let accounts=null;
+    if(Array.isArray(data)){
+      // Bare array of account objects.
+      accounts=data;
+    }else if(data&&Array.isArray(data.accounts)){
+      // Multi-account backup: {accounts:[...], exportedAt, version} or full
+      // v2 store envelope: {version:2, activeId, accounts:[...]}.
+      accounts=data.accounts;
+    }else if(data&&typeof data.id==='string'&&data.credential&&typeof data.credential.apiKey==='string'){
+      // Single-account export from the per-row "导出" button.
+      accounts=[data];
+    }
+    if(!accounts||!Array.isArray(accounts)||accounts.length===0){
+      toast('文件无效：未识别到可导入的账号数据（支持单账号导出、多账号备份、v2 store 三种格式）','error');
+      return;
+    }
+    if(!confirm(`从"${file.name}"导入 ${accounts.length} 个账号？\nID 匹配的现有账号将被更新。`))return;
+    const r=await fetch(API+'/admin/api/accounts/import',{method:'POST',headers:authHeaders(),body:JSON.stringify({accounts})});
+    const d=await r.json().catch(()=>({}));
     if(r.ok){toast(`导入完成：新增 ${d.added}，更新 ${d.updated}`,'success');loadAccountInfo();loadAccountsList();loadCredStore()}
-    else toast(d.message||'导入失败','error');
+    else toast(d.error?.message||d.message||'导入失败','error');
   }catch(e){console.error('importAccounts failed:',e);toast('导入失败：文件无效','error')}
   input.value='';
 }
