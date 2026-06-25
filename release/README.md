@@ -1,5 +1,39 @@
 # zcode-proxy 使用说明
 
+> **vceshi0.0.8 — 移动端全面适配 + 逻辑 Bug 修复 + 性能优化（重新发布）**
+>
+> 本次 vceshi0.0.8 重新发布，叠加 vceshi0.0.7 re-release 之后的全部累积改动。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 473/473 测试通过。
+>
+> **1. 移动端（<768px）全面适配**
+> - **汉堡菜单 + 抽屉式侧边栏**：原 900px 以下侧边栏塌缩为 60px 图标条，浪费手机屏幕；现在改为 off-canvas 抽屉，所有页头注入汉堡按钮，点击展开 + 半透明遮罩 + ESC 关闭 + 切页自动关闭 + 视口变大自动关闭
+> - **表格**：账号表 9 列在手机上保持可读 — 首列（名称）粘性，横向滚动时不丢；移动端取消 sticky-top 表头；scrollbar 变细
+> - **按钮组**：`.td-actions` 中 6+ 按钮在移动端换行，避免挤一行；`.action-bar` 按钮全宽折行
+> - **账号页搜索 + 筛选**：在移动端垂直堆叠（原来和 card-title 挤一行）
+> - **Modal**：所有 modal `max-width:94vw`、`form-row` 强制单列、footer 按钮全宽折行；inline-styled 的 proxyModal / quotaModal 同样覆盖
+> - **Toast**：移动端 `left/right` 各留 12px，全宽显示，原 `max-width:480px` 在 360px 屏会溢出
+> - **kv-grid**：移动端 label 在上、value 在下，原来 140px label 列在窄屏太挤
+> - **stats-grid**：360px 以下进一步塌缩为 1 列
+> - **触摸目标**：表单输入框 focus 时字号升到 16px，避免 iOS Safari 自动缩放
+> - **mini-stat / hero-card / login-box / log-box**：移动端 padding 与字号统一收紧
+> - **Tab 栏**：移动端隐藏图标、缩小 padding、横向滚动
+>
+> **2. 逻辑 Bug 修复**
+> - **`loadSettings` 端口 0 误判**：用 `||` 取端口，配置为 0（OS 随机端口）时被误判为 falsy 覆盖成 8080。改为 `??`（nullish coalescing），同样修复了 `cfgHost`
+> - **`statsIntervalId` 启动时机错误**：原代码在脚本加载时即启动 10s 轮询，未登录前 timer 永远空转浪费电量（移动端后台 tab 尤甚）。抽出 `startStatsInterval()`，改为登录成功后 `initDashboard()` 内调用
+> - **切换页面不重置滚动**：新页面继承旧页面的滚动位置（如从长账号列表切到概览会停在底部，看似空白）。nav click handler 内 `main.scrollTop=0`
+>
+> **3. 排版优化**
+> - Hero card 小屏改垂直堆叠 + 缩小图标
+> - Hint banner、empty-state 在移动端 padding 收紧
+> - OAuth URL 显示框在移动端按钮换行
+>
+> **4. 历史遗留修复（已并入本版本）**
+> - **`appendLog` 死循环（vceshi0.0.7 引入的回归）**：原 `while (logWaiters.length > 0) { shift().resolve() }` 因 waiter 的 resolve 同步 re-push 自己导致 while 永真，事件循环被永久阻塞。已改为 `for (const w of logWaiters) w.resolve(entry)`，每个 SSE 连接持有长期 waiter，连接关闭时由 `cancel()` 移除。新增回归测试覆盖。
+>
+> 升级建议：所有 vceshi0.0.7 用户建议升级。如果主要在移动端使用管理面板，强烈推荐升级。
+
+---
+
 > **vceshi0.0.7（re-release）— 追加管理面板 UI 排版系统优化**
 >
 > 本次 re-release 在原 vceshi0.0.7 逻辑修复基础上，追加 UI/排版层的系统优化。无 CLI 命令变化，无需重新生成 start.bat / start.sh。
@@ -25,20 +59,6 @@
 > - "备份与恢复"卡片里手写的假提示框（`<p>` + 内联 `border-left`）改为真正的 `.hint` 横幅，统一所有提示信息的视觉语言
 >
 > ---
-
-> **vceshi0.0.8 — 修复 vceshi0.0.7 引入的"激活账号卡死面板"严重回归**
->
-> vceshi0.0.7 在重写日志 SSE 推送逻辑时引入了一个死循环：`appendLog` 用 `while (logWaiters.length > 0) { shift().resolve() }`，
-> 而 waiter 的 `resolve()` 又会同步把自己 push 回 `logWaiters`，导致 while 条件永远为 true，事件循环被永久阻塞。
->
-> **症状**：只要 SSE 日志流连接着，任何调用 `appendLog` 的操作（点"激活"账号、保存配置、清空凭证等）都会让整个面板卡死，
-> 后端 HTTP 响应永远发不出去，F5 刷新也没用（服务器还卡着），只能重启进程。重启后磁盘写入已完成，所以"重新进入"看到操作其实成功。
->
-> **修复**：把 `appendLog` 改成 `for (const w of logWaiters) w.resolve(entry)`，每个 SSE 连接持有一个长期 waiter，
-> 连接关闭时由 `cancel()` 移除。`resolve(entry)` 直接发送该条日志，无需 re-push 也无需 flushNew 全表扫描。
-> 新增回归测试：SSE 已连接时触发 `appendLog`，5 秒内必须返回响应（旧代码会无限挂起）。
->
-> 升级建议：**所有 vceshi0.0.7 用户必须升级**。vceshi0.0.7 在生产环境基本不可用。
 
 > **vceshi0.0.7 — 管理面板逻辑 Bug 全面修复 + 性能优化**
 >

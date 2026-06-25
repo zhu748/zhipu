@@ -941,6 +941,230 @@ td input{font-family:var(--font-mono)}
   .card-body{padding:var(--s-4)}
   .hero-card{flex-direction:column;align-items:flex-start;text-align:left}
 }
+
+/* ============================================================
+   Mobile (<768px) — drawer sidebar + condensed layout
+   ============================================================
+   Previously the sidebar only collapsed to a 60px icon strip at
+   <=900px. On a phone that 60px strip eats 1/6 of the viewport
+   and there's no way to see nav labels. Now we hide the sidebar
+   off-canvas and surface a hamburger button in the main header. */
+@media (max-width:768px){
+  /* Off-canvas sidebar */
+  .sidebar{
+    position:fixed;top:0;left:0;bottom:0;
+    width:240px;z-index:1100;
+    transform:translateX(-100%);
+    transition:transform var(--t-slow);
+    box-shadow:var(--shadow-lg);
+  }
+  .sidebar.show{transform:translateX(0)}
+  /* Always show labels in drawer mode (the <=900px rule hides them) */
+  .sidebar-brand .brand-text,
+  .nav-item .nav-text,
+  .nav-section-title,
+  .sidebar-footer .version,
+  .sidebar-footer .logout-btn span{display:block !important}
+  .nav-item{justify-content:flex-start !important;padding:var(--s-2) var(--s-5) !important}
+  .nav-item .nav-icon{margin-right:var(--s-3) !important}
+  .sidebar-footer{padding:var(--s-4) var(--s-5) !important;text-align:left !important}
+
+  /* Hamburger button — shown only on mobile */
+  .mobile-menu-btn{
+    display:inline-flex !important;
+    align-items:center;justify-content:center;
+    width:36px;height:36px;
+    border:1px solid var(--border-strong);
+    border-radius:var(--r-md);
+    background:var(--surface-2);color:var(--text);
+    cursor:pointer;flex-shrink:0;
+  }
+  .mobile-menu-btn:hover{background:var(--surface-3)}
+  .mobile-menu-btn svg{width:18px;height:18px}
+
+  /* Backdrop when sidebar is open */
+  .sidebar-backdrop{
+    position:fixed;inset:0;z-index:1099;
+    background:rgba(0,0,0,.5);
+    animation:modalFadeIn .1s ease;
+  }
+
+  /* Header: tighten padding + show hamburger */
+  .main-header{padding:var(--s-3) var(--s-4) !important;gap:var(--s-2)}
+  .main-header h1{font-size:16px}
+  .main-header .subtitle{font-size:11px}
+  .main-content{padding:var(--s-4)}
+
+  /* Hero card: smaller icon, tighter spacing */
+  .hero-card{padding:var(--s-4);gap:var(--s-3)}
+  .hero-card .hero-icon{width:44px;height:44px}
+  .hero-card .hero-icon svg{width:22px;height:22px}
+  .hero-card .hero-title{font-size:15px}
+  .hero-card .hero-meta{font-size:12px;gap:var(--s-2) var(--s-3)}
+
+  /* Stats: 2 cols is still too tight on <=360px */
+  @media (max-width:360px){
+    .stats-grid{grid-template-columns:1fr;gap:var(--s-2)}
+  }
+
+  /* Mini-stats (accounts page summary): 2 cols on mobile */
+  #accountsStatsBar{grid-template-columns:1fr 1fr !important}
+  .mini-stat{padding:10px 12px}
+  .mini-stat .mini-stat-value{font-size:18px}
+
+  /* Cards: tighter padding */
+  .card-header{padding:var(--s-3) var(--s-4)}
+  .card-body{padding:var(--s-4)}
+  .card-actions{padding:var(--s-3) var(--s-4);flex-wrap:wrap}
+  .card-title{font-size:13px}
+
+  /* Tables: keep horizontal scroll but make first column sticky so
+     the row identity (name/model/id) stays visible while scrolling.
+     Also enlarge the scroll hint via .table-wrap::after. */
+  .table-wrap{
+    position:relative;
+    -webkit-overflow-scrolling:touch;
+  }
+  .table-wrap::-webkit-scrollbar{height:6px}
+  /* Reset sticky header positioning — on mobile the table is in
+     horizontal scroll, and a sticky-top header doesn't help. */
+  thead th{
+    position:static;
+    white-space:nowrap;
+  }
+  tbody td{white-space:nowrap}
+  /* Account-table first column (name) — sticky left so user can
+     scroll horizontally through action buttons without losing
+     which row they're on. */
+  #accountsTable td:first-child,
+  #accountsTable th:first-child{
+    position:sticky;left:0;z-index:2;
+    background:var(--surface);
+    box-shadow:2px 0 4px rgba(0,0,0,.15);
+  }
+  #accountsTable tbody tr:hover td:first-child{background:var(--surface-2)}
+
+  /* td-actions: wrap to 2 lines on mobile so 6+ buttons don't
+     squeeze into one unusable row */
+  .td-actions{flex-wrap:wrap;justify-content:flex-start;gap:4px !important}
+  .td-actions .btn{padding:4px 8px;font-size:11px}
+  .td-actions .btn svg{width:12px;height:12px}
+
+  /* Buttons: hide text on icon-only ghost buttons to save space */
+  .btn-sm{padding:4px 8px;font-size:11px}
+
+  /* Tabs: scroll horizontally, hide leading icon to fit more */
+  .tabs{gap:0}
+  .tab{padding:var(--s-3) var(--s-3);font-size:12px}
+  .tab .tab-icon{display:none}
+
+  /* Form rows already collapse to 1fr at <=900px; ensure modals
+     inside fixed containers also collapse. */
+  .modal{max-width:94vw !important;max-height:92vh !important}
+  .modal-header{padding:var(--s-4)}
+  .modal-body{padding:var(--s-4)}
+  .modal-footer{
+    padding:var(--s-3) var(--s-4);
+    flex-wrap:wrap;
+    justify-content:stretch;
+  }
+  .modal-footer .btn{flex:1;min-width:0}
+
+  /* Inline-styled modals (proxyModal, quotaModal, renderExport):
+     override their fixed max-width on mobile */
+  #proxyModal > div,
+  #quotaModal > div{max-width:94vw !important}
+  #proxyModal .form-row,
+  #quotaModal .form-row{grid-template-columns:1fr !important}
+
+  /* Login box: smaller, full-width */
+  .login-box{padding:var(--s-6) var(--s-5);width:100%}
+  .login-box h1{font-size:18px}
+  .login-logo{width:48px;height:48px}
+  .login-logo svg{width:24px;height:24px}
+
+  /* Toast: full-width minus margin */
+  .toast-container{left:var(--s-3);right:var(--s-3);transform:none}
+  .toast{
+    min-width:0;max-width:none;width:100%;
+    flex-direction:row;
+    padding:var(--s-3);
+    font-size:12px;
+  }
+
+  /* kv-grid: stack label above value on mobile */
+  .kv-grid{grid-template-columns:1fr;gap:var(--s-1) 0}
+  .kv-grid .kv-key{font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+
+  /* Log box: shorter on mobile, accounts page header actions stack */
+  .log-box{
+    height:calc(100vh - 220px);
+    min-height:240px;
+    font-size:11px;
+    padding:var(--s-3);
+  }
+  .log-controls{gap:var(--s-2)}
+  .log-controls input{min-width:120px}
+
+  /* Action bar: stack buttons full-width */
+  .action-bar{
+    flex-wrap:wrap;
+    justify-content:stretch;
+    gap:var(--s-2);
+  }
+  .action-bar .btn{flex:1;min-width:0}
+
+  /* Card-header on accounts page: filter row stacks vertically */
+  .card-header{flex-wrap:wrap}
+  .card-header > div:last-child,
+  .card-header > style + div,
+  .card-header [style*="display:flex;gap:8px"]{
+    width:100%;margin-top:var(--s-2);
+  }
+  .card-header input.filter-input,
+  .card-header select.filter-select{
+    width:100%;min-width:0;
+  }
+  .card-header [style*="display:flex;gap:8px"]{flex-direction:column;gap:var(--s-2) !important}
+
+  /* Hint banner: smaller padding */
+  .hint{padding:var(--s-2) var(--s-3);font-size:11px;line-height:1.5}
+  .hint .hint-icon svg{width:12px;height:12px}
+
+  /* Empty state: less vertical padding */
+  .empty-state{padding:var(--s-5) var(--s-2)}
+  .empty-state .empty-icon{width:40px;height:40px}
+
+  /* Form elements: larger touch targets */
+  .form-input,.form-select,.form-textarea,
+  .form-group input,.form-group select,.form-group textarea{
+    font-size:14px; /* iOS Safari zooms below 16px, but 14 keeps the
+                       dashboard compact; we set input font-size:16px on
+                       focus to avoid the zoom. */
+    padding:8px var(--s-3);
+  }
+  .form-input:focus,.form-select:focus,.form-textarea:focus,
+  .form-group input:focus,.form-group select:focus,.form-group textarea:focus{
+    font-size:16px;
+  }
+  .form-label{font-size:11px}
+
+  /* OAuth url-display: stack buttons vertically */
+  .url-display{flex-wrap:wrap}
+  .url-display input{width:100%;font-size:11px}
+
+  /* Footer version dot: hide to save space in drawer footer */
+  /* (Already handled by .sidebar-footer padding reset above) */
+}
+
+/* Hamburger button — hidden on desktop, shown on mobile via the
+   @media block above. Defined here so the default (desktop) state
+   is `display:none` and doesn't flicker on first paint. */
+.mobile-menu-btn{display:none}
+
+/* Sidebar backdrop — default hidden, only added to DOM on mobile
+   when the sidebar is opened. */
+.sidebar-backdrop{display:none}
 </style>
 </head>
 <body>
@@ -1024,7 +1248,7 @@ td input{font-family:var(--font-mono)}
     <div class="sidebar-footer">
       <div class="version">
         <span class="dot"></span>
-        <span>vceshi0.0.7</span>
+        <span>vceshi0.0.8</span>
       </div>
       <div class="logout-btn" onclick="doLogout()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -1986,6 +2210,65 @@ function doLogout(){
   document.getElementById('loginKey').value='';
 }
 
+// --- Mobile drawer (hamburger menu) ---
+// Injects a hamburger button into every .main-header and wires up an
+// off-canvas drawer for the sidebar on screens <=768px. The CSS handles
+// the visual transform; this JS just toggles the .show class and creates
+// a clickable backdrop to close the drawer.
+(function setupMobileDrawer(){
+  const sidebar=document.querySelector('.sidebar');
+  if(!sidebar)return;
+  // Inject hamburger button into every page header (pages are toggled, so
+  // we need one per header — not just the currently visible one).
+  document.querySelectorAll('.main-header').forEach(header=>{
+    const left=header.querySelector('.header-left');
+    if(!left)return;
+    // Skip if already injected (e.g. re-called after dynamic DOM changes).
+    if(header.querySelector('.mobile-menu-btn'))return;
+    const btn=document.createElement('button');
+    btn.className='mobile-menu-btn';
+    btn.type='button';
+    btn.setAttribute('aria-label','打开菜单');
+    btn.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>';
+    btn.addEventListener('click',(e)=>{
+      e.stopPropagation();
+      sidebar.classList.toggle('show');
+      // Toggle backdrop
+      let backdrop=document.querySelector('.sidebar-backdrop');
+      if(sidebar.classList.contains('show')){
+        if(!backdrop){
+          backdrop=document.createElement('div');
+          backdrop.className='sidebar-backdrop';
+          backdrop.style.display='block';
+          backdrop.addEventListener('click',()=>sidebar.classList.remove('show'));
+          document.body.appendChild(backdrop);
+        }
+      }else if(backdrop){
+        backdrop.remove();
+      }
+    });
+    // Insert as the first child of header (before .header-left) so it
+    // appears on the left edge of the header.
+    header.insertBefore(btn,left);
+  });
+  // Close drawer on Escape
+  document.addEventListener('keydown',e=>{
+    if(e.key==='Escape'&&sidebar.classList.contains('show')){
+      sidebar.classList.remove('show');
+      const backdrop=document.querySelector('.sidebar-backdrop');
+      if(backdrop)backdrop.remove();
+    }
+  });
+  // Auto-close drawer when viewport grows back to desktop
+  window.addEventListener('resize',()=>{
+    if(window.innerWidth>768){
+      sidebar.classList.remove('show');
+      const backdrop=document.querySelector('.sidebar-backdrop');
+      if(backdrop)backdrop.remove();
+    }
+  });
+})();
+
 // --- Nav ---
 document.querySelectorAll('.nav-item').forEach(el=>{
   el.addEventListener('click',()=>{
@@ -1993,6 +2276,19 @@ document.querySelectorAll('.nav-item').forEach(el=>{
     document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
     el.classList.add('active');
     document.getElementById('page-'+el.dataset.page).classList.add('active');
+    // Mobile: close the drawer after navigating
+    const sidebar=document.querySelector('.sidebar');
+    if(sidebar&&sidebar.classList.contains('show')){
+      sidebar.classList.remove('show');
+      const backdrop=document.querySelector('.sidebar-backdrop');
+      if(backdrop)backdrop.remove();
+    }
+    // Scroll the main content back to top — otherwise the new page
+    // inherits the scroll position of the previous long page (e.g.
+    // switching from a long accounts list to "概览" stays scrolled
+    // to the bottom, which looks empty).
+    const main=document.querySelector('.main-content');
+    if(main)main.scrollTop=0;
   });
 });
 
@@ -2033,6 +2329,9 @@ async function initDashboard(){
   await loadStats();
   await loadDebugDumps();
   connectLogStream();
+  // Start the periodic stats refresh now that we're authenticated.
+  // (Was previously started at script load — see startStatsInterval comment.)
+  startStatsInterval();
 }
 
 // --- Overview ---
@@ -2101,8 +2400,11 @@ async function loadSettings(){
   try{
     const r=await fetch(API+'/admin/api/config',{headers:authHeaders()});
     const c=await r.json();
-    document.getElementById('cfgPort').value=c.server?.port||8080;
-    document.getElementById('cfgHost').value=c.server?.host||'0.0.0.0';
+    // Note: use ?? for port — `||` would treat a legitimately configured
+    // port of 0 (which on some systems means "let the OS pick a random
+    // free port") as falsy and silently overwrite it with 8080.
+    document.getElementById('cfgPort').value=c.server?.port??8080;
+    document.getElementById('cfgHost').value=c.server?.host??'0.0.0.0';
     document.getElementById('cfgProvider').value=c.provider||'zai';
     document.getElementById('cfgPlan').value=c.plan||'coding-plan';
     document.getElementById('cfgAuthMode').value=c.auth?.mode||'apikey';
@@ -3651,8 +3953,18 @@ let _cachedByCredential={};
 // The old code leaked the interval forever (even after logout) — the inner
 // guard `if(authToken)loadStats()` prevented the actual fetch, but the timer
 // itself leaked. Now we clear it on logout.
+//
+// vceshi0.0.8+: don't start the interval at script load — start it inside
+// initDashboard() after login. The old code started a 10s timer the moment
+// the page loaded, even before the user logged in. The `if(authToken)`
+// guard prevented fetches, but the timer kept firing every 10s for the
+// entire session lifetime of the login page, which is wasteful (especially
+// on mobile where the page may sit open in a background tab).
 let statsIntervalId=null;
-statsIntervalId=setInterval(()=>{if(authToken)loadStats()},10000);
+function startStatsInterval(){
+  if(statsIntervalId)clearInterval(statsIntervalId);
+  statsIntervalId=setInterval(()=>{if(authToken)loadStats()},10000);
+}
 
 async function resetStats(){
   if(!confirm('确认重置所有统计数据？此操作不可撤销。'))return;
