@@ -748,67 +748,6 @@ export async function proxyRequest(
 
   const isSSE = upstreamResp.headers.get("content-type")?.includes("text/event-stream") ?? false;
 
-  // ──────────────────────────────────────────────────────────────────────
-  // Auto-detailed logging for abnormal upstream responses.
-  //
-  // When the upstream returns anything unusual (5xx, 429, 529, empty 200,
-  // or any non-OK status), we ALWAYS log the key headers + body preview —
-  // NOT gated behind `logging.debug`. This prevents the #1 support pain:
-  // "I see 529 / empty 200 in the log but have no idea what the upstream
-  // actually returned — is it quota exhausted? overloaded? captcha?".
-  //
-  // Normal 200 responses are NOT logged here (they're too frequent and
-  // would flood the log). Use `logging.debug: true` for full logging.
-  // ──────────────────────────────────────────────────────────────────────
-  const isAbnormal = !upstreamResp.ok || upstreamResp.status >= 400 ||
-    upstreamResp.headers.get("x-zcode-empty-stream") === "1";
-  if (isAbnormal) {
-    try {
-      const ct = upstreamResp.headers.get("content-type") ?? "";
-      const retryAfter = upstreamResp.headers.get("retry-after") ?? "";
-      const emptyStream = upstreamResp.headers.get("x-zcode-empty-stream") ?? "";
-      const ratelimitRemaining = upstreamResp.headers.get("anthropic-ratelimit-requests-remaining")
-        ?? upstreamResp.headers.get("x-ratelimit-remaining") ?? "";
-      const parts = [`status=${upstreamResp.status}`, `ct=${ct || "(none)"}`];
-      if (retryAfter) parts.push(`retry-after=${retryAfter}`);
-      if (emptyStream) parts.push(`empty-stream=${emptyStream}`);
-      if (ratelimitRemaining) parts.push(`ratelimit-remaining=${ratelimitRemaining}`);
-      console.log(`${reqId} ⚠ upstream error: ${parts.join(" | ")}`);
-
-      // Read body for preview — clone first so we don't consume the original.
-      // For non-OK responses the body is usually small (error JSON), so
-      // reading it in full is fine. For SSE streams we read the first ~2KB.
-      let bodyPreview = "";
-      try {
-        const cloned = upstreamResp.clone();
-        if (ct.includes("text/event-stream") && cloned.body) {
-          // SSE: read first 2KB or first complete event
-          const reader = cloned.body.getReader();
-          const decoder = new TextDecoder();
-          const deadline = Date.now() + 3000;
-          while (bodyPreview.length < 2048 && Date.now() < deadline) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            bodyPreview += decoder.decode(value, { stream: true });
-            if (bodyPreview.includes("\n\n") && bodyPreview.length > 50) break;
-          }
-          try { reader.cancel(); } catch {}
-        } else {
-          // Non-SSE (JSON / text / empty): read in full (usually small error body)
-          bodyPreview = await cloned.text();
-        }
-      } catch {
-        bodyPreview = "(body read failed)";
-      }
-      const trimmed = bodyPreview.length > 500
-        ? bodyPreview.slice(0, 500) + `...(truncated, ${bodyPreview.length} chars total)`
-        : bodyPreview;
-      console.log(`${reqId} ⚠ upstream body: ${trimmed || "(empty)"}`);
-    } catch (e) {
-      console.log(`${reqId} ⚠ failed to log upstream error detail: ${(e as Error).message}`);
-    }
-  }
-
   // Diagnostic: when the upstream rejects with 4xx (especially 3001 "parameter
   // error" from GLM), record a debug dump in memory so the user can inspect
   // the exact transformed body via /admin/api/debug-dumps without writing
