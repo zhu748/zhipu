@@ -774,7 +774,7 @@ describe("config loader: credentialSwitchThreshold", () => {
     delete process.env.ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD;
   });
 
-  it("defaults to 5 when not specified", async () => {
+  it("defaults to 2 when not specified (v0.1.5+; was 5 — but 5 > maxRetries=3 made the feature a no-op)", async () => {
     const { loadConfig } = await import("../config/loader.js");
     const path = writeYaml(`
 auth:
@@ -782,7 +782,7 @@ auth:
   apiKey: "abc"
 `);
     const cfg = loadConfig(path);
-    expect(cfg.retry.credentialSwitchThreshold).toBe(5);
+    expect(cfg.retry.credentialSwitchThreshold).toBe(2);
   });
 
   it("loads from YAML", async () => {

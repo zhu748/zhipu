@@ -6,7 +6,7 @@ import { loadConfig } from "./config/loader.js";
 import { EXAMPLE_CONFIG_YAML } from "./config/template.js";
 import { AuthManager } from "./auth/manager.js";
 import { startServer } from "./server/server.js";
-import { loadCredential, saveCredential, clearCredential, getStorePath, exportAccounts, listAccounts } from "./auth/store.js";
+import { loadCredential, saveCredential, clearCredentialAsync, getStorePath, exportAccounts, listAccounts } from "./auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "./auth/oauth.js";
 import { KeyResolver } from "./auth/resolver.js";
 import { readZCodeImport } from "./auth/zcode-config.js";
@@ -15,7 +15,7 @@ import type { ProviderId } from "./provider/types.js";
 import { spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 
-const VERSION = "0.1.5";
+const VERSION = "0.1.6";
 
 // ---------------------------------------------------------------------------
 // Process-level error handlers — installed ONCE before main() so they cover
@@ -120,7 +120,10 @@ Usage:
                                     Import API key from ~/.zcode/v2/config.json
   zcode-proxy auth logout           Clear stored credentials
   zcode-proxy auth status           Show current authentication state
-  zcode-proxy auth export           Print base64 credential for remote deploy
+  zcode-proxy auth export [--output FILE] [--quiet]
+                                    Export base64 credential for remote deploy
+                                    --output FILE  write to file (0600) instead of stdout (safer)
+                                    --quiet        base64 only, no banner (for piping)
   zcode-proxy version               Show version
   zcode-proxy help                  Show this help
 
@@ -131,6 +134,8 @@ Examples:
                                     Import existing key from ZCode config
   zcode-proxy auth status           Check if logged in
   zcode-proxy auth export           Print ZCODE_OAUTH_CREDENTIAL value for Render
+  zcode-proxy auth export --output cred.b64
+                                    Write blob to cred.b64 (0600) — avoids scrollback/CI log leaks
 `);
 }
 
@@ -371,11 +376,11 @@ function authCommand(args: string[]): void {
   if (sub === "login") {
     authLogin(args.slice(1)).catch(fatalError);
   } else if (sub === "logout") {
-    authLogout();
+    authLogout().catch(fatalError);
   } else if (sub === "status") {
     authStatus().catch(fatalError);
   } else if (sub === "export") {
-    authExport().catch(fatalError);
+    authExport(args.slice(1)).catch(fatalError);
   } else {
     console.error("Usage: zcode-proxy auth <login|logout|status|export>");
     process.exit(1);
@@ -485,12 +490,17 @@ async function authLogin(args: string[]): Promise<void> {
   console.log(`  Stored:  ${getStorePath()}`);
 }
 
-function authLogout(): void {
+async function authLogout(): Promise<void> {
   if (!existsSync(getStorePath())) {
     console.log("Not logged in.");
     return;
   }
-  clearCredential();
+  // Use clearCredentialAsync (mutex-protected) — the CLI logout runs in a
+  // separate process from the running proxy, but if the user runs logout
+  // while a dashboard edit is mid-flight, the async version avoids the
+  // "file resurrected" race. The proxy's own mtime-aware cache will
+  // detect this delete on its next readStore() call.
+  await clearCredentialAsync();
   console.log("Logged out. Credentials removed.");
 }
 
@@ -518,7 +528,9 @@ async function authStatus(): Promise<void> {
  *
  * Usage:
  *   1. Locally:   zcode-proxy auth login zai
- *   2. Locally:   zcode-proxy auth export   # prints base64 blob
+ *   2. Locally:   zcode-proxy auth export   # prints base64 blob to stdout
+ *                 zcode-proxy auth export --output cred.b64  # writes to file (0600)
+ *                 zcode-proxy auth export --quiet            # base64 only, no banner
  *   3. Remotely:  set ZCODE_AUTH_MODE=oauth
  *                 set ZCODE_OAUTH_CREDENTIAL=<base64 blob from step 2>
  *
@@ -530,8 +542,34 @@ async function authStatus(): Promise<void> {
  * setup) instead of just the active one. The remote host's render-start.sh
  * currently only consumes the single-credential form; --accounts is for
  * custom deployment scripts that import via the dashboard's import endpoint.
+ *
+ * v0.1.5+ SECURITY: --output <file> writes the blob to a file with 0600
+ * permissions (owner-only read/write) instead of stdout. This avoids
+ * leaking the credential through terminal scrollback, CI logs, screen
+ * recordings, SSH session recordings, log aggregators, etc. The file can
+ * then be `scp`'d to the remote host or piped via stdin to render/kubectl.
+ * Recommended workflow: `--output cred.b64 && scp cred.b64 remote: &&
+ * shred -u cred.b64`. Use --quiet only when piping to a known-safe consumer
+ * (e.g. `--quiet | base64 -d > /dev/null` for verification) — the base64
+ * blob still appears in scrollback/history even without the banner.
  */
-async function authExport(): Promise<void> {
+async function authExport(args: string[]): Promise<void> {
+  // Parse flags — `--output <path>` and `--quiet` are the two new options.
+  // The original no-args form (banner + blob to stdout) is preserved for
+  // backward compatibility.
+  const outputIdx = args.indexOf("--output");
+  let outputPath: string | undefined;
+  if (outputIdx >= 0 && outputIdx + 1 < args.length) {
+    outputPath = args[outputIdx + 1];
+  } else if (outputIdx >= 0) {
+    console.error("--output requires a file path argument");
+    process.exit(1);
+  }
+  // Also accept --output=<path> form
+  const outputEq = args.find(a => a.startsWith("--output="));
+  if (outputEq) outputPath = outputEq.slice("--output=".length);
+  const quiet = args.includes("--quiet");
+
   const cred = await loadCredential();
   if (!cred) {
     console.error("Not logged in. Run: zcode-proxy auth login <zai|bigmodel>");
@@ -541,6 +579,40 @@ async function authExport(): Promise<void> {
   const json = JSON.stringify(cred);
   const b64 = Buffer.from(json, "utf8").toString("base64");
 
+  if (outputPath) {
+    // File mode — write with 0600 (owner-only) permissions to avoid leaking
+    // through world-readable files. Bun/Node's fs.writeFileSync mode option
+    // is masked by the process umask, so we explicitly chmod after write to
+    // guarantee 0600 regardless of umask.
+    const { writeFileSync, chmodSync } = await import("node:fs");
+    try {
+      writeFileSync(outputPath, b64 + "\n", { mode: 0o600 });
+      chmodSync(outputPath, 0o600);
+    } catch (err) {
+      console.error(`Failed to write to ${outputPath}: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    console.log(`Credential blob written to: ${outputPath}`);
+    console.log(`Permissions: 0600 (owner-only)`);
+    console.log("");
+    console.log("Next steps:");
+    console.log(`  scp ${outputPath} remote:/tmp/cred.b64`);
+    console.log(`  ssh remote 'export ZCODE_AUTH_MODE=oauth ZCODE_OAUTH_CREDENTIAL=$(cat /tmp/cred.b64)' ...`);
+    console.log(`  shred -u ${outputPath}  # secure-delete the local copy when done`);
+    console.log("");
+    console.log("⚠  Treat this file like a password. Never commit it to git.");
+    return;
+  }
+
+  if (quiet) {
+    // Quiet mode — base64 only, no banner. Suitable for piping to known-safe
+    // consumers. WARNING: still appears in scrollback/history — use --output
+    // for sensitive workflows.
+    process.stdout.write(b64 + "\n");
+    return;
+  }
+
+  // Legacy mode — banner + blob to stdout (original behavior).
   console.log("=== ZCODE_OAUTH_CREDENTIAL (base64) ===");
   console.log(b64);
   console.log("=== END ===");
@@ -555,6 +627,9 @@ async function authExport(): Promise<void> {
   console.log("⚠  This blob contains your upstream credential in plaintext.");
   console.log("⚠  Treat it like a password. Never commit it to git.");
   console.log("⚠  On Render, mark the env var as Secret so it's masked in logs.");
+  console.log("");
+  console.log("Tip: use `--output <file>` to write the blob to a 0600 file instead of stdout,");
+  console.log("     avoiding terminal scrollback / CI log / screen recording leaks.");
 }
 
 async function runOAuth(provider: ProviderId): Promise<{ accessToken: string; userId?: string; jwt?: string; email?: string }> {

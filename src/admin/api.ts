@@ -7,7 +7,7 @@
 import type { ProxyConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
-import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, setAccountName, setAccountEmail, setAccountDisabled, exportSingleAccount, exportAccounts, exportStore, importAccounts, maskApiKey, invalidateStoreCache } from "../auth/store.js";
+import { loadCredential, saveCredential, clearCredentialAsync, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, setAccountName, setAccountEmail, setAccountDisabled, exportSingleAccount, exportAccounts, exportStore, importAccounts, maskApiKey, invalidateStoreCache } from "../auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { queryQuota } from "../auth/quota.js";
@@ -442,7 +442,53 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     if (!token && path === "/admin/api/logs/stream") {
       token = url.searchParams.get("token") ?? "";
     }
-    if (opts.config.auth.proxyApiKey && !timingSafeEqual(token, opts.config.auth.proxyApiKey)) {
+
+    // v0.1.5+ SECURITY: when proxyApiKey is NOT configured, all admin API
+    // routes (except /verify which has its own logic) require the request
+    // to come from the loopback address (127.0.0.1, ::1, localhost).
+    //
+    // Without this check, anyone who can reach the proxy port can:
+    //   - POST /admin/api/credentials → inject their own API key
+    //   - DELETE /admin/api/credentials → wipe the user's stored accounts
+    //   - PUT /admin/api/config → change config (e.g. disable proxyApiKey)
+    //   - POST /admin/api/accounts/import → inject credentials
+    //
+    // Loopback-only is a safe default: local dev tools (dashboard, CLI)
+    // run on the same host. Remote admin requires explicit proxyApiKey
+    // configuration. Operators who want remote admin without auth can
+    // still do so by binding to 0.0.0.0 + setting proxyApiKey (recommended)
+    // or by accepting the risk and proxying via SSH.
+    if (!opts.config.auth.proxyApiKey) {
+      // Detect loopback from X-Forwarded-For (when behind a trusted reverse
+      // proxy) OR from the connection's remote address. Bun exposes the
+      // latter via the `req` Request's underlying socket — but the Fetch
+      // API doesn't expose socket info, so we rely on a header convention.
+      // We check X-Real-IP first (Nginx default), then X-Forwarded-For
+      // (general proxy), then assume loopback if neither is set (direct
+      // local connection — the common dev case).
+      const xRealIp = req.headers.get("x-real-ip") ?? "";
+      const xForwardedFor = req.headers.get("x-forwarded-for") ?? "";
+      const remoteIp = xRealIp || (xForwardedFor ? xForwardedFor.split(",")[0].trim() : "");
+      const isLoopback = remoteIp === ""
+        || remoteIp === "127.0.0.1"
+        || remoteIp === "::1"
+        || remoteIp === "localhost"
+        || remoteIp === "::ffff:127.0.0.1";
+
+      if (!isLoopback) {
+        // Non-loopback remote + no proxyApiKey configured → reject.
+        // Surface a clear message so the operator knows what to fix.
+        return errorResponse(
+          401,
+          "authentication_required",
+          "Admin API requires auth.proxyApiKey to be configured when accessed from a non-loopback address. " +
+          "Set `auth.proxyApiKey` in config.yaml or env ZCODE_PROXY_API_KEY, then provide it as " +
+          "`Authorization: Bearer <key>` on admin API requests.",
+        );
+      }
+      // Loopback + no proxyApiKey → allow (legacy dev behavior).
+      // Fall through to per-route logic.
+    } else if (!timingSafeEqual(token, opts.config.auth.proxyApiKey)) {
       return errorResponse(401, "authentication_error", "Invalid admin token");
     }
   }
@@ -633,7 +679,11 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // defeating the purpose of the clear action and creating a confusing
   // "I cleared credentials but the proxy still works" experience.
   if (path === "/admin/api/credentials" && method === "DELETE") {
-    clearCredential();
+    // Use clearCredentialAsync (mutex-protected) instead of sync clearCredential
+    // — the sync version can race with concurrent withStoreLock writers
+    // (handler.ts auto-switch + dashboard add/edit running in parallel),
+    // causing the deleted file to be "resurrected" by the in-flight write.
+    await clearCredentialAsync();
     opts.auth.clearOAuthCredential();
     appendLog("info", "All credentials cleared via admin dashboard");
     return jsonResp({ ok: true });
@@ -1823,29 +1873,66 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         };
         logWaiters.push(waiter);
 
-        // Safety-net polling: 2s interval, used only to recover from the
-        // rare race where appendLog fires between the buffer-scan above and
-        // the logWaiters.push() above. Slow enough to be cheap on idle
-        // systems; fast enough that the race window is negligible.
-        const interval = setInterval(() => {
-          if (closed) return;
-          flushNew();
-        }, 2000);
-
-        // Safety timeout: close after 1 hour
-        const maxTimeout = setTimeout(() => {
-          doCleanup();
-          try { controller.close(); } catch { /* already closed */ }
-        }, 3600000);
+        // v0.1.5+ HEARTBEAT + SHORTER maxTimeout.
+        //
+        // doCleanup is declared BEFORE the intervals that reference it
+        // (heartbeats call doCleanup on enqueue failure). const-hoisting +
+        // closure semantics make this safe: setInterval's callback fires
+        // asynchronously, well after `doCleanup` has been assigned.
+        let interval: ReturnType<typeof setInterval> | null = null;
+        let heartbeat: ReturnType<typeof setInterval> | null = null;
+        let maxTimeout: ReturnType<typeof setTimeout> | null = null;
 
         const doCleanup = () => {
           closed = true;
-          clearInterval(interval);
-          clearTimeout(maxTimeout);
+          if (interval) clearInterval(interval);
+          if (heartbeat) clearInterval(heartbeat);
+          if (maxTimeout) clearTimeout(maxTimeout);
           const idx = logWaiters.indexOf(waiter);
           if (idx >= 0) logWaiters.splice(idx, 1);
         };
         cleanup = doCleanup;
+
+        // Safety-net polling: 2s interval, used only to recover from the
+        // rare race where appendLog fires between the buffer-scan above and
+        // the logWaiters.push() above. Slow enough to be cheap on idle
+        // systems; fast enough that the race window is negligible.
+        interval = setInterval(() => {
+          if (closed) return;
+          flushNew();
+        }, 2000);
+
+        // v0.1.5+ HEARTBEAT: send a no-op SSE comment (": heartbeat\n\n")
+        // every 30s. This serves two purposes:
+        //   1. Detects dead connections — if the client closed without
+        //      sending TCP FIN (mobile network drops, browser tab crash,
+        //      laptop sleep), the controller.enqueue throws and we clean
+        //      up the waiter. Without this, the waiter leaks for the full
+        //      maxTimeout window (10 min), and appendLog keeps calling
+        //      resolve() on it (no-op but still O(N) iteration cost).
+        //   2. Keeps the TCP connection alive through proxies / load
+        //      balancers that close idle connections after 60s.
+        // The SSE comment line (starting with ":") is ignored by the
+        // browser's EventSource API — it doesn't trigger any message event.
+        heartbeat = setInterval(() => {
+          if (closed) return;
+          try {
+            controller.enqueue(encoder.encode(`: heartbeat\n\n`));
+          } catch {
+            // enqueue failed — client is gone. Trigger cleanup.
+            doCleanup();
+            try { controller.close(); } catch { /* already closed */ }
+          }
+        }, 30_000);
+
+        // v0.1.5+ SHORTER maxTimeout: was 1 hour (way too long — leaked
+        // waiters up to 1h per disconnected client). 10 minutes is plenty
+        // for a dashboard log viewer session; the client auto-reconnects
+        // via EventSource's built-in retry after we close.
+        maxTimeout = setTimeout(() => {
+          doCleanup();
+          try { controller.close(); } catch { /* already closed */ }
+        }, 600_000);
       },
       cancel() {
         // Cleanup if the client disconnects early

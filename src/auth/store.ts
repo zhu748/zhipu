@@ -60,8 +60,20 @@ const ENV_LEGACY_SEED = "ZCODE_PROXY_LEGACY_SEED";
  * "not yet loaded" (distinct from `null` = "loaded but file doesn't exist").
  * Invalidated by every writeStore() and clearCredential() call so callers
  * always see fresh data after a mutation.
+ *
+ * v0.1.5+ STALENESS DETECTION: cross-process writes (e.g. `auth login` from
+ * start.bat while the proxy is running) won't invalidate this cache — they
+ * happen in a separate process. To catch that case, loadCredential() and
+ * exportAccounts() now stat() the file's mtimeMs and compare against the
+ * cached value. If the file was modified externally, the cache is dropped
+ * and the next read goes to disk. This is cheap (one stat per read) and
+ * catches the common case of "user added a credential via CLI".
  */
 let cachedStore: StoreV2 | null | undefined = undefined;
+/** mtimeMs of the on-disk credentials.json at the time cachedStore was
+ *  populated. Used to detect external writes (cross-process). -1 = unknown
+ *  (force re-read on next access). 0 = file didn't exist. */
+let cachedStoreMtimeMs = -1;
 
 /**
  * Guard flag set by readStoreUncached() when credentials.json exists on disk
@@ -410,22 +422,60 @@ function defaultLabel(cred: Credential, createdAt: number): string {
   return `${cred.provider} · ${ts}`;
 }
 
-/** Read raw store (migrates v1 if needed). Returns null if file doesn't exist.
+/**
+ * Read the store, using the in-memory cache when fresh. Detects external
+ * writes by stat-ing the file's mtimeMs — if the file changed on disk
+ * (e.g. `auth login` from start.bat in another process added a credential),
+ * the cache is dropped and the next read goes to disk.
  *
- * Results are cached in module memory and invalidated on every writeStore()
- * call. This avoids re-running AES-256-GCM decryption on every admin endpoint
- * invocation (9+ endpoints all call loadCredential() — that used to mean
- * 9 disk reads + 9 decrypts per dashboard refresh).
- *
- * The cache is process-local: a CLI invocation (e.g. `zcode-proxy auth login`
- * from start.bat) writes to the same credentials.json on disk, but the
- * long-running proxy process won't see the change because cachedStore is
- * still pointing at the old in-memory copy. Call invalidateStoreCache()
- * before reads that must reflect external writes (e.g. dashboard refresh).
+ * The stat() call is ~50µs on Linux/macOS and ~200µs on Windows — negligible
+ * compared to the JSON parse + AES-256-GCM decrypt we'd otherwise do (~1ms).
  */
 async function readStore(): Promise<StoreV2 | null> {
+  if (cachedStore !== undefined) {
+    // Cache populated — check mtime to detect external writes.
+    // Skip the stat if we know the file doesn't exist (cachedStore === null
+    // and cachedStoreMtimeMs === 0 means "loaded, file didn't exist").
+    if (cachedStoreMtimeMs === 0) return cachedStore;
+    try {
+      const st = statSync(STORE_FILE);
+      if (st.mtimeMs === cachedStoreMtimeMs) {
+        return cachedStore; // fresh
+      }
+      // mtime changed — external write. Drop cache + fall through.
+      console.log("[store] credentials.json mtime changed — external write detected, refreshing cache");
+      cachedStore = undefined;
+      cachedStoreMtimeMs = -1;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT") {
+        // File was deleted externally — cache is now stale (if it claimed
+        // to exist) or already correct (if it claimed null).
+        if (cachedStore !== null) {
+          console.log("[store] credentials.json disappeared — external delete detected, refreshing cache");
+          cachedStore = undefined;
+          cachedStoreMtimeMs = -1;
+        }
+      } else {
+        // EPERM/EBUSY/etc — be conservative, drop cache.
+        cachedStore = undefined;
+        cachedStoreMtimeMs = -1;
+      }
+    }
+  }
   if (cachedStore !== undefined) return cachedStore;
   cachedStore = await readStoreUncached();
+  // Capture mtime AFTER the successful read so subsequent reads can detect
+  // external writes. If the file doesn't exist, set 0 (skip-stat fast path).
+  if (cachedStore === null) {
+    cachedStoreMtimeMs = 0;
+  } else {
+    try {
+      cachedStoreMtimeMs = statSync(STORE_FILE).mtimeMs;
+    } catch {
+      cachedStoreMtimeMs = -1; // unknown — force re-stat next time
+    }
+  }
   return cachedStore;
 }
 
@@ -439,6 +489,7 @@ async function readStore(): Promise<StoreV2 | null> {
  */
 export function invalidateStoreCache(): void {
   cachedStore = undefined;
+  cachedStoreMtimeMs = -1;
 }
 
 /** Uncached inner implementation. Does the actual disk + decrypt work. */
@@ -801,6 +852,13 @@ async function writeStore(store: StoreV2): Promise<void> {
     console.warn(`[store] Set ZCODE_PROXY_STORE_DIR to a writable path (e.g. /data/.zcode-proxy on Render with a disk, or /tmp/.zcode-proxy for ephemeral storage).`);
   }
   cachedStore = store; // keep cache in sync with what we intended to write
+  // Capture the post-write mtime so subsequent reads see "fresh" without
+  // having to re-stat (we know we just wrote it).
+  try {
+    cachedStoreMtimeMs = statSync(STORE_FILE).mtimeMs;
+  } catch {
+    cachedStoreMtimeMs = -1;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -862,7 +920,78 @@ export async function loadCredential(): Promise<Credential | null> {
   return account?.credential ?? null;
 }
 
-/** Clear ALL stored credentials (preserves old behavior — used by "Clear Credentials" button). */
+/**
+ * Clear ALL stored credentials — ASYNC, mutex-protected version.
+ *
+ * Production code (handler.ts, admin/api.ts, index.ts) should use THIS
+ * function instead of the synchronous clearCredential() to avoid the
+ * following race:
+ *
+ *   1. Caller A acquires storeWriteMutex, readStore(), mutates store
+ *   2. Caller B calls clearCredential() (sync) → unlinkSync(STORE_FILE)
+ *   3. Caller A's writeStore() re-creates the file with A's mutated store
+ *   4. Result: user clicked "Clear", but credentials.json was "resurrected"
+ *
+ * clearCredentialAsync() acquires storeWriteMutex BEFORE the unlink, so
+ * any in-flight writeStore() finishes (or hasn't started) before we delete.
+ * After the unlink, the cache is reset to null (file gone) and mtime to 0
+ * (skip-stat fast path on next readStore).
+ *
+ * @throws on persistent EPERM/EBUSY after retries (same as sync version).
+ */
+export async function clearCredentialAsync(): Promise<void> {
+  await storeWriteMutex.run(async () => {
+    if (!existsSync(STORE_FILE)) {
+      // File already gone — just reset state.
+      cachedStore = null;
+      cachedStoreMtimeMs = 0;
+      cachedKey = null;
+      undecryptableFilePresent = false;
+      return;
+    }
+    // Windows: unlink can fail with EPERM/EBUSY/EACCES if AV / indexer /
+    // backup tool briefly has the file open. Retry with backoff.
+    const MAX_RETRIES = 5;
+    const RETRY_DELAY_MS = 50;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        unlinkSync(STORE_FILE);
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
+          // ASYNC sleep — no event-loop blocking (unlike sync clearCredential).
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
+          continue;
+        }
+        // ENOENT (already gone) is fine — treat as success.
+        if (code === "ENOENT") {
+          lastErr = null;
+          break;
+        }
+        throw err; // other non-retryable
+      }
+    }
+    if (lastErr) throw lastErr;
+    cachedStore = null;       // file gone, cache reflects that
+    cachedStoreMtimeMs = 0;   // skip-stat fast path on next readStore
+    cachedKey = null;
+    undecryptableFilePresent = false;
+  });
+}
+
+/**
+ * Clear ALL stored credentials — SYNC version, retained for backward compat
+ * with test code (which calls clearCredential() directly without await).
+ *
+ * ⚠️ NOT MUTEX-SAFE — concurrent withStoreLock() callers can "resurrect"
+ * the file by writing their in-flight store after this unlink. Production
+ * code should use clearCredentialAsync() instead. Tests don't need mutex
+ * protection because they run serially (no concurrent writers).
+ */
 export function clearCredential(): void {
   if (existsSync(STORE_FILE)) {
     // Windows: unlinkSync can fail with EPERM/EBUSY/EACCES if another process
@@ -890,12 +1019,14 @@ export function clearCredential(): void {
           while (Date.now() < end) { /* spin */ }
           continue;
         }
-        throw err; // ENOENT (already gone) or other non-retryable error
+        if (code === "ENOENT") { lastErr = null; break; }
+        throw err; // other non-retryable
       }
     }
     if (lastErr) throw lastErr;
   }
   cachedStore = null; // invalidate store cache
+  cachedStoreMtimeMs = 0; // skip-stat fast path
   cachedKey = null;   // invalidate key cache (will be repopulated with the same fixed key)
   // Clear the guard flag — once the user has explicitly cleared credentials,
   // they're free to save new ones without the "refusing to overwrite" error.

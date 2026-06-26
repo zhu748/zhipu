@@ -110,13 +110,14 @@ retry:
   # switches to another stored credential (if available) and continues retrying.
   # Already-tried credentials are skipped in the same request to avoid cycling.
   #
-  # Set to 0 to disable. Default: 5.
+  # Set to 0 to disable. Default: 2 (v0.1.5+; was 5 — but 5 > maxRetries=3
+  # made the feature a no-op under default config).
   #
   # Only effective when:
   #   1. More than one credential is stored (add accounts via the dashboard or
   #      `zcode-proxy auth login`).
   #   2. maxRetries >= this threshold (otherwise the retry loop exhausts first).
-  credentialSwitchThreshold: 5
+  credentialSwitchThreshold: 2
 
 # --- Responses thinking override (Codex CLI workaround) ---
 # Codex CLI frequently sends `reasoning: null` in the /v1/responses wire

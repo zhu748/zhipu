@@ -1,5 +1,57 @@
 # zcode-proxy 使用说明
 
+> **v0.1.6 — 全面优化：Captcha 并发保护 + 凭证竞态修复 + Admin API 默认鉴权 + authExport 安全输出**
+>
+> 本次更新聚焦于「用着用着突然不能用」类问题的根因修复。全套 508/508 测试通过，TypeScript 编译零错误，生产编译（786 模块 → 单文件 exe）成功。
+>
+> **核心修复 1：Captcha Solver 并发保护（防止 OOM 崩溃）**
+> - 症状：start-plan 模式下，多个并发请求同时遇到 token 过期时，每个请求都会启动一个独立的 JSDOM 实例（每个 50-100MB），4 个并发 = 400MB 内存峰值，长时间运行容易 OOM
+> - 修复：新增 `solveMutex` 串行化所有 JSDOM solve 调用，同一时刻只允许一个 JSDOM 实例存在
+> - 双重检查锁定：第二个调用者拿到锁后会先检查 cache，如果第一个调用者已 solve 完就直接复用，省掉一次 JSDOM 启动
+> - `pendingInvalidate` 机制：403 触发 invalidate 时如果 solve 正在进行，solve 完成后丢弃结果，避免旧 token 污染 cache
+> - 配置获取超时：8s timeout + AbortController，避免 zcode.z.ai 网络问题导致整个请求挂死
+> - JSDOM 资源彻底清理：finally 块清理 interval/timeout/window/document 引用，防止内存泄漏
+> - 错误分类：配置不可用不重试（不会突然恢复），只有 solve 失败才重试
+>
+> **核心修复 2：clearCredential 竞态（防止凭证"复活"）**
+> - 症状：用户点击"清除凭证"时，如果同时有 auto-switch 写入在进行，写入会把刚删的 credentials.json 重新创建出来，导致凭证"复活"
+> - 修复：新增 `clearCredentialAsync()` 走 `storeWriteMutex`，确保任何 in-flight 写入完成后才执行删除
+> - 生产代码（`auth logout` 命令、dashboard 的"清除凭证"按钮）全部改用 async 版本
+> - 同步版本保留给测试用，加了 ⚠️ 注释标明不安全
+>
+> **核心修复 3：跨进程凭证缓存同步（无需重启即可看到新凭证）**
+> - 症状：proxy 运行中，用户通过 `start.bat` 跑 `auth login` 添加新凭证，proxy 的 auto-switch 不会用到新凭证（cache 不刷新）
+> - 修复：`readStore()` 加 mtime 检测，每次读 cache 前先 stat 文件 mtimeMs，如果变化（说明 CLI 进程改了 credentials.json）就丢弃缓存重新读盘
+> - 新增凭证后运行中的 proxy 在下一次 auto-switch 时就能看到，不需要重启
+>
+> **安全加固 1：Admin API 默认鉴权（防止远程清空凭证）**
+> - 症状：当 `proxyApiKey` 未配置时，所有 `/admin/api/*` 路由完全开放，任何能访问端口的人都可以 POST 凭证、DELETE 清空、PUT 改配置
+> - 修复：`proxyApiKey` 未配置时，admin API 要求 loopback 来源（127.0.0.1 / ::1 / localhost），非 loopback 返回 401 提示配置 `proxyApiKey`
+> - 本地开发不受影响（dashboard / CLI 都走 loopback），远程管理必须显式配置 `proxyApiKey`
+>
+> **安全加固 2：authExport 安全输出（防止凭证泄漏到 stdout）**
+> - 症状：`zcode-proxy auth export` 把 base64 编码的完整凭证（apiKey / secret / jwt / userId）打印到 stdout，会被终端 scrollback / CI 日志 / 录屏 / SSH 录像 / log 聚合捕获
+> - 修复：新增 `--output <file>` 选项，写文件 + 强制 0600 权限（owner-only），避免 stdout 暴露
+> - 新增 `--quiet` 选项，只输出 base64 无 banner，便于管道（但仍有 scrollback 风险，敏感场景用 `--output`）
+> - 默认行为保留（向后兼容），但加了 tip 提示用 `--output`
+>
+> **逻辑修复：credentialSwitchThreshold 默认值（5 → 2）**
+> - 症状：默认 `credentialSwitchThreshold=5` > `maxRetries=3`，导致通用凭证切换在默认配置下永不触发（retry 循环先耗尽）
+> - 修复：默认值改为 2，失败 2 次后切换到下一个凭证，并 grant +1 attempt 让新凭证真的有机会被试
+>
+> **性能优化：logWaiters 泄漏修复**
+> - 症状：dashboard SSE 日志连接的 waiter 最长泄漏 1 小时（maxTimeout=3600s），浏览器崩溃/移动网络断开后 appendLog 每次都遍历死 waiter
+> - 修复：maxTimeout 从 1h → 10min；新增 30s 心跳（发送 `: heartbeat\n\n` SSE 注释），enqueue 失败立即清理 waiter
+>
+> **CLI 变化（不影响 start.bat / start.sh）**
+> - `auth export` 新增 `--output <file>` 和 `--quiet` 选项（旧脚本不调用 `auth export`，无需重新生成）
+> - `auth logout` 内部改为 async（用户视角无变化，调用方式不变）
+> - `printHelp` 输出更新，反映新的 `--output` / `--quiet` 选项
+>
+> **配置变化**
+> - `retry.credentialSwitchThreshold` 默认值从 5 改为 2（已同步更新 config.example.yaml）
+> - 其他配置项无变化，无需用户手动迁移
+>
 > **v0.1.5 — 代码质量优化 + Anthropic 强制流式输出 + 代理测试连接 + 上游超时配置**
 >
 > 本次更新包含大量代码质量改进和新功能。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 508/508 测试通过，TypeScript 编译零错误。

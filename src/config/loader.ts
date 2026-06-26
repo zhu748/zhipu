@@ -46,7 +46,14 @@ const DEFAULTS = {
   RETRY_MAX_DELAY_MS: 8000,
   RETRY_BACKOFF_FACTOR: 2,
   RETRY_STATUSES: [529],
-  RETRY_CREDENTIAL_SWITCH_THRESHOLD: 5,
+  // v0.1.5+: lowered from 5 to 2. With maxRetries=3 (default), the old
+  // value 5 meant the retry loop ALWAYS exhausted before the switch could
+  // trigger — making the feature a no-op. 2 means after the initial
+  // failure + 1 retry fail (2 consecutive failures), we switch to the next
+  // credential and grant one extra attempt (extraAttemptsFromSwitches=1)
+  // so the new credential actually gets tried. Default still safe: if
+  // maxRetries is increased, switchThreshold=2 just triggers earlier.
+  RETRY_CREDENTIAL_SWITCH_THRESHOLD: 2,
   RETRY_EMPTY_STREAM_SWITCH_THRESHOLD: 3,
 };
 
