@@ -1588,3 +1588,148 @@ describe("transformRequestBody — metadata.user_id (Anthropic)", () => {
     expect(parsed.metadata).toEqual({ user_id: "user-from-oauth" });
   });
 });
+
+describe("transformRequestBody — injectZCodeThinkingFormat (WAF fingerprint alignment)", () => {
+  // The real ZCode desktop client sends these EXACT values when thinking is
+  // enabled. Our inject feature aligns the proxy's request body to match.
+  // Source: reverse-engineered ZCode Electron client traffic (2026-06).
+  const EXPECTED_MAX_TOKENS = 64000;
+  const EXPECTED_BUDGET_TOKENS = 32000;
+  const EXPECTED_EFFORT = "max";
+
+  it("is a no-op when injectThinkingFormat is false (default)", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const out = transformRequestBody(body, {
+      format: "anthropic",
+      injectThinkingFormat: false,
+    });
+    const parsed = JSON.parse(out as string);
+    // max_tokens preserved, no budget_tokens, no output_config
+    expect(parsed.max_tokens).toBe(1000);
+    expect(parsed.thinking.budget_tokens).toBeUndefined();
+    expect(parsed.output_config).toBeUndefined();
+  });
+
+  it("injects max_tokens + budget_tokens + output_config when thinking is enabled", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const out = transformRequestBody(body, {
+      format: "anthropic",
+      injectThinkingFormat: true,
+    });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.max_tokens).toBe(EXPECTED_MAX_TOKENS);
+    expect(parsed.thinking.type).toBe("enabled");
+    expect(parsed.thinking.budget_tokens).toBe(EXPECTED_BUDGET_TOKENS);
+    expect(parsed.output_config).toEqual({ effort: EXPECTED_EFFORT });
+  });
+
+  it("overwrites client-sent budget_tokens with the ZCode value", () => {
+    // Claude Code sends { type: "enabled", budget_tokens: 5000 }.
+    // transformUnsupportedAnthropicFields strips budget_tokens first
+    // (simplifies to { type: "enabled" }), then injectZCodeThinkingFormat
+    // re-adds it with the ZCode value.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      thinking: { type: "enabled", budget_tokens: 5000 },
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const out = transformRequestBody(body, {
+      format: "anthropic",
+      injectThinkingFormat: true,
+    });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.thinking.budget_tokens).toBe(EXPECTED_BUDGET_TOKENS);
+    expect(parsed.max_tokens).toBe(EXPECTED_MAX_TOKENS);
+    expect(parsed.output_config).toEqual({ effort: EXPECTED_EFFORT });
+  });
+
+  it("handles adaptive thinking (Claude Code sends type: adaptive)", () => {
+    // Claude Code sometimes sends { type: "adaptive" }.
+    // transformUnsupportedAnthropicFields converts to { type: "enabled" },
+    // then injectZCodeThinkingFormat kicks in.
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      thinking: { type: "adaptive" },
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const out = transformRequestBody(body, {
+      format: "anthropic",
+      injectThinkingFormat: true,
+    });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.thinking.type).toBe("enabled");
+    expect(parsed.thinking.budget_tokens).toBe(EXPECTED_BUDGET_TOKENS);
+    expect(parsed.output_config).toEqual({ effort: EXPECTED_EFFORT });
+  });
+
+  it("is a no-op when thinking is disabled", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      thinking: { type: "disabled" },
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const out = transformRequestBody(body, {
+      format: "anthropic",
+      injectThinkingFormat: true,
+    });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.max_tokens).toBe(1000); // preserved
+    expect(parsed.thinking).toEqual({ type: "disabled" });
+    expect(parsed.output_config).toBeUndefined();
+  });
+
+  it("is a no-op when thinking is absent", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const out = transformRequestBody(body, {
+      format: "anthropic",
+      injectThinkingFormat: true,
+    });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.max_tokens).toBe(1000); // preserved
+    expect(parsed.thinking).toBeUndefined();
+    expect(parsed.output_config).toBeUndefined();
+  });
+
+  it("is a no-op for OpenAI format (inject only applies to Anthropic)", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const out = transformRequestBody(body, {
+      format: "openai",
+      injectThinkingFormat: true,
+    });
+    const parsed = JSON.parse(out as string);
+    expect(parsed.max_tokens).toBe(1000);
+    expect(parsed.thinking).toBeUndefined();
+    expect(parsed.output_config).toBeUndefined();
+  });
+
+  it("idempotent: running twice produces the same result", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      thinking: { type: "enabled" },
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const ctx = { format: "anthropic" as const, injectThinkingFormat: true };
+    const out1 = transformRequestBody(body, ctx);
+    const out2 = transformRequestBody(out1 as string, ctx);
+    expect(out2).toBe(out1);
+  });
+});

@@ -1,6 +1,12 @@
 /**
  * Tests for identity header builder.
- * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
+ *
+ * Updated 2026-06: real ZCode client uses Vercel AI SDK's anthropic provider,
+ * sending ONLY `User-Agent: ai-sdk/anthropic/{version}`. The four "ZCode
+ * desktop" headers (X-ZCode-App-Version / X-Title / X-ZCode-Agent /
+ * HTTP-Referer) were removed — they were WAF fingerprint signals.
+ *
+ * @see _reverse/NOTEPAD.md "Real ZCode Request Headers (2026-06)"
  */
 import { describe, it, expect } from "bun:test";
 import { buildIdentityHeaders } from "./identity.js";
@@ -13,35 +19,37 @@ const BASE: ProxyIdentity = {
 };
 
 describe("buildIdentityHeaders", () => {
-  it("emits User-Agent as ZCode/{appVersion}", () => {
-    const h = buildIdentityHeaders({ ...BASE, appVersion: "9.9.9" });
-    expect(h["User-Agent"]).toBe("ZCode/9.9.9");
-  });
-
-  it("emits X-ZCode-App-Version mirroring User-Agent version", () => {
-    const h = buildIdentityHeaders({ ...BASE, appVersion: "4.5.6" });
-    expect(h["X-ZCode-App-Version"]).toBe("4.5.6");
-    expect(h["User-Agent"]).toBe("ZCode/4.5.6");
-  });
-
-  it("emits X-Title as `Z Code@{sourceTitle}`", () => {
-    const h = buildIdentityHeaders({ ...BASE, sourceTitle: "electron" });
-    expect(h["X-Title"]).toBe("Z Code@electron");
-  });
-
-  it("hard-codes X-ZCode-Agent to glm", () => {
+  it("emits User-Agent as ai-sdk/anthropic/{version} (matches real ZCode client)", () => {
     const h = buildIdentityHeaders(BASE);
-    expect(h["X-ZCode-Agent"]).toBe("glm");
+    // Real ZCode client UA, captured from reverse-engineered traffic.
+    expect(h["User-Agent"]).toBe("ai-sdk/anthropic/3.0.81");
   });
 
-  it("passes refererOrigin through as HTTP-Referer", () => {
-    const h = buildIdentityHeaders({ ...BASE, refererOrigin: "https://example.com" });
-    expect(h["HTTP-Referer"]).toBe("https://example.com");
+  it("does NOT emit X-ZCode-App-Version (real ZCode client doesn't send it)", () => {
+    const h = buildIdentityHeaders({ ...BASE, appVersion: "9.9.9" }) as unknown as Record<string, string | undefined>;
+    expect(h["X-ZCode-App-Version"]).toBeUndefined();
   });
 
-  it("preserves the 'unknown' fallback literally (loader-level concern)", () => {
-    const h = buildIdentityHeaders({ ...BASE, appVersion: "unknown" });
-    expect(h["User-Agent"]).toBe("ZCode/unknown");
-    expect(h["X-ZCode-App-Version"]).toBe("unknown");
+  it("does NOT emit X-Title (real ZCode client doesn't send it)", () => {
+    const h = buildIdentityHeaders({ ...BASE, sourceTitle: "electron" }) as unknown as Record<string, string | undefined>;
+    expect(h["X-Title"]).toBeUndefined();
+  });
+
+  it("does NOT emit X-ZCode-Agent (real ZCode client doesn't send it)", () => {
+    const h = buildIdentityHeaders(BASE) as unknown as Record<string, string | undefined>;
+    expect(h["X-ZCode-Agent"]).toBeUndefined();
+  });
+
+  it("does NOT emit HTTP-Referer (real ZCode client doesn't send it)", () => {
+    const h = buildIdentityHeaders({ ...BASE, refererOrigin: "https://example.com" }) as unknown as Record<string, string | undefined>;
+    expect(h["HTTP-Referer"]).toBeUndefined();
+  });
+
+  it("User-Agent is independent of identity config (real ZCode uses fixed SDK version)", () => {
+    // Different identity configs should NOT change the UA — the real client
+    // always sends `ai-sdk/anthropic/3.0.81` regardless of its app version.
+    const h1 = buildIdentityHeaders({ ...BASE, appVersion: "1.0.0" });
+    const h2 = buildIdentityHeaders({ ...BASE, appVersion: "9.9.9" });
+    expect(h1["User-Agent"]).toBe(h2["User-Agent"]);
   });
 });

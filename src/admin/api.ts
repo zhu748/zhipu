@@ -595,6 +595,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       opts.config.modelMappings = newConfig.modelMappings;
       if (newConfig.responsesThinking) opts.config.responsesThinking = newConfig.responsesThinking;
       if (newConfig.forceStreamAnthropic !== undefined) opts.config.forceStreamAnthropic = newConfig.forceStreamAnthropic;
+      if (newConfig.injectThinkingFormat !== undefined) opts.config.injectThinkingFormat = newConfig.injectThinkingFormat;
       if (authBody) opts.config.auth = newConfig.auth;
       // providers.*.anthropicBase / openaiBase: also hot-swappable
       if (body.providers) {
@@ -607,7 +608,7 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
         requiresRestart: restartFields.length > 0,
         restartFields,
         // hotApplied: fields that were applied to the live config without restart
-        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : [])],
+        hotApplied: ["provider", "plan", "defaultModel", "models", "identity", "logging", "retry", "routingRules", "modelMappings", "responsesThinking", "forceStreamAnthropic", "injectThinkingFormat", ...(authBody ? ["auth"] : []), ...(body.providers ? ["providers"] : [])],
       });
     } catch (err) {
       return errorResponse(500, "save_failed", (err as Error).message);
@@ -2023,6 +2024,8 @@ function sanitizeConfig(config: ProxyConfig): Record<string, unknown> {
     routingRules: config.routingRules ?? [],
     modelMappings: config.modelMappings ?? [],
     responsesThinking: config.responsesThinking ?? { models: [] },
+    forceStreamAnthropic: config.forceStreamAnthropic === true,
+    injectThinkingFormat: config.injectThinkingFormat === true,
   };
 }
 
@@ -2076,6 +2079,13 @@ function configToYaml(config: ProxyConfig): string {
     ...(config.responsesThinking && config.responsesThinking.models.length > 0
       ? { responsesThinking: { models: [...config.responsesThinking.models] } }
       : {}),
+    // Always emit the anthropic section so the dashboard's toggles persist
+    // across saves — otherwise turning ON then saving then turning OFF would
+    // leave a stale `true` in the YAML forever.
+    anthropic: {
+      ...(config.forceStreamAnthropic ? { forceStream: true } : {}),
+      ...(config.injectThinkingFormat ? { injectThinkingFormat: true } : {}),
+    },
   };
 
   return stringifyYaml(obj, {

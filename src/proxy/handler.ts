@@ -90,6 +90,27 @@ export async function proxyRequest(
     }
   }
 
+  // Strip "[undefined]" string values from the parsed body.
+  //
+  // Some clients (notably Cherry Studio) serialize JavaScript `undefined`
+  // values as the literal STRING "[undefined]" instead of omitting the field.
+  // JSON.parse then turns these into string values, not undefined — so they
+  // pass through to z.ai as actual request fields like:
+  //   "temperature": "[undefined]"
+  //   "system": "[undefined]"
+  //   "tools": "[undefined]"
+  //
+  // These garbage fields are a strong WAF fingerprint — no real client
+  // would ever send them. z.ai's WAF scores requests containing these as
+  // script traffic and starts blocking. We recursively strip any field
+  // whose value is exactly the string "[undefined]".
+  if (parsedBody && typeof parsedBody === "object") {
+    const removed = stripUndefinedStringFields(parsedBody as Record<string, unknown>);
+    if (removed > 0) {
+      console.log(`${reqId} stripped ${removed} "[undefined]" field(s) from request body`);
+    }
+  }
+
   const meta = peekParsedBody(parsedBody);
 
   // Per-model routing rules: if any rule's pattern matches the request's
@@ -184,7 +205,7 @@ export async function proxyRequest(
     return c.jwt ? "start-plan" : "coding-plan";
   };
 
-  let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan" });
+  let transformedObj = transformRequestBodyObj(upstreamBodyObj, { format: upstreamFormat, userId: cred.userId, startPlan: currentPlan === "start-plan", injectThinkingFormat: config.injectThinkingFormat === true });
 
   // Force-enable streaming for Anthropic format when config.forceStreamAnthropic
   // is true. Overrides the client's stream preference (including missing/undefined
@@ -420,6 +441,32 @@ export async function proxyRequest(
   }
   let headersAt = Date.now();
 
+  // === WAF 拦截检测 ===
+  // z.ai / zcode.z.ai 用阿里云 WAF。被拦截时返回:
+  //   - HTTP 405 / 403 / 200 + content-type: text/html
+  //   - body 是阿里云拦截页 HTML，含 `errors.aliyun.com` 字样
+  //   - server: Tengine
+  //
+  // 这种响应绝对不能重试 — 越撞越黑。立即返回一个明确的错误，避免
+  // 进入 retry 循环让 IP 越拉越黑。
+  if (await isWafBlockResponse(upstreamResp)) {
+    const ct = upstreamResp.headers.get("content-type") ?? "";
+    console.error(
+      `${reqId} ⚠️  ALIYUN WAF BLOCK DETECTED — status=${upstreamResp.status}, ` +
+      `content-type=${ct}. STOPPING all retries. Your IP may have been blacklisted. ` +
+      `Recommend: 1) Change IP (restart router / use proxy), 2) Wait 24h, 3) Reduce request frequency.`,
+    );
+    try { upstreamResp.body?.cancel(); } catch {}
+    printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
+    return errorResponse(
+      503,
+      "waf_blocked",
+      "Request blocked by Aliyun WAF (status=" + upstreamResp.status + "). " +
+      "Your IP is likely blacklisted. Stop retrying immediately, change IP, and wait before retrying. " +
+      "See: https://errors.aliyun.com",
+    );
+  }
+
   if (upstreamResp.status === 401 && currentPlan === "start-plan") {
     printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0);
     return errorResponse(401, "start_plan_jwt_invalid", "Start-plan JWT was rejected. Re-run: zcode-proxy auth login");
@@ -582,6 +629,7 @@ export async function proxyRequest(
             format: upstreamFormat,
             userId: cred.userId,
             startPlan: currentPlan === "start-plan",
+            injectThinkingFormat: config.injectThinkingFormat === true,
           });
           transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
           consecutiveCredFailures = 0;
@@ -724,6 +772,7 @@ export async function proxyRequest(
             format: upstreamFormat,
             userId: cred.userId,
             startPlan: currentPlan === "start-plan",
+            injectThinkingFormat: config.injectThinkingFormat === true,
           });
           transformedBody = transformedObj !== undefined ? JSON.stringify(transformedObj) : undefined;
           consecutiveCredFailures = 0;
@@ -884,6 +933,106 @@ async function readBody(req: Request): Promise<string | undefined> {
   const text = await req.text();
   if (text.length === 0) return undefined;
   return text;
+}
+
+/**
+ * Recursively strip fields whose value is exactly the string "[undefined]".
+ *
+ * Some clients (notably Cherry Studio) serialize JavaScript `undefined` as
+ * the literal STRING "[undefined]" instead of omitting the field. These
+ * pass through JSON.parse as string values, get forwarded to z.ai as
+ * bogus request parameters (`temperature: "[undefined]"` etc.), and are
+ * a strong WAF fingerprint — no legitimate client would ever send them.
+ *
+ * Returns the count of removed fields for diagnostic logging.
+ */
+function stripUndefinedStringFields(node: unknown): number {
+  if (Array.isArray(node)) {
+    let removed = 0;
+    for (const item of node) {
+      if (item && typeof item === "object") {
+        removed += stripUndefinedStringFields(item);
+      }
+    }
+    return removed;
+  }
+  if (node && typeof node === "object") {
+    const obj = node as Record<string, unknown>;
+    let removed = 0;
+    for (const key of Object.keys(obj)) {
+      const v = obj[key];
+      if (v === "[undefined]") {
+        delete obj[key];
+        removed++;
+      } else if (v && typeof v === "object") {
+        removed += stripUndefinedStringFields(v);
+      }
+    }
+    return removed;
+  }
+  return 0;
+}
+
+/**
+ * Detect Aliyun WAF block responses.
+ *
+ * z.ai / zcode.z.ai use Aliyun WAF. When an IP is blacklisted, the WAF
+ * returns a non-standard response:
+ *   - HTTP 405 / 403 / 200 (NOT a typical API error status)
+ *   - content-type: text/html (NOT application/json or text/event-stream)
+ *   - body is an Aliyun HTML error page containing `errors.aliyun.com`
+ *   - server: Tengine (Alibaba's nginx fork)
+ *
+ * We peek at the body to confirm it's actually a WAF page (not some other
+ * html response) — the `errors.aliyun.com` string is the reliable signal.
+ *
+ * IMPORTANT: This function consumes the body. Callers must use the returned
+ * boolean to decide whether to bail out — if true, the response body is
+ * already read and the caller should return a synthetic error.
+ */
+async function isWafBlockResponse(resp: Response): Promise<boolean> {
+  // Fast path: status codes that the WAF typically uses.
+  // 405 = Method Not Allowed (the classic WAF block)
+  // 403 = Forbidden (captcha challenge or WAF block)
+  // 200 = sometimes the WAF returns 200 + HTML instead of an error status
+  const isSuspectStatus = resp.status === 405 || resp.status === 403 || resp.status === 200;
+  if (!isSuspectStatus) return false;
+
+  const ct = resp.headers.get("content-type") ?? "";
+  // WAF responses are HTML; legitimate API responses are JSON or SSE.
+  // If content-type is JSON or SSE, this is NOT a WAF block.
+  if (ct.includes("application/json") || ct.includes("text/event-stream")) {
+    return false;
+  }
+  // Strong signal: Tengine server header (Alibaba's nginx fork).
+  // But not all WAF responses have it, so we don't require it.
+  const server = resp.headers.get("server") ?? "";
+
+  // Peek the body to confirm — look for the Aliyun error page signature.
+  // We need to clone the response first so the body stays readable if this
+  // turns out NOT to be a WAF block.
+  try {
+    const text = await resp.text();
+    // The Aliyun WAF error page always contains this string.
+    if (text.includes("errors.aliyun.com") || text.includes("aliyun") && text.includes("WAF")) {
+      return true;
+    }
+    // Secondary signal: Tengine server + status 405 + HTML body
+    if (resp.status === 405 && ct.includes("text/html") && server.toLowerCase().includes("tengine")) {
+      return true;
+    }
+    // Not a WAF block — reconstruct the response with the read body so
+    // downstream code can still read it.
+    // (Note: this is tricky — we've consumed the body. The caller checks
+    // the return value and bails if true. If false, we need to put the
+    // body back. We can't modify resp in place, so we use a hack: stash
+    // the body text on the response object via a Symbol.)
+    (resp as any)._wafCheckBody = text;
+    (resp as any)._wafCheckBodyConsumed = true;
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 /**

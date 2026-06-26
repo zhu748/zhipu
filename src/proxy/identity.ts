@@ -1,33 +1,40 @@
 /**
- * Identity header builder — emits the ZCode desktop client's companion headers
- * on every upstream request so the proxy is indistinguishable from the official
- * client at the fingerprinting layer.
+ * Identity header builder — emits the headers ZCode actually sends upstream.
  *
- * Mirrors `eYn` in `_reverse/zcode.cjs` (offset ~9074294). Differences from the
- * bundle: we read resolved values from `ProxyIdentity` (env/YAML already merged
- * by the config loader) instead of `e[art]`/`t.appVersion`, and we always emit
- * `X-ZCode-App-Version` rather than gating on truthiness — the loader guarantees
- * a printable-ASCII value or the literal `"unknown"`.
+ * Based on reverse-engineered ZCode Electron client traffic (2026-06):
+ * ZCode uses the Vercel AI SDK's anthropic provider, NOT a custom UA. The
+ * real User-Agent is `ai-sdk/anthropic/{version}` (e.g. `ai-sdk/anthropic/3.0.81`).
  *
- * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
+ * The previous implementation injected four "ZCode desktop" headers
+ * (X-ZCode-App-Version / X-Title / X-ZCode-Agent / HTTP-Referer) that the
+ * real client NEVER sends. These were strong WAF fingerprint signals —
+ *.aliyun WAF scored them as "claiming to be ZCode but missing real client
+ * signals" and started blocking.
+ *
+ * @see _reverse/NOTEPAD.md "Real ZCode Request Headers (2026-06)"
  */
 import type { ProxyIdentity } from "../config/types.js";
 
 export interface IdentityHeaders {
   "User-Agent": string;
-  "X-ZCode-App-Version": string;
-  "X-Title": string;
-  "X-ZCode-Agent": "glm";
-  "HTTP-Referer": string;
 }
 
-/** Build the five identity headers injected upstream. Pure function. */
-export function buildIdentityHeaders(id: ProxyIdentity): IdentityHeaders {
+/** AI SDK anthropic provider version — matches the bundled ZCode client. */
+const AI_SDK_VERSION = "3.0.81";
+
+/**
+ * Build the identity headers injected upstream.
+ *
+ * Only User-Agent is injected — matching the real ZCode client which uses
+ * the Vercel AI SDK and sends NO custom identity headers. The previous
+ * implementation's four fake headers (X-ZCode-App-Version etc.) were a
+ * primary WAF fingerprint and have been removed.
+ *
+ * The `id` parameter is kept for backwards compatibility (config still
+ * loads identity block) but its fields are no longer used to build headers.
+ */
+export function buildIdentityHeaders(_id: ProxyIdentity): IdentityHeaders {
   return {
-    "User-Agent": `ZCode/${id.appVersion}`,
-    "X-ZCode-App-Version": id.appVersion,
-    "X-Title": `Z Code@${id.sourceTitle}`,
-    "X-ZCode-Agent": "glm",
-    "HTTP-Referer": id.refererOrigin,
+    "User-Agent": `ai-sdk/anthropic/${AI_SDK_VERSION}`,
   };
 }

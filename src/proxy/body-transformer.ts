@@ -101,6 +101,18 @@ export interface TransformContext {
   userId?: string;
   /** When true (start-plan), prepend ZCode gateway system blocks. */
   startPlan?: boolean;
+  /**
+   * When true, any Anthropic-format request with `thinking.type === "enabled"`
+   * gets its thinking-related fields overwritten with the EXACT values the
+   * real ZCode desktop client sends:
+   *   - max_tokens: 64000
+   *   - thinking.budget_tokens: 32000
+   *   - output_config: { effort: "max" }
+   *
+   * This reduces WAF fingerprinting risk by making the request body
+   * indistinguishable from the real ZCode client. Default: false.
+   */
+  injectThinkingFormat?: boolean;
 }
 
 /**
@@ -140,6 +152,15 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
       modified = applyStartPlanSystem(obj) || modified;
     }
     modified = transformUnsupportedAnthropicFields(obj) || modified;
+    // Inject ZCode thinking format (max_tokens + budget_tokens + output_config)
+    // — runs AFTER transformUnsupportedAnthropicFields so we can detect the
+    // simplified `thinking: { type: "enabled" }` shape. Must run BEFORE
+    // any transform that might strip output_config (none currently do, but
+    // historically transformUnsupportedAnthropicFields stripped it — that's
+    // why we run AFTER it, so our injection isn't undone).
+    if (ctx.injectThinkingFormat) {
+      modified = injectZCodeThinkingFormat(obj) || modified;
+    }
     modified = relocateSystemMessages(obj) || modified;
     modified = stripThinkingBlocksFromMessages(obj) || modified;
     modified = ensureAssistantTextBlock(obj) || modified;
@@ -294,6 +315,71 @@ function transformUnsupportedAnthropicFields(body: Record<string, unknown>): boo
       changed = true;
     }
   }
+  return changed;
+}
+
+/**
+ * Inject the EXACT thinking-format fields the real ZCode desktop client sends.
+ *
+ * Triggered only when `ctx.injectThinkingFormat === true`. When the request
+ * has `thinking.type === "enabled"` (after transformUnsupportedAnthropicFields
+ * simplified it), overwrite the thinking-related fields with the values the
+ * real ZCode client sends:
+ *
+ *   - `max_tokens: 64000`           — force max output budget
+ *   - `thinking.budget_tokens: 32000` — force thinking budget
+ *   - `output_config: { effort: "max" }` — force max effort (re-added here
+ *     because transformUnsupportedAnthropicFields strips it; the real ZCode
+ *     client always sends it, so injecting it back aligns our fingerprint)
+ *
+ * Source: reverse-engineered from real ZCode Electron client traffic (2026-06).
+ * Captured request body shape:
+ *   {
+ *     "model": "glm-5.2",
+ *     "max_tokens": 64000,
+ *     "thinking": { "type": "enabled", "budget_tokens": 32000 },
+ *     "output_config": { "effort": "max" },
+ *     ...
+ *   }
+ *
+ * When `thinking` is absent or `type !== "enabled"`, this function is a no-op
+ * — we don't force-enable thinking, we only align the format when the client
+ * already requested thinking.
+ */
+function injectZCodeThinkingFormat(body: Record<string, unknown>): boolean {
+  // Only inject when thinking is enabled. We don't force-enable thinking —
+  // that's a separate concern (see responsesThinking config for /v1/responses).
+  const thinking = body.thinking;
+  if (!isPlainObject(thinking)) return false;
+  if (thinking.type !== "enabled") return false;
+
+  let changed = false;
+
+  // 1. Force max_tokens to 64000 (real ZCode client value).
+  //    The real client always sends 64000 when thinking is enabled, regardless
+  //    of what the user configured. Aligning this reduces fingerprinting risk.
+  if (body.max_tokens !== 64000) {
+    body.max_tokens = 64000;
+    changed = true;
+  }
+
+  // 2. Force thinking.budget_tokens to 32000 (real ZCode client value).
+  //    transformUnsupportedAnthropicFields strips budget_tokens (GLM "doesn't
+  //    support" it — but the real ZCode client sends it anyway and the gateway
+  //    accepts it). We re-add it here to match the real client's shape.
+  if (thinking.budget_tokens !== 32000) {
+    thinking.budget_tokens = 32000;
+    changed = true;
+  }
+
+  // 3. Re-add output_config: { effort: "max" } (real ZCode client value).
+  //    transformUnsupportedAnthropicFields deletes this; we add it back. The
+  //    real ZCode client always sends it when thinking is enabled.
+  if (!isPlainObject(body.output_config) || (body.output_config as Record<string, unknown>).effort !== "max") {
+    body.output_config = { effort: "max" };
+    changed = true;
+  }
+
   return changed;
 }
 

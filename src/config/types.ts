@@ -263,4 +263,26 @@ export interface ProxyConfig {
    * @see ResponsesThinkingConfig
    */
   responsesThinking?: ResponsesThinkingConfig;
+  /**
+   * Inject full ZCode thinking format on every request that has thinking enabled.
+   *
+   * When true, any Anthropic-format request with `thinking.type === "enabled"`
+   * (whether from Claude Code, Cherry Studio, or any other client) gets its
+   * thinking-related fields overwritten with the EXACT values the real ZCode
+   * desktop client sends:
+   *
+   *   - `max_tokens: 64000`           (force max output budget)
+   *   - `thinking.budget_tokens: 32000` (force thinking budget)
+   *   - `output_config: { effort: "max" }` (force max effort)
+   *
+   * This makes the request body indistinguishable from the real ZCode client
+   * at the body-inspection layer of the WAF, reducing fingerprinting risk.
+   *
+   * Default: false (preserve client's original values). Env var:
+   * ZCODE_PROXY_INJECT_THINKING_FORMAT=1 to enable at startup. Also toggleable
+   * via dashboard "代理规则" tab.
+   *
+   * @see body-transformer.ts `injectZCodeThinkingFormat`
+   */
+  injectThinkingFormat?: boolean;
 }

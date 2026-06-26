@@ -85,21 +85,42 @@ describe("buildAuthHeaders", () => {
     expect(h["authorization"]).toBe("Bearer bmkey");
   });
 
-  it("injects ZCode identity headers (User-Agent + companions)", () => {
+  it("injects only User-Agent (matches real ZCode client using Vercel AI SDK)", () => {
+    // Real ZCode client sends ONLY `User-Agent: ai-sdk/anthropic/{version}`.
+    // The four "ZCode desktop" headers were removed (2026-06 WAF fix).
     const h = buildAuthHeaders("anthropic", ZAI_CRED, IDENTITY);
-    expect(h["User-Agent"]).toBe("ZCode/test-1.0.0");
-    expect(h["X-ZCode-App-Version"]).toBe("test-1.0.0");
-    expect(h["X-Title"]).toBe("Z Code@cli");
-    expect(h["X-ZCode-Agent"]).toBe("glm");
-    expect(h["HTTP-Referer"]).toBe("https://zcode.z.ai");
+    expect(h["User-Agent"]).toBe("ai-sdk/anthropic/3.0.81");
+    expect(h["X-ZCode-App-Version"]).toBeUndefined();
+    expect(h["X-Title"]).toBeUndefined();
+    expect(h["X-ZCode-Agent"]).toBeUndefined();
+    expect(h["HTTP-Referer"]).toBeUndefined();
   });
 
-  it("generates unique x-session-id per call (no shared singleton)", () => {
-    const h1 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY);
-    const h2 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY);
+  it("injects Accept: text/event-stream (real ZCode client always sends it)", () => {
+    const h = buildAuthHeaders("anthropic", ZAI_CRED, IDENTITY);
+    expect(h["accept"]).toBe("text/event-stream");
+  });
+
+  it("x-query-id is a bare UUID (no query_ prefix, matches real ZCode)", () => {
+    const h = buildAuthHeaders("anthropic", ZAI_CRED, IDENTITY);
+    const qid = h["x-query-id"];
+    expect(qid).toBeTruthy();
+    // UUID v4 format: 8-4-4-4-12 hex chars, no prefix
+    expect(qid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+    expect(qid?.startsWith("query_")).toBe(false);
+  });
+
+  it("x-session-id is stable per client fingerprint (matches real ZCode session behavior)", () => {
+    // Without a fingerprint (test path), each call generates a fresh UUID.
+    // With the same fingerprint, session ID is cached for 30 minutes.
+    const h1 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY, "coding-plan", "fp-test-1");
+    const h2 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY, "coding-plan", "fp-test-1");
     expect(h1["x-session-id"]).toBeTruthy();
-    expect(h2["x-session-id"]).toBeTruthy();
-    expect(h1["x-session-id"]).not.toBe(h2["x-session-id"]);
+    expect(h1["x-session-id"]).toBe(h2["x-session-id"]); // same fingerprint → same session
+
+    // Different fingerprint → different session
+    const h3 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY, "coding-plan", "fp-test-2");
+    expect(h3["x-session-id"]).not.toBe(h1["x-session-id"]);
   });
 
   it("generates unique x-request-id and x-zcode-trace-id per call", () => {
@@ -121,7 +142,8 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("x-api-key")).toBe("testkey.testsecret");
     expect(upstream.headers.get("anthropic-version")).toBe("2023-06-01");
     expect(upstream.headers.get("content-type")).toBe("application/json");
-    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0");
+    expect(upstream.headers.get("user-agent")).toBe("ai-sdk/anthropic/3.0.81");
+    expect(upstream.headers.get("accept")).toBe("text/event-stream");
 
     const body = await upstream.text();
     expect(body).toBe('{"model":"glm-4.6","messages":[]}');

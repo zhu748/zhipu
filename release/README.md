@@ -1,5 +1,54 @@
 # zcode-proxy 使用说明
 
+> **v0.1.8 — WAF 指纹对齐：请求头/请求体全面模拟真实 ZCode 客户端**
+>
+> 本次升级针对阿里云 WAF 拦截问题，根据逆向真实 ZCode Electron 客户端抓包，全面对齐请求指纹。全套 518/518 测试通过，TypeScript 编译零错误。
+>
+> **核心改动 — 请求头指纹对齐（identity.ts / upstream.ts）**
+> - **User-Agent 改为 `ai-sdk/anthropic/3.0.81`**（之前是 `ZCode/3.1.5`，但真实 ZCode 客户端用的是 Vercel AI SDK，发的 UA 是 `ai-sdk/anthropic/{version}`）
+> - **删除四个伪装头**：`X-ZCode-App-Version` / `X-Title` / `X-ZCode-Agent` / `HTTP-Referer`（真实 ZCode 客户端**根本不发**这些头，发了反而是指纹）
+> - **`x-query-id` 去掉 `query_` 前缀**，发送纯 UUID（之前是 `query_<uuid>`，真实客户端发的是裸 UUID）
+> - **`x-session-id` 改为会话内稳定**（之前每次 fetch 都换新 UUID，真实客户端在 Electron app 整个生命周期内只换一次 session ID。代理现在按 client IP + proxy API key 缓存 session ID 30 分钟）
+> - **新增 `Accept: text/event-stream`** 头（真实 ZCode 客户端总是发这个 Accept，之前代理缺失）
+> - **剥离所有客户端 SDK / 浏览器头**：`origin` / `referer` / `sec-fetch-*` / `sec-ch-ua` 等都从客户端请求剥离，不让它们透传到上游
+> - **`anthropic-beta` 过滤**：只保留 `claude-code-*` 前缀的 flag，其余（`prompt-caching-*` / `interleaved-thinking-*` 等）一律剥离
+>
+> **核心改动 — 请求体清理（handler.ts）**
+> - **递归剥离 `"[undefined]"` 字段**：Cherry Studio 等客户端会把 JavaScript `undefined` 序列化成字符串 `"[undefined]"`（变成 `temperature: "[undefined]"` 这种垃圾字段透传到 z.ai），这是强烈的脚本流量指纹，WAF 一抓一个准。代理现在会递归清理请求体里所有值为 `"[undefined]"` 的字段
+>
+> **核心改动 — WAF 拦截短路检测（handler.ts）**
+> - 新增 `isWafBlockResponse()` 检测阿里云 WAF 拦截响应（HTTP 405/403/200 + `content-type: text/html` + body 含 `errors.aliyun.com`）
+> - 命中 WAF 拦截时**立即停止所有重试**，返回 503 + `waf_blocked` 错误类型，避免越撞越黑
+> - 控制台输出明显的警告日志，提示用户换 IP / 等待 / 降频
+>
+> **核心改动 — 新增「注入 ZCode 思考格式」开关（默认关闭）**
+> - 真实 ZCode 客户端在思考开启时发送固定的请求体：`max_tokens: 64000` + `thinking.budget_tokens: 32000` + `output_config.effort: "max"`
+> - 之前代理会**剥离** `budget_tokens` 和 `output_config`（误以为 GLM 不支持），导致请求体和真实客户端不一致
+> - 新增 `anthropic.injectThinkingFormat` 配置项（默认关闭），开启后任何 `thinking.type === "enabled"` 的请求都会被强制改写成 ZCode 真实客户端格式
+> - 三种开启方式：① Dashboard「代理规则」面板的开关（热切换，无需重启）② YAML `anthropic.injectThinkingFormat: true` ③ 环境变量 `ZCODE_PROXY_INJECT_THINKING_FORMAT=1`
+> - 仅当客户端已开启思考时触发，不会强制开启思考；OpenAI 格式请求不受影响
+>
+> **影响**
+> - 代理发出的请求头**逐字节匹配**真实 ZCode 客户端抓包（已用脚本对比验证）
+> - Cherry Studio / Claude Code / Codex CLI 任何客户端发来的请求，透传到 z.ai 时都会变成真实 ZCode 客户端的形状
+> - 被阿里云 WAF 拦截时不再傻乎乎撞 3 次 retry，立即停止并提示用户
+> - 开启思考格式注入后，请求体层面也和真实 ZCode 客户端一致，进一步降低被识别风险
+>
+> **配置示例**
+> ```yaml
+> anthropic:
+>   forceStream: false
+>   injectThinkingFormat: true   # 新增：注入 ZCode 思考格式
+> ```
+>
+> **建议升级路径**
+> 1. 升级到 v0.1.8
+> 2. **换 IP**（旧 IP 可能已被拉黑，不换 IP 升级也没用）
+> 3. 启动代理，在 Dashboard 开启「注入 ZCode 思考格式」
+> 4. 用 Cherry Studio / Claude Code 测试，观察代理日志看是否还有 `⚠️ ALIYUN WAF BLOCK DETECTED` 警告
+> 5. 如果再被拦，把拦截响应的完整 header（特别是 `via` / `eagleid` / `x-cache`）反馈给开发者定位是哪一层挡的
+>
+
 > **v0.1.7 — 紧急修复：Captcha Token 重用导致 3007 验证失败**
 >
 > 本次修复 v0.1.6 引入的 regression。全套 508/508 测试通过，TypeScript 编译零错误，生产编译成功。
