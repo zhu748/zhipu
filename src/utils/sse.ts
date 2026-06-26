@@ -80,18 +80,29 @@ export function formatSSE(eventType: string, data: unknown): string {
  * Use this before every `controller.enqueue(...)` on a translated SSE stream
  * so that a slow downstream client cannot cause unbounded memory growth in
  * the proxy's translated-stream buffer.
+ *
+ * Implementation note (vceshi0.0.8+): we LOOP on `desiredSize` until it
+ * recovers to a positive value, with a total deadline of `maxWaitMs`
+ * (default 30s). The previous implementation only slept once for `maxYieldMs`
+ * (default 1ms) and then returned — which let a slow client cause unbounded
+ * internal buffer growth because the next enqueue would almost certainly
+ * fire while `desiredSize` was still ≤ 0.
  */
 export async function waitForBackpressure(
   controller: ReadableStreamDefaultController,
-  maxYieldMs: number = 1,
+  maxYieldMs: number = 5,
+  maxWaitMs: number = 30_000,
 ): Promise<void> {
   // desiredSize === null means the controller is errored or closed — caller
   // will get an exception on enqueue, which they should handle.
-  // desiredSize <= 0 means the consumer is behind — yield to the event loop
-  // so the consumer can drain. We use a tiny setTimeout rather than the
-  // queueMicrotask/promise pattern because we want to give the runtime a
-  // chance to actually drain the underlying sink.
-  if (controller.desiredSize !== null && controller.desiredSize <= 0) {
+  if (controller.desiredSize === null) return;
+  // Loop until the consumer drains the buffer below the high-water mark.
+  // Cap the total wait at `maxWaitMs` so a permanently-stuck client can't
+  // pin a worker forever — the caller will then get an exception on enqueue
+  // and the stream will be errored, which is the correct outcome.
+  const deadline = Date.now() + maxWaitMs;
+  while (controller.desiredSize <= 0) {
+    if (Date.now() >= deadline) return; // give up; let enqueue throw
     await new Promise<void>(r => setTimeout(r, maxYieldMs));
   }
 }

@@ -17,7 +17,8 @@
  *
  * @see .omo/plans/zcode-proxy.md Task 14
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, unlinkSync, readdirSync, statSync } from "node:fs";
+import { unlink, readFile } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes, createCipheriv, createDecipheriv, createHash } from "node:crypto";
@@ -460,28 +461,31 @@ async function readStoreUncached(): Promise<StoreV2 | null> {
   // brief AV scan would back up the (locked, unreadable) file.
   //
   // We retry up to 5 times with 50ms backoff before declaring the file
-  // unreadable. The total worst-case blocking time is 50+100+150+200+250
-  // = 750ms, acceptable for a read that happens on dashboard refresh.
+  // unreadable. The total worst-case wait is 50+100+150+200+250 = 750ms,
+  // but it's now ASYNC — the event loop stays responsive so concurrent
+  // SSE streams don't stall (vceshi0.0.8+ fix for the 750ms event-loop
+  // blocking that was freezing all in-flight LLM streams).
   let raw: string | null = null;
   let readErr: unknown = null;
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      raw = readFileSync(STORE_FILE, "utf-8");
+      raw = await readFile(STORE_FILE, "utf-8");
       readErr = null;
       break;
     } catch (err) {
       readErr = err;
       const code = (err as NodeJS.ErrnoException)?.code;
       // EPERM/EBUSY/EACCES: transient Windows lock — retry.
-      // ENOENT: file disappeared between existsSync and readFileSync (another
+      // ENOENT: file disappeared between existsSync and readFile (another
       // process deleted it) — retry won't help, treat as "no file".
       if (code === "ENOENT") {
         undecryptableFilePresent = false;
         return null;
       }
       if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
-        const end = Date.now() + 50 * (attempt + 1);
-        while (Date.now() < end) { /* spin */ }
+        // Async sleep — non-blocking. The total worst-case wait is 750ms,
+        // but other requests and SSE streams keep flowing.
+        await new Promise(r => setTimeout(r, 50 * (attempt + 1)));
         continue;
       }
       // Other errors (EISDIR, etc.) — don't retry
@@ -792,15 +796,21 @@ async function writeStore(store: StoreV2): Promise<void> {
   } catch (err) {
     // Read-only filesystem (e.g. Render container without a persistent disk
     // mounted at STORE_DIR), OR Windows EPERM/EBUSY that exhausted the
-    // safeRename retry budget. Don't crash the process — log and keep the
-    // in-memory copy so the current request can still complete. The next
-    // restart will start with whatever's on disk (possibly stale, but not
-    // corrupted — atomicWriteFile guarantees the file is either the OLD or
-    // the NEW content, never a partial mix).
-    console.warn(`[store] Could not persist credentials to ${STORE_FILE}: ${(err as Error).message}`);
-    console.warn(`[store] Set ZCODE_PROXY_STORE_DIR to a writable path (e.g. /data/.zcode-proxy on Render with a disk, or /tmp/.zcode-proxy for ephemeral storage).`);
+    // safeRename retry budget.
+    //
+    // vceshi0.0.8+ CRITICAL FIX: previously we swallowed the error and STILL
+    // updated `cachedStore` below — meaning the dashboard said "saved" but
+    // the next restart lost the credential. Now we:
+    //   1. Do NOT update the in-memory cache (it stays at the pre-mutation state).
+    //   2. Re-throw so the caller (withStoreLock → saveCredential / etc.) can
+    //      surface the failure to the dashboard / API client.
+    // The disk file is still safe — atomicWriteFile guarantees it's either
+    // the OLD or the NEW content, never a partial mix.
+    console.error(`[store] Could not persist credentials to ${STORE_FILE}: ${(err as Error).message}`);
+    console.error(`[store] Set ZCODE_PROXY_STORE_DIR to a writable path (e.g. /data/.zcode-proxy on Render with a disk, or /tmp/.zcode-proxy for ephemeral storage).`);
+    throw err;
   }
-  cachedStore = store; // keep cache in sync with what we intended to write
+  cachedStore = store; // keep cache in sync with what we ACTUALLY wrote to disk
 }
 
 // ---------------------------------------------------------------------------
@@ -863,34 +873,38 @@ export async function loadCredential(): Promise<Credential | null> {
 }
 
 /** Clear ALL stored credentials (preserves old behavior — used by "Clear Credentials" button). */
-export function clearCredential(): void {
+export async function clearCredential(): Promise<void> {
   if (existsSync(STORE_FILE)) {
-    // Windows: unlinkSync can fail with EPERM/EBUSY/EACCES if another process
+    // Windows: unlink can fail with EPERM/EBUSY/EACCES if another process
     // (antivirus, Windows Search indexer, backup tool) briefly has the file
-    // open. Retry a few times with backoff before surfacing the error —
-    // matches the safeRename pattern in utils/fs.ts. Without this retry, a
-    // transient AV scan during "Clear credentials" would throw an uncaught
-    // error, leaving the dashboard in a half-state and the file on disk.
+    // open. Retry a few times with ASYNC backoff before surfacing the error.
+    //
+    // vceshi0.0.8+: was previously `clearCredential(): void` with a
+    // synchronous spin-wait (`while (Date.now() < end) {}`) that blocked
+    // the event loop for up to 750ms — freezing every in-flight SSE stream.
+    // Now async so other requests keep flowing during the retry.
     const MAX_RETRIES = 5;
     const RETRY_DELAY_MS = 50;
     let lastErr: unknown;
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
-        unlinkSync(STORE_FILE);
+        await unlink(STORE_FILE);
         lastErr = null;
         break;
       } catch (err) {
         lastErr = err;
         const code = (err as NodeJS.ErrnoException)?.code;
         if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
-          // Synchronous sleep — clearCredential is sync by API contract
-          // (callers don't await it). The total worst-case blocking time
-          // is 50+100+150+200+250 = 750ms, acceptable for a UI action.
-          const end = Date.now() + RETRY_DELAY_MS * (attempt + 1);
-          while (Date.now() < end) { /* spin */ }
+          // Async sleep — non-blocking.
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
           continue;
         }
-        throw err; // ENOENT (already gone) or other non-retryable error
+        if (code === "ENOENT") {
+          // Already gone — that's fine, treat as success.
+          lastErr = null;
+          break;
+        }
+        throw err; // other non-retryable error
       }
     }
     if (lastErr) throw lastErr;
@@ -1029,10 +1043,14 @@ export async function removeAccount(id: string): Promise<boolean> {
 
 /** Update an account's human-readable label. */
 export async function setAccountLabel(id: string, label: string): Promise<boolean> {
+  const trimmed = label.trim();
   return withStoreLock((store) => {
     const account = store.accounts.find(a => a.id === id);
     if (!account) return false;
-    account.label = label.trim() || account.label;
+    // vceshi0.0.8+: if the trimmed label is empty, fall back to the
+    // auto-generated label (provider + createdAt) so the dashboard's inline
+    // rename input can be cleared without leaving a stale old value visible.
+    account.label = trimmed || defaultLabel(account.credential, account.createdAt);
     return true;
   });
 }
@@ -1175,7 +1193,12 @@ export async function exportSingleAccount(id: string): Promise<{
 export async function exportAccounts(): Promise<Array<Omit<StoredAccount, "credential"> & { credential: Credential }>> {
   const store = await readStore();
   if (!store) return [];
-  return store.accounts;
+  // vceshi0.0.8+: return a deep copy so future callers that mutate the result
+  // can't corrupt the in-memory cache (which is the live reference returned
+  // by readStore). Previously we returned `store.accounts` directly — a
+  // footgun that was latent only because current callers JSON.stringify the
+  // result without mutation.
+  return store.accounts.map(a => ({ ...a, credential: { ...a.credential } }));
 }
 
 /**

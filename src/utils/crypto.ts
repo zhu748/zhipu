@@ -1,24 +1,37 @@
 /**
  * Timing-safe string comparison.
  *
- * Compares two strings in constant time relative to the longer one, so that
- * an attacker cannot use response-time differences to bitwise-recover a
- * secret. Always iterates over the full length of the longer string — never
- * short-circuits on the first differing character.
+ * Delegates to Node's native `crypto.timingSafeEqual` for constant-time
+ * comparison of equal-length Buffers. We pad to the longer string's length
+ * first (with a fixed byte) so length differences don't short-circuit the
+ * native call — this avoids leaking length information via early returns.
  *
  * @returns true iff both strings are byte-equal AND have the same length.
  */
+import { timingSafeEqual as nodeTimingSafeEqual } from "node:crypto";
+
 export function timingSafeEqual(a: string, b: string): boolean {
-  // To avoid leaking length information, always compare the full length of
-  // the longer string. If the lengths differ, we still do a full pass so the
-  // total work is constant w.r.t. max(a.length, b.length); the result is
-  // guaranteed false because the XOR-fold of differing lengths is non-zero.
-  const maxLen = Math.max(a.length, b.length);
-  let result = a.length ^ b.length; // Non-zero if lengths differ
-  for (let i = 0; i < maxLen; i++) {
-    const aChar = i < a.length ? a.charCodeAt(i) : 0;
-    const bChar = i < b.length ? b.charCodeAt(i) : 0;
-    result |= aChar ^ bChar;
+  // Encode both to UTF-8 Buffers once. UTF-8 is the right encoding here
+  // because API keys are ASCII / UTF-8 strings; encoding mismatches with
+  // charCodeAt (which returns UTF-16 code units) could let two distinct
+  // strings compare equal in edge cases involving surrogate pairs.
+  const aBuf = Buffer.from(a, "utf-8");
+  const bBuf = Buffer.from(b, "utf-8");
+  // If lengths differ, we still want to do a constant-amount of work so the
+  // caller can't infer the expected length from the response time. Pad the
+  // shorter buffer with zeros to match the longer one's length, then run the
+  // native constant-time comparison. The XOR of differing lengths guarantees
+  // the result is false even if the padded bytes happen to match.
+  if (aBuf.length !== bBuf.length) {
+    const maxLen = Math.max(aBuf.length, bBuf.length);
+    const aPad = Buffer.alloc(maxLen);
+    const bPad = Buffer.alloc(maxLen);
+    aBuf.copy(aPad);
+    bBuf.copy(bPad);
+    // Run the comparison for its timing side-effect, but ignore the result —
+    // length mismatch already decides the outcome.
+    nodeTimingSafeEqual(aPad, bPad);
+    return false;
   }
-  return result === 0;
+  return nodeTimingSafeEqual(aBuf, bBuf);
 }

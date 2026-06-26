@@ -74,7 +74,17 @@ export async function proxyRequest(
   const debugLoggingEnabled = config.logging?.debug === true
     || process.env.ZCODE_PROXY_DEBUG_LOGGING === "1";
 
-  const body = await readBody(clientReq);
+  let body: string | undefined;
+  try {
+    body = await readBody(clientReq);
+  } catch (err) {
+    const e = err as Error & { httpStatus?: number; errorType?: string };
+    const status = e.httpStatus ?? 400;
+    const type = e.errorType ?? "body_read_failed";
+    const meta: RequestMeta = { model: "-", stream: false };
+    printRow(reqId, format, meta, status, started, Date.now(), 0, 0, 0);
+    return errorResponse(status, type, e.message);
+  }
 
   // Parse the body once and reuse the parsed object throughout the pipeline.
   // Previously the body string was JSON.parse'd up to 3 times (peekBody,
@@ -241,6 +251,13 @@ export async function proxyRequest(
   const buildUpstreamReq = (captcha?: Record<string, string>) =>
     buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, currentPlan, captcha);
 
+  // vceshi0.0.8+: tracks the AbortController of the most-recent successful
+  // upstream fetch, so the SSE response wrapper can abort it when the client
+  // disconnects. Without this, a client that cancels a long SSE stream would
+  // leave the upstream socket open until the 10-minute stream timeout fires —
+  // and repeated disconnects would exhaust file descriptors.
+  let activeUpstreamCtrl: AbortController | null = null;
+
   // Track the last anthropic-beta header actually sent upstream. Captured
   // during the real fetch so diagnostics on 4xx don't need to build a second
   // throwaway Request (which would generate fresh random UUIDs and log a
@@ -255,13 +272,27 @@ export async function proxyRequest(
   // requests (LLM thinking traces can be long), 5 min for batch. Prevents a
   // hung upstream TCP connection from pinning a Bun worker forever.
   //
+  // vceshi0.0.8+: the AbortController is RETURNED alongside the response so
+  // the caller can wire it to the client's disconnect signal. When the client
+  // cancels reading the response body, we abort the upstream fetch — which
+  // releases the upstream socket immediately instead of letting it run until
+  // the 10-minute timeout. Without this, repeated client disconnects on long
+  // SSE streams would exhaust file descriptors.
+  //
+  // Also: for streaming responses, we DON'T clearTimeout on fetch resolve.
+  // The timer keeps running and serves as an overall-stream lifetime cap —
+  // if the upstream silently stops sending chunks mid-stream, the abort
+  // fires after the timeout and frees the socket. (Previously the timer was
+  // cleared as soon as headers arrived, leaving no idle-timeout protection
+  // for the body-reading phase.)
+  //
   // Per-account outbound proxy (v2.1.4.1test5+): if `cred.proxy` is set,
   // route the upstream fetch through that proxy via Bun's native
   // `{ proxy: url }` RequestInit option. We re-read `cred.proxy` on EVERY
   // call (not captured in a closure) so a credential switch mid-retry picks
   // up the new account's proxy automatically — without this, switching from
   // a proxied account to a direct one would keep using the old proxy.
-  const fetchUpstreamDetected = async (captcha?: Record<string, string>): Promise<Response> => {
+  const fetchUpstreamDetected = async (captcha?: Record<string, string>): Promise<{ resp: Response; ctrl: AbortController }> => {
     const req = buildUpstreamReq(captcha);
     lastSentBeta = req.headers.get("anthropic-beta");
     const timeoutMs = meta.stream ? UPSTREAM_TIMEOUT_STREAM_MS : UPSTREAM_TIMEOUT_BATCH_MS;
@@ -289,7 +320,16 @@ export async function proxyRequest(
       }
       throw err;
     }
-    clearTimeout(timer);
+    // vceshi0.0.8+: for non-streaming responses, clear the timer as before
+    // (the body will be consumed synchronously by .text()/.json()). For
+    // streaming responses, KEEP the timer running — it acts as an overall
+    // stream lifetime cap. If the upstream silently stops sending chunks,
+    // the timer fires and aborts the fetch, freeing the socket. The caller
+    // is responsible for clearing the timer when the stream completes
+    // naturally (via the wrapper installed below).
+    if (!meta.stream) {
+      clearTimeout(timer);
+    }
     // vceshi0.0.6+: verbose logging — log the upstream request headers + body
     // when logging.verbose is enabled. Auth tokens are masked to avoid leaking
     // secrets to the dashboard log panel. Truncated to 2000 chars to avoid
@@ -333,7 +373,7 @@ export async function proxyRequest(
     if (debugLoggingEnabled) {
       logUpstreamResponseDebug(reqId, resp, meta.stream);
     }
-    return resp;
+    return { resp, ctrl };
   };
 
   // Refresh captcha token if we're in start-plan mode. Returns the captcha
@@ -374,7 +414,16 @@ export async function proxyRequest(
         [RETRY_HEADERS.PARAM]: fresh.verifyParam,
         [RETRY_HEADERS.REGION]: fresh.region,
       };
-      const newResp = await fetchUpstreamDetected(freshCaptcha);
+      const fetched = await fetchUpstreamDetected(freshCaptcha);
+      const newResp = fetched.resp;
+      // For the captcha-retry path: if the new response is also 4xx/5xx,
+      // abort the upstream immediately to free the socket (we won't read
+      // the body anyway — handleCaptchaChallenge's caller will discard it).
+      if (!newResp.ok) {
+        try { fetched.ctrl.abort(); } catch {}
+      } else {
+        activeUpstreamCtrl = fetched.ctrl;
+      }
       headersAt = Date.now();
       return newResp;
     } catch (err) {
@@ -390,7 +439,18 @@ export async function proxyRequest(
     // got at the start of this function might have expired by now if there
     // was any await in between (config loading, body parsing, etc.).
     captchaHeaders = await refreshCaptchaHeaders();
-    upstreamResp = await fetchUpstreamDetected(captchaHeaders);
+    const fetched0 = await fetchUpstreamDetected(captchaHeaders);
+    upstreamResp = fetched0.resp;
+    // If the initial fetch returned an error, abort the upstream socket
+    // immediately — we're going to retry or return an error response, so we
+    // don't need to keep the upstream connection open. If it succeeded,
+    // remember the ctrl so the SSE wrapper can abort it on client disconnect.
+    if (!upstreamResp.ok) {
+      try { fetched0.ctrl.abort(); } catch {}
+      activeUpstreamCtrl = null;
+    } else {
+      activeUpstreamCtrl = fetched0.ctrl;
+    }
   } catch (err) {
     printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
     return errorResponse(502, "upstream_unreachable", (err as Error).message);
@@ -476,7 +536,21 @@ export async function proxyRequest(
     // total attempts if we want to actually try an alternative credential after
     // the switch (default maxRetries=3 would exhaust before the switch+retry).
     // We bump the effective limit by 1 per credential switch.
+    //
+    // vceshi0.0.8+: cap extraAttempts at 2× the number of unique credentials
+    // we've tried. Without this, a pathological config (maxRetries=10, 5
+    // dead credentials) would burn 10 + (5×2) = 20 retries × N seconds of
+    // backoff each — leaving the client waiting minutes for a response that
+    // was doomed after the first switch failed. The cap ensures we stop
+    // cycling once every available credential has been tried twice.
     let extraAttemptsFromSwitches = 0;
+    // vceshi0.0.8+: dynamic cap, recomputed at each switch. Without this,
+    // a pathological config (maxRetries=10, 5 dead credentials) would burn
+    // 10 + (5×2) = 20 retries × N seconds of backoff each — leaving the
+    // client waiting minutes for a response that was doomed after the first
+    // switch failed. The cap ensures we stop cycling once every available
+    // credential has been tried twice.
+    const extraAttemptsCap = () => Math.max(2, triedApiKeys.size * 2);
 
     for (let attempt = 1; attempt <= config.retry.maxRetries + extraAttemptsFromSwitches; attempt++) {
       // Calculate backoff delay: initialDelay * backoffFactor^(attempt-1), capped at maxDelay
@@ -571,7 +645,7 @@ export async function proxyRequest(
           // maxRetries=3). The extra attempt gives the new credential a fair
           // shot. For generic switchThreshold switches we DON'T add extra
           // attempts — the existing tests expect the loop to end at maxRetries.
-          if (shouldSwitchForEmptyStream) {
+          if (shouldSwitchForEmptyStream && extraAttemptsFromSwitches < extraAttemptsCap()) {
             extraAttemptsFromSwitches++;
           }
           // Persist the switch so the dashboard reflects the new active account.
@@ -608,7 +682,22 @@ export async function proxyRequest(
         // "captcha verify failed" — which is NOT a retryable status, so it
         // would break out of the loop and leak the 403 to the client.
         const retryCaptcha = await refreshCaptchaHeaders();
-        upstreamResp = await fetchUpstreamDetected(retryCaptcha);
+        const fetchedRetry = await fetchUpstreamDetected(retryCaptcha);
+        upstreamResp = fetchedRetry.resp;
+        // Track the active ctrl so the SSE wrapper can abort on client
+        // disconnect. If this is a retryable status (we'll loop again),
+        // the body will be cancelled below before the next attempt — that
+        // cancellation does NOT need to abort the ctrl (we want the socket
+        // to close naturally as the body drains). Only the FINAL successful
+        // response's ctrl matters for the SSE wrapper.
+        if (upstreamResp.ok) {
+          activeUpstreamCtrl = fetchedRetry.ctrl;
+        } else if (config.retry.retryableStatuses.includes(upstreamResp.status)) {
+          // Retryable error — body will be cancelled below, abort ctrl to
+          // free the socket immediately since we won't read the body.
+          try { fetchedRetry.ctrl.abort(); } catch {}
+          activeUpstreamCtrl = null;
+        }
         headersAt = Date.now();
 
         // If the retry itself returns 403 (captcha challenge), try to
@@ -706,7 +795,9 @@ export async function proxyRequest(
           consecutiveCredFailures = 0;
           consecutiveEmptyStreams = 0;
           triedApiKeys.add(newCred.apiKey);
-          extraAttemptsFromSwitches++;
+          if (extraAttemptsFromSwitches < extraAttemptsCap()) {
+            extraAttemptsFromSwitches++;
+          }
           // Persist the switch so the dashboard reflects the new active account.
           // This was MISSING in the end-of-loop switch block — the in-memory
           // credential was switched (so the request used the new account), but
@@ -799,7 +890,7 @@ export async function proxyRequest(
         const translated = anthropicSseToResponsesSse(upstreamResp.body, meta.model);
         const [clientBody, statsBody] = translated.tee();
         observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null, maskApiKey(cred.apiKey));
-        return translatedSseResponse(clientBody);
+        return translatedSseResponse(wrapStreamWithClientAbort(clientBody, activeUpstreamCtrl));
       }
       return await translatedResponsesBatchResponse(
         clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt,
@@ -813,7 +904,7 @@ export async function proxyRequest(
       const translated = anthropicSseToOpenaiSse(upstreamResp.body, meta.model);
       const [clientBody, statsBody] = translated.tee();
       observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, null, maskApiKey(cred.apiKey));
-      return translatedSseResponse(clientBody);
+      return translatedSseResponse(wrapStreamWithClientAbort(clientBody, activeUpstreamCtrl));
     }
     return await translatedBatchResponse(clientReq, upstreamResp, meta.model, reqId, format, meta, started, headersAt, maskApiKey(cred.apiKey));
   }
@@ -821,7 +912,7 @@ export async function proxyRequest(
   if (isSSE && upstreamResp.body) {
     const [clientBody, statsBody] = upstreamResp.body.tee();
     observeStream(reqId, format, meta, upstreamResp.status, started, statsBody, upstreamResp.headers.get("content-encoding"), maskApiKey(cred.apiKey));
-    return passthroughResponse(upstreamResp, clientBody);
+    return passthroughResponse(upstreamResp, wrapStreamWithClientAbort(clientBody, activeUpstreamCtrl));
   }
 
   // Non-streaming anthropic passthrough — try to extract usage from the response
@@ -856,11 +947,46 @@ export async function proxyRequest(
 }
 
 /** Read the request body as a string, returning undefined for empty bodies. */
+const MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024; // 32 MB hard cap — blocks OOM attacks
+
 async function readBody(req: Request): Promise<string | undefined> {
   if (req.method === "GET" || req.method === "HEAD") return undefined;
-  const text = await req.text();
-  if (text.length === 0) return undefined;
-  return text;
+  // vceshi0.0.8+: enforce a hard body size cap BEFORE reading, so a malicious
+  // or buggy client sending a 1GB JSON body can't OOM the proxy. 32MB is
+  // generous for typical LLM workloads (long Codex history + tool results
+  // rarely exceed 1MB) while still blocking the abuse vector. Returns 413
+  // by throwing — caller catches and converts to errorResponse.
+  const contentLength = req.headers.get("content-length");
+  if (contentLength) {
+    const n = parseInt(contentLength, 10);
+    if (Number.isFinite(n) && n > MAX_REQUEST_BODY_BYTES) {
+      throw Object.assign(new Error(`Request body too large: ${n} bytes (max ${MAX_REQUEST_BODY_BYTES})`), { httpStatus: 413, errorType: "request_too_large" });
+    }
+  }
+  // Read with a streaming byte cap as a defense-in-depth — Content-Length
+  // could be missing or lying. We accumulate the text but abort if the
+  // accumulated size exceeds the cap.
+  const reader = req.body?.getReader();
+  if (!reader) {
+    // No body — fall back to req.text() for compatibility with empty bodies.
+    const text = await req.text();
+    return text.length === 0 ? undefined : text;
+  }
+  const decoder = new TextDecoder();
+  let acc = "";
+  let totalBytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    totalBytes += value.byteLength;
+    if (totalBytes > MAX_REQUEST_BODY_BYTES) {
+      try { await reader.cancel(); } catch {}
+      throw Object.assign(new Error(`Request body exceeded ${MAX_REQUEST_BODY_BYTES} bytes while reading`), { httpStatus: 413, errorType: "request_too_large" });
+    }
+    acc += decoder.decode(value, { stream: true });
+  }
+  acc += decoder.decode(); // flush trailing bytes
+  return acc.length === 0 ? undefined : acc;
 }
 
 /**
@@ -1063,20 +1189,20 @@ async function translatedBatchResponse(
     if (v) respHeaders.set(h, v);
   }
 
-  if (clientAcceptsGzip(clientReq)) {
-    respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey);
-    // Note: Bun.gzipSync blocks the event loop briefly (~5-20ms for 200KB).
-    // Bun's typing only exposes gzipSync (not an async Bun.gzip), and the
-    // alternative (Bun.deflateSync with GZIP format) is also sync. In
-    // practice this is rarely a hot path — chat completions responses are
-    // usually <50KB. If you hit high concurrency with large responses,
-    // consider moving to a worker thread or a streaming compressor.
-    return new Response(Bun.gzipSync(payload), {
-      status: upstream.status,
-      headers: respHeaders,
-    });
-  }
+    if (clientAcceptsGzip(clientReq)) {
+      respHeaders.set("content-encoding", "gzip");
+      printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey);
+      // vceshi0.0.8+: use level=1 instead of the default (6). level 1 is ~5x
+      // faster for typical 50-200KB JSON responses while only marginally
+      // larger output (~10% worse compression). For a chat-completions proxy
+      // where the client is local and bandwidth is not the bottleneck, the
+      // event-loop savings dominate. If you need max compression, switch to
+      // a worker thread.
+      return new Response(Bun.gzipSync(payload, { level: 1 }), {
+        status: upstream.status,
+        headers: respHeaders,
+      });
+    }
   printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey);
   return new Response(payload, {
     status: upstream.status,
@@ -1147,7 +1273,7 @@ async function translatedResponsesBatchResponse(
   if (clientAcceptsGzip(clientReq)) {
     respHeaders.set("content-encoding", "gzip");
     printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey);
-    return new Response(Bun.gzipSync(payload), {
+    return new Response(Bun.gzipSync(payload, { level: 1 }), {
       status: upstream.status,
       headers: respHeaders,
     });
@@ -1165,6 +1291,45 @@ function translatedSseResponse(body: ReadableStream<Uint8Array>): Response {
     headers: {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
+    },
+  });
+}
+
+/**
+ * Wrap a ReadableStream so that when the downstream client cancels reading
+ * (e.g. network drop, IDE closed, user pressed Ctrl+C in their CLI), the
+ * provided AbortController is aborted — which releases the upstream socket
+ * immediately instead of letting it run until the 10-minute stream timeout.
+ *
+ * vceshi0.0.8+: previously the upstream AbortController was only tied to a
+ * wall-clock timeout, NOT to the client's read state. A client disconnect
+ * left the upstream socket open for up to 10 minutes per request, and
+ * repeated disconnects under load would exhaust file descriptors.
+ */
+function wrapStreamWithClientAbort<T>(
+  body: ReadableStream<T>,
+  ctrl: AbortController | null,
+): ReadableStream<T> {
+  if (!ctrl) return body; // no upstream ctrl to abort (e.g. synthetic response)
+  const reader = body.getReader();
+  return new ReadableStream<T>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (err) {
+        // Upstream errored — propagate to client.
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      // Client disconnected — abort the upstream fetch to free the socket.
+      try { ctrl.abort(); } catch {}
+      try { reader.cancel(reason); } catch {}
     },
   });
 }
@@ -1460,34 +1625,46 @@ async function logUpstreamResponseDebug(reqId: string, resp: Response, _isStream
     // Read the clone's body with a timeout so a hung stream doesn't block
     // the request forever. 3s is enough to get the first SSE event or the
     // full JSON body of an error response.
-    const previewPromise = (async () => {
-      if (!clone.body) return "(no body)";
+    //
+    // vceshi0.0.8+: previously used Promise.race([previewPromise, timeout])
+    // — but when the timeout won, the previewPromise was still running in
+    // the background with an open reader on `clone.body`, leaking the
+    // upstream socket until the stream naturally ended (could be up to
+    // 10 minutes for SSE). Now we use an AbortController: when the timeout
+    // fires, we cancel the reader explicitly, which releases the underlying
+    // socket immediately.
+    const preview = await new Promise<string>(async (resolve) => {
+      if (!clone.body) { resolve("(no body)"); return; }
       const reader = clone.body.getReader();
       const decoder = new TextDecoder();
-      let preview = "";
-      const deadline = Date.now() + 3000;
-      while (preview.length < 2048 && Date.now() < deadline) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        preview += decoder.decode(value, { stream: true });
-        // For SSE: stop after first complete event (enough to diagnose)
-        if (ct.includes("text/event-stream") && preview.includes("\n\n") && preview.length > 50) break;
-        // For JSON: stop when we likely have the full body (small error responses)
-        if (ct.includes("application/json") && preview.length > 0 && preview.trim().endsWith("}")) break;
+      let acc = "";
+      let settled = false;
+      const finish = (val: string) => {
+        if (settled) return;
+        settled = true;
+        try { reader.cancel(); } catch { /* already closed */ }
+        resolve(val);
+      };
+      // Timeout — cancels the reader and resolves with what we have so far.
+      const timer = setTimeout(() => finish(acc + "(read timeout after 3s)"), 3000);
+      try {
+        const deadline = Date.now() + 3000;
+        while (acc.length < 2048 && Date.now() < deadline) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          acc += decoder.decode(value, { stream: true });
+          // For SSE: stop after first complete event (enough to diagnose)
+          if (ct.includes("text/event-stream") && acc.includes("\n\n") && acc.length > 50) break;
+          // For JSON: stop when we likely have the full body (small error responses)
+          if (ct.includes("application/json") && acc.length > 0 && acc.trim().endsWith("}")) break;
+        }
+        clearTimeout(timer);
+        finish(acc);
+      } catch {
+        clearTimeout(timer);
+        finish(acc + "(body read failed)");
       }
-      try { reader.cancel(); } catch {}
-      return preview;
-    })();
-
-    let preview: string;
-    try {
-      preview = await Promise.race([
-        previewPromise,
-        new Promise<string>(r => setTimeout(() => r("(read timeout after 3s)"), 3000)),
-      ]);
-    } catch {
-      preview = "(body read failed)";
-    }
+    });
 
     const trimmed = preview.length > 1000
       ? preview.slice(0, 1000) + `...(truncated, total ${preview.length} chars)`

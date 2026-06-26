@@ -1,5 +1,39 @@
 # zcode-proxy 使用说明
 
+> **v0.1.6 — 全面安全与性能优化：鉴权旁路修复 + SSE socket 泄漏修复 + 凭证写盘可靠性 + 卡顿消除**
+>
+> 本次更新聚焦于安全漏洞修复、运行时崩溃风险消除和性能优化。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 508/508 测试通过，TypeScript 编译零错误。
+>
+> **P0 严重修复（5 项）**
+> - **鉴权旁路修复**：旧版当 `auth.proxyApiKey` 未配置时，`if (proxyApiKey && !timingSafeEqual(...))` 短路为 false，**所有 admin API 裸奔**——任何人都能 `GET /admin/api/accounts/export` 拖走全部明文凭证。新版改为"未配置也拒绝"，仅 `/admin/api/verify` 仍返回 `no_auth` 警告供 dashboard 显示横幅
+> - **SSE 客户端断开 socket 泄漏修复**：旧版 `body.tee()` 拆出的 statsBody 仍被 `observeStream` 读取，按 tee 语义源流必须两个分支都 cancel 才取消；上游 fetch 的 AbortController 仅绑 10 分钟超时，未绑客户端断开信号——多次断连会耗尽 fd。新版 `fetchUpstreamDetected` 返回 `{resp, ctrl}`，SSE 响应 body 用 `wrapStreamWithClientAbort` 包装，客户端 cancel 时立即 `ctrl.abort()` 释放上游 socket
+> - **请求体 32MB 硬上限**：旧版 `readBody` 用 `req.text()` 整体读入，100MB body 会同时存在原文 + parsed obj + stringify 结果 ≈ 300MB 内存峰值。新版改流式读取 + Content-Length 预检，超限返回 413
+> - **真 backpressure 循环**：旧版 `waitForBackpressure` 只 `setTimeout 1ms` 一次就返回，慢客户端下翻译器内部 buffer 无界增长直到 OOM。新版改 `while (desiredSize <= 0) await sleep(5ms)`，30s 总超时兜底
+> - **凭证写盘不再静默吞错**：旧版 `writeStore` 的 `catch (err) { console.warn(...) }` 后无论写盘成功与否都 `cachedStore = store`——磁盘满 / Render 未挂载持久盘 / Windows EPERM 重试 5 次仍失败时，**用户在 dashboard 看到"已保存"，重启后凭证丢失**。新版写盘失败时不更新缓存 + rethrow，让 dashboard 真实返回 500
+>
+> **P1 高优先级修复（6 项）**
+> - **凭证切换组合锁**：旧版 `switchAccount` 持 store 锁、`persistConfig` 持 config 锁——两把不同的锁，并发切到不同 plan 的账号时最终磁盘上的 `activeId` 和 `plan` 可能来自不同请求。新版 `accountSwitchMutex` 包整个序列
+> - **captcha token in-flight 去重**：旧版缓存过期瞬间 N 个并发请求同时进入 `solveInJsdomWithRetry`（每个 ~40s CPU + 50MB jsdom），事件循环被 AliyunCaptcha 内部 80ms setInterval 反复打断。新版 `inflightToken` Promise 共享，N 个请求等一次 solve
+> - **SSE 流 idle timeout**：旧版 `clearTimeout(timer)` 在 fetch resolve 后立即执行，上游 mid-stream 静默会挂到 10 分钟自然超时。新版流式响应保留 AbortController 到流结束，上游静默时 10min 超时仍能 abort 释放 socket
+> - **debug 日志 reader 泄漏修复**：旧版 `logUpstreamResponseDebug` 用 `Promise.race([previewPromise, timeout])`——超时赢得后 previewPromise 仍在后台读 `clone.body`，reader 永不 cancel，上游 socket 被占住直到流自然结束。新版用 AbortController 模式，超时时显式 `reader.cancel()`
+> - **importAccounts 字段白名单**：旧版只校验 `credential.apiKey` 是 string，`credential` 其它字段完全不过滤——可注入 `proxy: "http://attacker.com"` 让该账号所有 LLM 请求经攻击者代理泄露 prompt/response。新版只保留已知安全字段，`proxy` 额外校验 URL scheme
+> - **AuthManager switchToNextCredential 加锁 + in-flight 去重**：旧版两个并发请求同时进入 retry loop，同时 `await listAllCredentials()` 读到同一快照，都切到同一候选凭证。新版 `credMutex` + `inflightSwitch` Promise 共享
+>
+> **P2 性能优化（7 项）**
+> - `Bun.gzipSync` 改 `level:1`（事件循环阻塞降 ~5×）
+> - `extraAttemptsFromSwitches` 加动态上限 `max(2, triedApiKeys.size × 2)`，避免凭证全失效时无限重试
+> - `safeJson(req)` 4MB body 上限，应用于 `/config` PUT 和 `/accounts/import`
+> - `PUT /admin/api/config` 的 `server` 字段深合并，避免丢 `host`
+> - `setAccountLabel` 空字符串回退到自动标签（不再静默 no-op）
+> - 删账号时 `quotaCache.delete(id)` 同步清理
+> - `exportAccounts` 返回深拷贝，防止未来 mutate 污染缓存
+>
+> **额外修复**
+> - `utils/crypto.ts`：手写 `timingSafeEqual` 改用 `node:crypto#timingSafeEqual`，更可靠的恒定时间比较
+> - `utils/fs.ts`：`atomicWriteFile` tmp 文件名加 4 字节随机后缀，防同毫秒并发写碰撞
+> - `auth/store.ts`：`readStoreUncached` + `clearCredential` 的 spin-wait 改异步 `setTimeout`，消除 750ms 事件循环阻塞（Windows 杀毒锁文件时必现）
+> - `clearCredential` 现为 `async`，`authLogout` 同步适配
+>
 > **v0.1.5 — 代码质量优化 + Anthropic 强制流式输出 + 代理测试连接 + 上游超时配置**
 >
 > 本次更新包含大量代码质量改进和新功能。无 CLI 命令变化，无需重新生成 start.bat / start.sh。全套 508/508 测试通过，TypeScript 编译零错误。

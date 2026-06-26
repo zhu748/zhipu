@@ -8,6 +8,7 @@ import type { ProxyConfig, RoutingRule, ModelMapping, ResponsesThinkingConfig } 
 import type { AuthManager } from "../auth/manager.js";
 import type { Credential as AppCredential } from "../auth/types.js";
 import { loadCredential, saveCredential, clearCredential, listAccounts, switchAccount, removeAccount, setAccountLabel, setAccountPlan, setAccountProxy, setAccountName, setAccountEmail, setAccountDisabled, exportSingleAccount, exportAccounts, exportStore, importAccounts, maskApiKey, invalidateStoreCache } from "../auth/store.js";
+import type { StoredAccount } from "../auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { queryQuota } from "../auth/quota.js";
@@ -361,6 +362,13 @@ const configWriteMutex = createMutex();
 const persistConfig = (config: ProxyConfig, configPath: string): Promise<void> =>
   configWriteMutex.run(() => atomicWriteFile(configPath, configToYaml(config)));
 
+// vceshi0.0.8+: composite mutex for the switchAccount + plan-sync + persist
+// sequence. The store lock (inside switchAccount) and the config lock (inside
+// persistConfig) are separate, so without this outer mutex two concurrent
+// dashboard PUTs could interleave and leave the on-disk state inconsistent
+// (activeId from request A, plan from request B).
+const accountSwitchMutex = createMutex();
+
 // Log buffer for streaming — uses a monotonic sequence number per entry
 // so that SSE clients can track their position even when the underlying
 // array is trimmed. The old approach used array indices, which became
@@ -442,7 +450,15 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     if (!token && path === "/admin/api/logs/stream") {
       token = url.searchParams.get("token") ?? "";
     }
-    if (opts.config.auth.proxyApiKey && !timingSafeEqual(token, opts.config.auth.proxyApiKey)) {
+    // vceshi0.0.8+ CRITICAL FIX: previously `if (proxyApiKey && !timingSafeEqual(...))`
+    // — when proxyApiKey was UNSET, the condition short-circuited to false and
+    // ALL admin API routes were left open to anyone with network access.
+    // That meant GET /admin/api/accounts/export would dump every plaintext
+    // credential to an unauthenticated caller. Now we reject when the key is
+    // missing OR the comparison fails. The /admin/api/verify endpoint still
+    // returns a `warning: "no_auth"` so the dashboard can show the user the
+    // "please set proxyApiKey" banner, but every other route is locked.
+    if (!opts.config.auth.proxyApiKey || !timingSafeEqual(token, opts.config.auth.proxyApiKey)) {
       return errorResponse(401, "authentication_error", "Invalid admin token");
     }
   }
@@ -474,7 +490,10 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Update config
   if (path === "/admin/api/config" && method === "PUT") {
     try {
-      const body = await req.json() as Record<string, unknown>;
+      // vceshi0.0.8+: use safeJson for body-size cap (defense against OOM).
+      const bodyJson = await safeJson(req);
+      if (isSafeJsonError(bodyJson)) return errorResponse(bodyJson.status, bodyJson.error.type, bodyJson.error.message);
+      const body = bodyJson;
       // Prevent masked placeholder values from overwriting real secrets.
       // The sanitizeConfig() GET endpoint returns "***configured***" for
       // secret fields; if the dashboard sends those back unchanged we skip them.
@@ -505,6 +524,12 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       // `{"retry":{"maxRetries":5}}` would lose all other retry fields
       // (initialDelayMs, retryableStatuses, emptyStreamSwitchThreshold, etc.),
       // causing runtime TypeError in handler.ts when those fields became undefined.
+      //
+      // vceshi0.0.8+: also deep-merge `server` — previously a partial
+      // `{server: {port: 3000}}` would silently drop `server.host`.
+      if (body.server) {
+        newConfig.server = { ...opts.config.server, ...(body.server as object) };
+      }
       if (authBody) {
         newConfig.auth = { ...opts.config.auth, ...authBody };
       }
@@ -633,7 +658,11 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // defeating the purpose of the clear action and creating a confusing
   // "I cleared credentials but the proxy still works" experience.
   if (path === "/admin/api/credentials" && method === "DELETE") {
-    clearCredential();
+    try {
+      await clearCredential();
+    } catch (err) {
+      return errorResponse(500, "clear_failed", (err as Error).message);
+    }
     opts.auth.clearOAuthCredential();
     appendLog("info", "All credentials cleared via admin dashboard");
     return jsonResp({ ok: true });
@@ -658,34 +687,44 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     try {
       const body = await req.json() as { id?: string };
       if (!body.id) return errorResponse(400, "missing_param", "id is required");
-      const ok = await switchAccount(body.id);
-      if (!ok) return errorResponse(404, "not_found", "Account not found");
-      // Hot-swap the in-memory credential and sync plan
-      const cred = await loadCredential();
-      let planSynced = false;
-      if (cred) {
-        opts.auth.setOAuthCredential(cred);
-        // Sync config.plan to match the account's plan, and persist to yaml
-        // so the change survives a server restart. Without this, users who
-        // switch plan via the dashboard find the change silently reverted
-        // after restart — leading to confusing "still coding-plan" reports.
-        if (cred.plan && cred.plan !== opts.config.plan) {
-          opts.config.plan = cred.plan;
-          planSynced = true;
-          appendLog("info", `Plan synced to ${cred.plan} (from account ${body.id})`);
+      // vceshi0.0.8+: serialize the entire switch + plan-sync + persist sequence.
+      // Previously switchAccount held the store lock and persistConfig held the
+      // config lock — two different locks. Two concurrent PUTs switching to
+      // accounts with different plans could interleave so that the final
+      // on-disk state had activeId=A but plan=B. The composite mutex below
+      // guarantees the whole operation is atomic from the dashboard's POV.
+      const result = await accountSwitchMutex.run(async () => {
+        const ok = await switchAccount(body.id!);
+        if (!ok) return { kind: "error" as const, status: 404, type: "not_found", message: "Account not found" };
+        // Hot-swap the in-memory credential and sync plan
+        const cred = await loadCredential();
+        let planSynced = false;
+        if (cred) {
+          opts.auth.setOAuthCredential(cred);
+          // Sync config.plan to match the account's plan, and persist to yaml
+          // so the change survives a server restart. Without this, users who
+          // switch plan via the dashboard find the change silently reverted
+          // after restart — leading to confusing "still coding-plan" reports.
+          if (cred.plan && cred.plan !== opts.config.plan) {
+            opts.config.plan = cred.plan;
+            planSynced = true;
+            appendLog("info", `Plan synced to ${cred.plan} (from account ${body.id})`);
+          }
         }
-      }
-      appendLog("info", `Switched active account to ${body.id}`);
-      // Persist the (possibly updated) plan to yaml so restart keeps it.
-      if (planSynced) {
-        try {
-          await persistConfig(opts.config, opts.configPath);
-          appendLog("info", `Persisted plan=${opts.config.plan} to ${opts.configPath}`);
-        } catch (e) {
-          appendLog("error", `Failed to persist plan to config: ${(e as Error).message}`);
+        appendLog("info", `Switched active account to ${body.id}`);
+        // Persist the (possibly updated) plan to yaml so restart keeps it.
+        if (planSynced) {
+          try {
+            await persistConfig(opts.config, opts.configPath);
+            appendLog("info", `Persisted plan=${opts.config.plan} to ${opts.configPath}`);
+          } catch (e) {
+            appendLog("error", `Failed to persist plan to config: ${(e as Error).message}`);
+          }
         }
-      }
-      return jsonResp({ ok: true, plan: cred?.plan || opts.config.plan });
+        return { kind: "ok" as const, plan: cred?.plan || opts.config.plan };
+      });
+      if (result.kind === "error") return errorResponse(result.status, result.type, result.message);
+      return jsonResp({ ok: true, plan: result.plan });
     } catch (err) {
       return errorResponse(500, "switch_failed", (err as Error).message);
     }
@@ -947,6 +986,10 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     if (!id) return errorResponse(400, "missing_param", "account id required");
     const ok = await removeAccount(id);
     if (!ok) return errorResponse(404, "not_found", "Account not found");
+    // vceshi0.0.8+: drop the quota cache entry for the deleted account so the
+    // FIFO evictor doesn't keep a stale entry around (and so a re-added account
+    // with the same id starts with a fresh cache miss).
+    quotaCache.delete(id);
     // Hot-swap the in-memory credential if active changed
     const cred = await loadCredential();
     if (cred) opts.auth.setOAuthCredential(cred);
@@ -1242,19 +1285,52 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Import accounts from backup
   if (path === "/admin/api/accounts/import" && method === "POST") {
     try {
-      const body = await req.json() as { accounts?: unknown[] };
+      // vceshi0.0.8+: use safeJson for body-size cap (defense against OOM).
+      const bodyJson = await safeJson(req);
+      if (isSafeJsonError(bodyJson)) return errorResponse(bodyJson.status, bodyJson.error.type, bodyJson.error.message);
+      const body = bodyJson as { accounts?: unknown[] };
       if (!Array.isArray(body.accounts)) {
         return errorResponse(400, "invalid_param", "accounts array is required");
       }
-      // Basic validation: each account must have id, label, createdAt, credential
-      const validated = body.accounts.filter((a: any) =>
-        a && typeof a.id === "string" && typeof a.label === "string" &&
-        typeof a.createdAt === "number" && a.credential && typeof a.credential.apiKey === "string"
-      );
+      // vceshi0.0.8+ CRITICAL: previously we only validated that
+      // `credential.apiKey` was a string and passed the whole object through
+      // `as any` to importAccounts. That let an attacker (or a careless
+      // backup file) inject arbitrary fields like `proxy: "http://attacker.com"`
+      // — which would then route ALL that account's LLM traffic through the
+      // attacker's proxy, leaking prompts and responses. Now we extract ONLY
+      // the known-safe fields and drop everything else.
+      const VALID_PROVIDERS = new Set(["zai", "bigmodel"]);
+      const VALID_PLANS = new Set(["coding-plan", "start-plan", undefined]);
+      const validated: Array<Omit<StoredAccount, "credential"> & { credential: AppCredential }> = [];
+      for (const raw of body.accounts) {
+        if (!raw || typeof raw !== "object") continue;
+        const a = raw as Record<string, any>;
+        if (typeof a.id !== "string" || typeof a.label !== "string" || typeof a.createdAt !== "number") continue;
+        if (!a.credential || typeof a.credential.apiKey !== "string") continue;
+        const c = a.credential;
+        if (!VALID_PROVIDERS.has(c.provider)) continue;
+        if (!VALID_PLANS.has(c.plan)) continue;
+        // Rebuild a clean credential with only known fields. `proxy` is only
+        // kept if it's a syntactically-valid http(s)/socks5 URL — same regex
+        // as the proxy PUT route.
+        const cred: AppCredential = {
+          apiKey: String(c.apiKey),
+          provider: c.provider as "zai" | "bigmodel",
+          ...(c.plan === "coding-plan" || c.plan === "start-plan" ? { plan: c.plan } : {}),
+          ...(typeof c.userId === "string" ? { userId: c.userId } : {}),
+          ...(typeof c.jwt === "string" ? { jwt: c.jwt } : {}),
+          ...(typeof c.secret === "string" ? { secret: c.secret } : {}),
+          ...(typeof c.email === "string" ? { email: c.email } : {}),
+          ...(typeof c.name === "string" ? { name: c.name } : {}),
+          ...(typeof c.proxy === "string" && /^(https?|socks5h?):\/\/[^\s]+$/i.test(c.proxy) ? { proxy: c.proxy } : {}),
+          ...(typeof c.expiresAt === "number" ? { expiresAt: c.expiresAt } : {}),
+        };
+        validated.push({ id: a.id, label: a.label, createdAt: a.createdAt, credential: cred });
+      }
       if (validated.length === 0) {
         return errorResponse(400, "invalid_param", "No valid accounts found in import data");
       }
-      const result = await importAccounts(validated as any);
+      const result = await importAccounts(validated);
       appendLog("info", `Imported accounts: ${result.added} added, ${result.updated} updated`);
       // Hot-swap active credential (only if it changed). After import we
       // must invalidate cache so loadCredential() reads the freshly-imported
@@ -1908,6 +1984,74 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
 }
 
 // --- Helpers ---
+
+/**
+ * vceshi0.0.8+: safe JSON body parser with a hard size cap.
+ *
+ * The dashboard's admin API never legitimately receives a body larger than
+ * ~1MB (the largest realistic payload is the accounts/import route with
+ * 20+ accounts × ~5KB each = ~100KB). Without a cap, an attacker who stole
+ * the proxyApiKey (or who exploits the no-auth path when proxyApiKey is
+ * unset — fixed elsewhere) could POST a 1GB JSON body and OOM the proxy.
+ *
+ * Returns {error, status} on failure so callers can do:
+ *   const body = await safeJson(req);
+ *   if ("error" in body) return errorResponse(body.status, body.error.type, body.error.message);
+ *   // body is now typed as Record<string, unknown>
+ */
+const MAX_ADMIN_BODY_BYTES = 4 * 1024 * 1024; // 4 MB — covers any realistic admin payload
+
+async function safeJson(req: Request): Promise<Record<string, unknown> | { error: { type: string; message: string }; status: number }> {
+  // Pre-check Content-Length if present — fast rejection without reading.
+  const cl = req.headers.get("content-length");
+  if (cl) {
+    const n = parseInt(cl, 10);
+    if (Number.isFinite(n) && n > MAX_ADMIN_BODY_BYTES) {
+      return { error: { type: "request_too_large", message: `Request body exceeds ${MAX_ADMIN_BODY_BYTES} bytes` }, status: 413 };
+    }
+  }
+  let text: string;
+  try {
+    // Read with a streaming byte cap as defense-in-depth against missing/lying CL.
+    const reader = req.body?.getReader();
+    if (!reader) {
+      text = await req.text();
+    } else {
+      const decoder = new TextDecoder();
+      let acc = "";
+      let total = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > MAX_ADMIN_BODY_BYTES) {
+          try { await reader.cancel(); } catch {}
+          return { error: { type: "request_too_large", message: `Request body exceeded ${MAX_ADMIN_BODY_BYTES} bytes while reading` }, status: 413 };
+        }
+        acc += decoder.decode(value, { stream: true });
+      }
+      acc += decoder.decode();
+      text = acc;
+    }
+  } catch (err) {
+    return { error: { type: "body_read_failed", message: (err as Error).message }, status: 400 };
+  }
+  if (text.length === 0) return {};
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { error: { type: "invalid_param", message: "Request body must be a JSON object" }, status: 400 };
+    }
+    return parsed as Record<string, unknown>;
+  } catch (err) {
+    return { error: { type: "invalid_json", message: (err as Error).message }, status: 400 };
+  }
+}
+
+/** Type guard for the error variant of safeJson's return type. */
+function isSafeJsonError(v: Record<string, unknown> | { error: { type: string; message: string }; status: number }): v is { error: { type: string; message: string }; status: number } {
+  return typeof (v as any).error === "object" && (v as any).error !== null;
+}
 
 function jsonResp(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {

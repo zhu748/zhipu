@@ -15,7 +15,7 @@ import type { ProviderId } from "./provider/types.js";
 import { spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 
-const VERSION = "0.1.5";
+const VERSION = "0.1.6";
 
 // ---------------------------------------------------------------------------
 // Process-level error handlers — installed ONCE before main() so they cover
@@ -371,7 +371,7 @@ function authCommand(args: string[]): void {
   if (sub === "login") {
     authLogin(args.slice(1)).catch(fatalError);
   } else if (sub === "logout") {
-    authLogout();
+    authLogout().catch(fatalError);
   } else if (sub === "status") {
     authStatus().catch(fatalError);
   } else if (sub === "export") {
@@ -485,13 +485,18 @@ async function authLogin(args: string[]): Promise<void> {
   console.log(`  Stored:  ${getStorePath()}`);
 }
 
-function authLogout(): void {
+async function authLogout(): Promise<void> {
   if (!existsSync(getStorePath())) {
     console.log("Not logged in.");
     return;
   }
-  clearCredential();
-  console.log("Logged out. Credentials removed.");
+  try {
+    await clearCredential();
+    console.log("Logged out. Credentials removed.");
+  } catch (err) {
+    console.error(`Logout failed: ${(err as Error).message}`);
+    process.exit(1);
+  }
 }
 
 async function authStatus(): Promise<void> {

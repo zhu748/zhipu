@@ -35,6 +35,17 @@ const SDK_LOAD_TIMEOUT_MS = Number(process.env.ZCODE_CAPTCHA_SDK_LOAD_MS || 20_0
 interface FetchedCaptchaConfig { enabled: boolean; prefix: string; sceneId: string; region: string; }
 let cachedConfig: { value: FetchedCaptchaConfig | null; expiresAt: number } = { value: null, expiresAt: 0 };
 let cachedToken: { verifyParam: string; region: string; expiresAt: number } | null = null;
+// vceshi0.0.8+: in-flight dedup for getCaptchaToken. Without this, when the
+// 45s TTL expires the first concurrent start-plan request starts a ~40s jsdom
+// solve, and any other concurrent request also sees cachedToken === null and
+// starts ITS own solve — N concurrent jsdom instances hammer the event loop
+// (each runs setInterval(80ms) internally) and burn ~50MB RAM each, plus
+// they all hit Aliyun's verify endpoint in parallel and risk rate-limiting.
+// Sharing the in-flight promise means N concurrent callers wait on ONE solve.
+let inflightToken: Promise<{ verifyParam: string; region: string }> | null = null;
+// In-flight dedup for fetchCaptchaConfig — same rationale but for the config
+// endpoint. Less critical (it's a fast HTTP call) but still cheap to dedup.
+let inflightConfig: Promise<FetchedCaptchaConfig | null> | null = null;
 
 export function detectCaptchaChallenge(resp: Response): string | null {
   const v = resp.headers.get(CAPTCHA_HEADER);
@@ -45,22 +56,41 @@ export function invalidateCaptchaToken(): void { cachedToken = null; }
 
 async function fetchCaptchaConfig(): Promise<FetchedCaptchaConfig | null> {
   if (cachedConfig.value && cachedConfig.expiresAt > Date.now()) return cachedConfig.value;
-  try {
-    const resp = await fetch(`${CONFIGS_API}?app_version=3.1.1&platform=win32-x64`);
-    const json = (await resp.json()) as { data?: { configs?: { captcha?: FetchedCaptchaConfig } } };
-    const cfg = json?.data?.configs?.captcha ?? null;
-    cachedConfig = { value: cfg, expiresAt: Date.now() + 60000 };
-    return cfg;
-  } catch { return null; }
+  if (inflightConfig) return inflightConfig;
+  inflightConfig = (async () => {
+    try {
+      const resp = await fetch(`${CONFIGS_API}?app_version=3.1.1&platform=win32-x64`);
+      const json = (await resp.json()) as { data?: { configs?: { captcha?: FetchedCaptchaConfig } } };
+      const cfg = json?.data?.configs?.captcha ?? null;
+      cachedConfig = { value: cfg, expiresAt: Date.now() + 60000 };
+      return cfg;
+    } catch { return null; }
+    finally { inflightConfig = null; }
+  })();
+  return inflightConfig;
 }
 
 export async function getCaptchaToken(): Promise<{ verifyParam: string; region: string }> {
   if (cachedToken && cachedToken.expiresAt > Date.now()) return { verifyParam: cachedToken.verifyParam, region: cachedToken.region };
-  const cfg = await fetchCaptchaConfig();
-  if (!cfg || !cfg.enabled || !cfg.prefix || !cfg.sceneId) throw new Error("Captcha config unavailable");
-  const verifyParam = await solveInJsdomWithRetry(cfg);
-  cachedToken = { verifyParam, region: cfg.region, expiresAt: Date.now() + TOKEN_TTL_MS };
-  return { verifyParam, region: cfg.region };
+  if (inflightToken) return inflightToken;
+  inflightToken = (async () => {
+    const cfg = await fetchCaptchaConfig();
+    if (!cfg || !cfg.enabled || !cfg.prefix || !cfg.sceneId) throw new Error("Captcha config unavailable");
+    const verifyParam = await solveInJsdomWithRetry(cfg);
+    cachedToken = { verifyParam, region: cfg.region, expiresAt: Date.now() + TOKEN_TTL_MS };
+    return { verifyParam, region: cfg.region };
+  })();
+  try {
+    return await inflightToken;
+  } finally {
+    // Clear the slot only AFTER all awaiters have settled. We can't know
+    // when the last awaiter resumes, so we clear immediately on our own
+    // settle — subsequent callers will see cachedToken populated and skip
+    // the inflight path entirely. The only edge case is if our cachedToken
+    // write raced with a TTL expiry in another caller, but that just falls
+    // through to a fresh solve on the next call, which is correct.
+    inflightToken = null;
+  }
 }
 
 async function solveInJsdomWithRetry(cfg: FetchedCaptchaConfig): Promise<string> {

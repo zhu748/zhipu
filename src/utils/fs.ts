@@ -14,6 +14,7 @@
  */
 import { writeFile, rename, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
 
 /**
  * Windows-safe rename with retry. On POSIX, `rename` is atomic and
@@ -69,7 +70,14 @@ export async function atomicWriteFile(
   content: string | Uint8Array,
   encoding: BufferEncoding = "utf-8",
 ): Promise<void> {
-  const tmp = join(dirname(path), `.${process.pid}.tmp-${Date.now()}`);
+  // Append a 4-byte random suffix so two concurrent atomicWriteFile calls
+  // on the same path (e.g. configWriteMutex + storeWriteMutex racing on
+  // different files in the same dir, or any future caller outside the
+  // mutexes) can't collide on the same tmp filename when Date.now() returns
+  // the same millisecond. Without this, the second write would silently
+  // overwrite the first's tmp file and the first rename would fail with
+  // ENOENT — losing the first write.
+  const tmp = join(dirname(path), `.${process.pid}.tmp-${Date.now()}-${randomBytes(4).toString("hex")}`);
   await writeFile(tmp, content, encoding);
   try {
     await safeRename(tmp, path);

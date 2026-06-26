@@ -42,14 +42,14 @@ function cleanupBrokenBackups(): void {
 // set. The env vars below are only used by the legacy-fallback recovery tests
 // to simulate files encrypted by older versions of this code.
 describe("credential store", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     _resetKeyCacheForTesting();
-    clearCredential();
+    await clearCredential();
     cleanupBrokenBackups();
   });
 
-  afterEach(() => {
-    clearCredential();
+  afterEach(async () => {
+    await clearCredential();
     cleanupBrokenBackups();
     _resetKeyCacheForTesting();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
@@ -91,7 +91,7 @@ describe("credential store", () => {
   it("clearCredential removes stored credential", async () => {
     const cred: Credential = { apiKey: "x", provider: "zai" };
     await saveCredential(cred);
-    clearCredential();
+    await clearCredential();
     const loaded = await loadCredential();
     expect(loaded).toBeNull();
   });
@@ -109,15 +109,15 @@ describe("credential store", () => {
 });
 
 describe("multi-account store", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     _resetKeyCacheForTesting();
-    clearCredential();
+    await clearCredential();
     // Also clean up any leftover .broken-* files from prior test runs
     cleanupBrokenBackups();
   });
 
-  afterEach(() => {
-    clearCredential();
+  afterEach(async () => {
+    await clearCredential();
     cleanupBrokenBackups();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
     delete process.env.ZCODE_PROXY_LEGACY_SEED;
@@ -464,7 +464,7 @@ describe("multi-account store", () => {
     expect(existsSync(storePath)).toBe(true);
 
     // After clearCredential (user explicitly confirms discard), saving works again
-    clearCredential();
+    await clearCredential();
     _resetKeyCacheForTesting();
     await saveCredential({ apiKey: "fresh-key", provider: "zai" });
     const fresh = await loadCredential();
@@ -526,7 +526,7 @@ describe("multi-account store", () => {
     // old env-var-derived key CANNOT be recovered by setting the old env
     // var — but CAN be recovered by setting ZCODE_PROXY_LEGACY_SEED to the
     // same value.
-    clearCredential();
+    await clearCredential();
     _resetKeyCacheForTesting();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
     const crypto = await import("node:crypto");
@@ -859,7 +859,7 @@ describe("multi-account store", () => {
     // Simulate a crashed write that left an empty file (the old writeFileSync
     // truncate-then-write race). The new code should treat this as "no store"
     // and NOT back it up (backing up an empty file is pointless spam).
-    clearCredential();
+    await clearCredential();
     const storePath = join(homedir(), ".zcode-proxy", "credentials.json");
     mkdirSync(join(homedir(), ".zcode-proxy"), { recursive: true });
     writeFileSync(storePath, "", "utf-8");
@@ -883,7 +883,7 @@ describe("multi-account store", () => {
   it(".broken-* backups are capped at 5 (oldest deleted)", async () => {
     // Create 7 corrupted files by writing invalid JSON directly, then trigger
     // a read (which backs up + cleans up). Only the 5 most recent should remain.
-    clearCredential();
+    await clearCredential();
     const storeDir = join(homedir(), ".zcode-proxy");
     mkdirSync(storeDir, { recursive: true });
 

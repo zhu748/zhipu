@@ -5,6 +5,7 @@
 import type { AuthMode, Credential } from "./types.js";
 import { createApiKeyCredential } from "./apikey.js";
 import type { ProviderId } from "../provider/types.js";
+import { createMutex } from "../utils/fs.js";
 
 /** Options for constructing an `AuthManager`. */
 export interface AuthManagerOptions {
@@ -32,6 +33,16 @@ export class AuthManager {
   private cachedApiKeyCred: Credential | null = null;
   private oauthCred: Credential | null = null;
   private listAllCredentials?: () => Promise<Credential[]>;
+  // vceshi0.0.8+: serializes credential mutations (setOAuthCredential /
+  // switchToNextCredential) so concurrent callers can't race on `oauthCred`.
+  // Without this, two concurrent switchToNextCredential calls would both
+  // read the same snapshot, both pick the same candidate, and both write
+  // `oauthCred = next` — wasting the switch.
+  private credMutex = createMutex();
+  // In-flight switch promise — concurrent callers awaiting switchToNextCredential
+  // share the same promise so the underlying listAllCredentials + reassign
+  // only runs once per concurrent burst.
+  private inflightSwitch: Promise<Credential | null> | null = null;
 
   constructor(opts: AuthManagerOptions) {
     this.mode = opts.mode;
@@ -62,6 +73,11 @@ export class AuthManager {
 
   /** Set the OAuth credential (used by T9/T10 OAuth flow). */
   setOAuthCredential(cred: Credential): void {
+    // Synchronous setter — no I/O, no race. Wrap in credMutex is unnecessary
+    // because JS is single-threaded and this method is sync; the only race
+    // concern is with async switchToNextCredential, which itself acquires
+    // credMutex before mutating `oauthCred`. A sync setter between two awaits
+    // of credMutex.run(...) is safe — the assignment happens atomically.
     this.oauthCred = cred;
   }
 
@@ -90,9 +106,33 @@ export class AuthManager {
    */
   async switchToNextCredential(excludeApiKeys?: Set<string>): Promise<Credential | null> {
     if (!this.listAllCredentials) return null;
+    // vceshi0.0.8+: in-flight deduplication. Two concurrent retry loops
+    // hitting switchToNextCredential at nearly the same time would both call
+    // listAllCredentials(), both see the same snapshot, both pick the same
+    // candidate, and both assign `oauthCred = next` — the second assignment
+    // is wasted, and worse, the `excludeApiKeys` set passed by caller A is
+    // not visible to caller B so B may pick a credential A already tried.
+    //
+    // Dedup by sharing a single in-flight promise: the first caller runs the
+    // real switch, subsequent concurrent callers await the same promise.
+    // After the promise settles, the dedup slot is cleared so the NEXT
+    // sequential switch attempt (after another retry failure) gets a fresh
+    // pass with the updated `oauthCred` excluded.
+    if (this.inflightSwitch) return this.inflightSwitch;
+    this.inflightSwitch = (async () => {
+      try {
+        return await this.credMutex.run(() => this._doSwitch(excludeApiKeys));
+      } finally {
+        this.inflightSwitch = null;
+      }
+    })();
+    return this.inflightSwitch;
+  }
+
+  private async _doSwitch(excludeApiKeys?: Set<string>): Promise<Credential | null> {
     let all: Credential[];
     try {
-      all = await this.listAllCredentials();
+      all = await this.listAllCredentials!();
     } catch {
       return null;
     }

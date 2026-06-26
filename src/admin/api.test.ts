@@ -33,7 +33,12 @@ import type { Credential } from "../auth/types.js";
 function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
   return {
     server: { port: 8080, host: "127.0.0.1" },
-    auth: { mode: "apikey", apiKey: "testkey.testsecret", ...overrides.auth },
+    // vceshi0.0.8+: proxyApiKey is now REQUIRED for admin API access (was
+    // previously optional with a bypassable check). The default fixture
+    // includes proxyApiKey="proxy-secret" so authedReq()'s Bearer token
+    // matches. Tests that specifically want the no-auth scenario override
+    // `auth` to omit proxyApiKey.
+    auth: { mode: "apikey", apiKey: "testkey.testsecret", proxyApiKey: "proxy-secret", ...overrides.auth },
     provider: "zai",
     plan: "coding-plan",
     providers: {
@@ -76,12 +81,12 @@ async function callAdmin(req: Request, opts: AdminOptions): Promise<Response | n
 // Test isolation: reset module-level state between tests
 // ---------------------------------------------------------------------------
 
-beforeEach(() => {
+beforeEach(async () => {
   _resetStatsForTesting();
   clearDebugDumps();
 });
 
-afterEach(() => {
+afterEach(async () => {
   _resetStatsForTesting();
   clearDebugDumps();
 });
@@ -484,7 +489,7 @@ describe("POST /admin/api/accounts/active — does not freeze server via appendL
         expect(body.ok).toBe(true);
       }
     } finally {
-      clearCredential();
+      await clearCredential();
       delete process.env.ZCODE_PROXY_STORE_DIR;
       _resetKeyCacheForTesting();
       try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
@@ -649,10 +654,10 @@ describe("/admin/api/verify — security warning", () => {
 
 describe("/admin/api/config PUT — validation", () => {
   let tmpDir: string;
-  beforeEach(() => {
+  beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "zcode-proxy-test-"));
   });
-  afterEach(() => {
+  afterEach(async () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -799,10 +804,10 @@ describe("/admin/api/config PUT — validation", () => {
 
 describe("/admin/api/config PUT — requiresRestart detection", () => {
   let tmpDir: string;
-  beforeEach(() => {
+  beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), "zcode-proxy-test-"));
   });
-  afterEach(() => {
+  afterEach(async () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -933,13 +938,13 @@ describe("/admin — dashboard page", () => {
 describe("/admin/api/accounts/render-export — multi-account export", () => {
   const TEST_SECRET = "test-encryption-secret-for-render-export";
 
-  beforeEach(() => {
+  beforeEach(async () => {
     process.env.ZCODE_PROXY_CREDENTIAL_SECRET = TEST_SECRET;
-    clearCredential();
+    await clearCredential();
   });
 
-  afterEach(() => {
-    clearCredential();
+  afterEach(async () => {
+    await clearCredential();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
   });
 
@@ -1024,13 +1029,13 @@ describe("/admin/api/accounts/render-export — multi-account export", () => {
 describe("/admin/api/accounts/proxy — per-account proxy CRUD", () => {
   const TEST_SECRET = "test-encryption-secret-for-proxy-tests";
 
-  beforeEach(() => {
+  beforeEach(async () => {
     process.env.ZCODE_PROXY_CREDENTIAL_SECRET = TEST_SECRET;
-    clearCredential();
+    await clearCredential();
   });
 
-  afterEach(() => {
-    clearCredential();
+  afterEach(async () => {
+    await clearCredential();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
   });
 
@@ -1401,13 +1406,13 @@ describe("/admin/api/accounts/proxy-test — proxy connectivity check", () => {
 
 // /admin/api/accounts/edit + /admin/api/accounts/export-single (vceshi0.0.4+)
 describe("/admin/api/accounts/edit — name/email editing", () => {
-  beforeEach(() => {
-    clearCredential();
+  beforeEach(async () => {
+    await clearCredential();
     _resetKeyCacheForTesting();
     process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "test-secret-for-edit";
   });
-  afterEach(() => {
-    clearCredential();
+  afterEach(async () => {
+    await clearCredential();
     _resetKeyCacheForTesting();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
   });
@@ -1476,13 +1481,13 @@ describe("/admin/api/accounts/edit — name/email editing", () => {
 });
 
 describe("/admin/api/accounts/export-single — single account JSON export", () => {
-  beforeEach(() => {
-    clearCredential();
+  beforeEach(async () => {
+    await clearCredential();
     _resetKeyCacheForTesting();
     process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "test-secret-for-export";
   });
-  afterEach(() => {
-    clearCredential();
+  afterEach(async () => {
+    await clearCredential();
     _resetKeyCacheForTesting();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
   });
@@ -1539,13 +1544,13 @@ describe("/admin/api/accounts/export-single — single account JSON export", () 
 
 // vceshi0.0.5: PUT /config deep-merges nested objects (retry/identity/logging/providers)
 describe("PUT /admin/api/config — deep merge of nested objects (vceshi0.0.5+)", () => {
-  beforeEach(() => {
-    clearCredential();
+  beforeEach(async () => {
+    await clearCredential();
     _resetKeyCacheForTesting();
     process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "test-secret-config-merge";
   });
-  afterEach(() => {
-    clearCredential();
+  afterEach(async () => {
+    await clearCredential();
     _resetKeyCacheForTesting();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
   });
@@ -1591,13 +1596,13 @@ describe("PUT /admin/api/config — deep merge of nested objects (vceshi0.0.5+)"
 
 // vceshi0.0.5: POST /admin/api/credentials validates apiKey + provider
 describe("POST /admin/api/credentials — field validation (vceshi0.0.5+)", () => {
-  beforeEach(() => {
-    clearCredential();
+  beforeEach(async () => {
+    await clearCredential();
     _resetKeyCacheForTesting();
     process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "test-secret-cred-validation";
   });
-  afterEach(() => {
-    clearCredential();
+  afterEach(async () => {
+    await clearCredential();
     _resetKeyCacheForTesting();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
   });
@@ -1633,13 +1638,13 @@ describe("POST /admin/api/credentials — field validation (vceshi0.0.5+)", () =
 
 // vceshi0.0.5: validateConfigForSave rejects bad emptyStreamSwitchThreshold + backoffFactor
 describe("PUT /admin/api/config — retry field validation (vceshi0.0.5+)", () => {
-  beforeEach(() => {
-    clearCredential();
+  beforeEach(async () => {
+    await clearCredential();
     _resetKeyCacheForTesting();
     process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "test-secret-retry-validation";
   });
-  afterEach(() => {
-    clearCredential();
+  afterEach(async () => {
+    await clearCredential();
     _resetKeyCacheForTesting();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
   });
@@ -1675,13 +1680,13 @@ describe("PUT /admin/api/config — retry field validation (vceshi0.0.5+)", () =
 
 // vceshi0.0.6+: disabled toggle endpoint
 describe("/admin/api/accounts/disabled — toggle disabled state (vceshi0.0.6+)", () => {
-  beforeEach(() => {
-    clearCredential();
+  beforeEach(async () => {
+    await clearCredential();
     _resetKeyCacheForTesting();
     process.env.ZCODE_PROXY_CREDENTIAL_SECRET = "test-secret-disabled";
   });
-  afterEach(() => {
-    clearCredential();
+  afterEach(async () => {
+    await clearCredential();
     _resetKeyCacheForTesting();
     delete process.env.ZCODE_PROXY_CREDENTIAL_SECRET;
   });
