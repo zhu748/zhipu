@@ -878,7 +878,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     expect(parsed.system[2].text).toBe("Custom client instructions");
   });
 
-  it("rewrites 'You are Claude Code' → 'You are ZCode model working in Claude Code'", () => {
+  it("rewrites 'You are Claude Code' → 'You are ZCode, an interactive coding agent'", () => {
     const body = JSON.stringify({
       model: "glm-5.2",
       messages: [{ role: "user", content: "hi" }],
@@ -893,9 +893,28 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     const parsed = JSON.parse(out as string);
     // Find the rewritten block (it's in the client blocks, after the 2 ZCode blocks)
     const clientBlocks = parsed.system.slice(2);
-    const identityBlock = clientBlocks.find((b: any) => b.text.includes("You are ZCode model working in Claude Code"));
+    const identityBlock = clientBlocks.find((b: any) => b.text.includes("You are ZCode, an interactive coding agent"));
     expect(identityBlock).toBeDefined();
     expect(identityBlock.text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
+  });
+
+  it("rewrites 'You are Claude Code, Anthropic\\'s official CLI for Claude, running within the Claude Agent SDK.' (newer variant)", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      system: [
+        { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK." },
+        { type: "text", text: "Some harness instructions" },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const clientBlocks = parsed.system.slice(2);
+    const identityBlock = clientBlocks.find((b: any) => b.text.includes("You are ZCode, an interactive coding agent"));
+    expect(identityBlock).toBeDefined();
+    expect(identityBlock.text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude");
   });
 
   it("also rewrites identity in messages[].role: 'system' content", () => {
@@ -916,7 +935,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     const text = Array.isArray(sysMsg.content)
       ? sysMsg.content.map((b: any) => b.text || "").join("")
       : String(sysMsg.content);
-    expect(text).toContain("You are ZCode model working in Claude Code");
+    expect(text).toContain("You are ZCode, an interactive coding agent");
     expect(text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
   });
 
@@ -972,6 +991,44 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     const p2 = JSON.parse(out2 as string);
     expect(p2.system.length).toBe(p1.system.length);
     expect(p2.system[0].text).toBe(p1.system[0].text);
+  });
+
+  it("strips x-anthropic-billing-header system block", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      system: [
+        { type: "text", text: "x-anthropic-billing-header: cc_version=2.1.195; cc_entrypoint=claude-vscode;" },
+        { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK." },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const billingBlock = parsed.system.find((b: any) => b.text.includes("x-anthropic-billing-header"));
+    expect(billingBlock).toBeUndefined();
+  });
+
+  it("replaces 'Claude Code' references in system text with 'ZCode'", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [{ role: "user", content: "hi" }],
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+      system: [
+        { type: "text", text: "Claude Code is available as a CLI. Fast mode for Claude Code uses Claude Opus." },
+      ],
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    // Client system blocks are after the 2 ZCode official blocks
+    const clientBlocks = parsed.system.slice(2);
+    const harnessBlock = clientBlocks.find((b: any) => b.text.includes("available as a CLI"));
+    expect(harnessBlock).toBeDefined();
+    expect(harnessBlock.text).not.toContain("Claude Code");
+    expect(harnessBlock.text).toContain("ZCode is available as a CLI");
+    expect(harnessBlock.text).toContain("Fast mode for ZCode uses Claude Opus");
   });
 });
 
@@ -1107,7 +1164,7 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     // 8. system starts with 2 ZCode blocks, then client's (rewritten) block
     expect(parsed.system.length).toBe(3);
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
-    expect(parsed.system[2].text).toContain("You are ZCode model working in Claude Code");
+    expect(parsed.system[2].text).toContain("You are ZCode, an interactive coding agent");
     expect(parsed.system[2].text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
   });
 });
@@ -1293,10 +1350,10 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     expect(tr2.type).toBe("tool_result");
     expect(typeof tr2.content).toBe("string");
 
-    // 3. is_error preserved on the failed tool_result
+    // 3. is_error:true preserved on the failed tool_result
     expect(tr2.is_error).toBe(true);
-    // Successful tool_result: is_error: false was sent by client → preserved too
-    expect(tr1.is_error).toBe(false);
+    // Successful tool_result: is_error:false stripped (real ZCode only sends is_error:true)
+    expect(tr1.is_error).toBeUndefined();
 
     // 4. Assistant message with only tool_use is NOT given a placeholder text block
     const asst1 = parsed.messages[1];
@@ -1315,7 +1372,7 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     // 7. system: 2 ZCode blocks + client block (with identity rewritten)
     expect(parsed.system.length).toBe(3);
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
-    expect(parsed.system[2].text).toContain("You are ZCode model working in Claude Code");
+    expect(parsed.system[2].text).toContain("You are ZCode, an interactive coding agent");
 
     // 8. thinking simplified + budget injected; max_tokens=64000; output_config injected
     expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 32000 });
@@ -1325,5 +1382,140 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     // 9. tool_choice + stream filled
     expect(parsed.tool_choice).toEqual({ type: "auto" });
     expect(parsed.stream).toBe(true);
+  });
+});
+
+describe("transformRequestBody — document block conversion + is_error:false stripping", () => {
+  it("converts document type blocks to text type", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Please check this log:" },
+            {
+              type: "document",
+              source: { type: "text", media_type: "text/plain", data: "[2026-06-25] log line 1\n[2026-06-25] log line 2" },
+            },
+          ],
+        },
+        { role: "assistant", content: [{ type: "text", text: "I see the log." }] },
+      ],
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const userContent = parsed.messages[0].content;
+    // document block should be converted to text
+    const docBlock = userContent.find((b: any) => b.type === "document");
+    expect(docBlock).toBeUndefined();
+    const convertedBlock = userContent.find((b: any) => b.type === "text" && b.text.includes("[2026-06-25]"));
+    expect(convertedBlock).toBeDefined();
+    expect(convertedBlock.text).toContain("log line 1");
+  });
+
+  it("converts document block with empty source.data to text:' '", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "document", source: { type: "text", media_type: "text/plain", data: "" } }],
+        },
+      ],
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const block = parsed.messages[0].content[0];
+    expect(block.type).toBe("text");
+    expect(block.text).toBe(" ");
+  });
+
+  it("converts document block with missing source to text:' '", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "document" }],
+        },
+      ],
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const block = parsed.messages[0].content[0];
+    expect(block.type).toBe("text");
+    expect(block.text).toBe(" ");
+  });
+
+  it("strips is_error:false from tool_result blocks but keeps is_error:true", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [
+        { role: "user", content: "do it" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "tu1", name: "Bash", input: { command: "ls" } }],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "tu1", content: "file1\nfile2", is_error: false }],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "tu2", name: "Bash", input: { command: "bad" } }],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "tu2", content: "command not found", is_error: true }],
+        },
+      ],
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    // is_error:false should be stripped from the success tool_result
+    const successBlock = parsed.messages
+      .flatMap((m: any) => m.content || [])
+      .find((b: any) => b.tool_use_id === "tu1");
+    expect(successBlock.is_error).toBeUndefined();
+    // is_error:true should be preserved on the error tool_result
+    const errorBlock = parsed.messages
+      .flatMap((m: any) => m.content || [])
+      .find((b: any) => b.tool_use_id === "tu2");
+    expect(errorBlock.is_error).toBe(true);
+  });
+
+  it("does not affect tool_result blocks without is_error field", () => {
+    const body = JSON.stringify({
+      model: "glm-5.2",
+      messages: [
+        { role: "user", content: "do it" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "tu1", name: "Read", input: { file_path: "/tmp/a" } }],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "tu1", content: "file contents" }],
+        },
+      ],
+      max_tokens: 1000,
+      thinking: { type: "enabled" },
+    });
+    const out = transformRequestBody(body, { format: "anthropic" });
+    const parsed = JSON.parse(out as string);
+    const tr = parsed.messages.find(
+      (m: any) => m.role === "user" && Array.isArray(m.content) && m.content.some((b: any) => b.type === "tool_result"),
+    );
+    expect(tr.content[0].content).toBe("file contents");
+    expect("is_error" in tr.content[0]).toBe(false);
   });
 });

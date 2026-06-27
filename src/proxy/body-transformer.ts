@@ -64,9 +64,9 @@
  * === TRANSFORM ORDER MATTERS ===
  *
  * The transforms run in a specific order (see `transformRequestBodyObj`):
- *   thinking fields → system relocation → thinking block strip →
- *   assistant text ensure → content normalize → tool_result normalize →
- *   sanitize (cc + is_error) → cache_control add
+ *   thinking fields → thinking block strip → document block convert →
+ *   content normalize → sanitize (is_error:false) → cache_control add →
+ *   align ZCode format (system inject + identity rewrite + key reorder)
  *
  * Reordering will break things. For example, `sanitizeContentBlocks` MUST
  * run AFTER `applyAnthropicCacheControl` would have run (it's the safety
@@ -167,6 +167,10 @@ export function transformRequestBodyObj(parsed: unknown, ctx: TransformContext):
     // keeps them in messages[] (e.g. "The Bash tool shell was changed...").
     // The align function (called last) handles system injection.
     modified = stripThinkingBlocksFromMessages(obj) || modified;
+    // Convert `document` type content blocks to `text` type — ZCode gateway
+    // does not accept `document` blocks (Claude Code sends them for file
+    // attachments). Must run before normalizeAllMessageContent.
+    modified = convertDocumentBlocks(obj) || modified;
     // v0.1.9+: normalizeAllMessageContent still runs (converts string content
     // to array form). Real ZCode uses array form for user/assistant messages.
     modified = normalizeAllMessageContent(obj) || modified;
@@ -463,9 +467,23 @@ const ZCODE_OFFICIAL_SYSTEM_BLOCKS: ReadonlyArray<{ type: "text"; text: string; 
   (ZCODE_SYSTEM_BLOCKS as SystemBlock[]).map(b => Object.freeze({ ...b })),
 );
 
-/** Claude Code's default identity string — we rewrite it to ZCode identity. */
-const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
-const ZCODE_IDENTITY_REPLACEMENT = "You are ZCode model working in Claude Code.";
+/**
+ * Claude Code's identity pattern — matches both known variants and rewrites
+ * to ZCode identity. Covers:
+ *   - "You are Claude Code, Anthropic's official CLI for Claude."
+ *   - "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
+ */
+const CLAUDE_CODE_IDENTITY_RE = /You are Claude Code, Anthropic's official CLI for Claude(?:, running within the Claude Agent SDK)?\./;
+const ZCODE_IDENTITY_REPLACEMENT = "You are ZCode, an interactive coding agent.";
+
+/**
+ * Additional Claude Code references in system text that need rewriting.
+ * These are NOT identity strings — they're references within the harness
+ * instructions (e.g. "Claude Code is available as a CLI"). Replace with
+ * ZCode-equivalent phrasing that doesn't leak the non-ZCode client identity.
+ */
+const CLAUDE_CODE_REF_RE = /Claude Code/g;
+const CLAUDE_CODE_REF_REPLACEMENT = "ZCode";
 
 function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, unknown> | null {
   let changed = false;
@@ -502,23 +520,33 @@ function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, 
       if ((msg as Record<string, unknown>).role !== "system") continue;
       const content = (msg as Record<string, unknown>).content;
       if (typeof content === "string") {
-        if (content.includes(CLAUDE_CODE_IDENTITY)) {
-          (msg as Record<string, unknown>).content = content.replace(
-            CLAUDE_CODE_IDENTITY,
-            ZCODE_IDENTITY_REPLACEMENT,
-          );
+        let rewritten = content;
+        if (CLAUDE_CODE_IDENTITY_RE.test(rewritten)) {
+          rewritten = rewritten.replace(CLAUDE_CODE_IDENTITY_RE, ZCODE_IDENTITY_REPLACEMENT);
+        }
+        if (CLAUDE_CODE_REF_RE.test(rewritten)) {
+          rewritten = rewritten.replace(CLAUDE_CODE_REF_RE, CLAUDE_CODE_REF_REPLACEMENT);
+        }
+        if (rewritten !== content) {
+          (msg as Record<string, unknown>).content = rewritten;
           changed = true;
         }
       } else if (Array.isArray(content)) {
         for (const block of content) {
           if (!isPlainObject(block)) continue;
           const text = (block as Record<string, unknown>).text;
-          if (typeof text === "string" && text.includes(CLAUDE_CODE_IDENTITY)) {
-            (block as Record<string, unknown>).text = text.replace(
-              CLAUDE_CODE_IDENTITY,
-              ZCODE_IDENTITY_REPLACEMENT,
-            );
-            changed = true;
+          if (typeof text === "string") {
+            let rewritten = text;
+            if (CLAUDE_CODE_IDENTITY_RE.test(rewritten)) {
+              rewritten = rewritten.replace(CLAUDE_CODE_IDENTITY_RE, ZCODE_IDENTITY_REPLACEMENT);
+            }
+            if (CLAUDE_CODE_REF_RE.test(rewritten)) {
+              rewritten = rewritten.replace(CLAUDE_CODE_REF_RE, CLAUDE_CODE_REF_REPLACEMENT);
+            }
+            if (rewritten !== text) {
+              (block as Record<string, unknown>).text = rewritten;
+              changed = true;
+            }
           }
         }
       }
@@ -604,14 +632,32 @@ function normalizeSystemToArray(system: unknown): SystemBlock[] {
   return [];
 }
 
-/** Rewrite "You are Claude Code..." → "You are ZCode model working in Claude Code." */
+/**
+ * Rewrite Claude Code identity + references in system blocks → ZCode equivalents.
+ * 1. Replace the identity string ("You are Claude Code, Anthropic's official CLI for Claude...")
+ * 2. Replace remaining "Claude Code" references in harness instructions
+ * 3. Strip x-anthropic-billing-header blocks (ZCode never sends these)
+ */
 function rewriteClaudeCodeIdentity(blocks: SystemBlock[]): SystemBlock[] {
-  return blocks.map(b => {
-    if (b.text.includes(CLAUDE_CODE_IDENTITY)) {
-      return { ...b, text: b.text.replace(CLAUDE_CODE_IDENTITY, ZCODE_IDENTITY_REPLACEMENT) };
-    }
-    return b;
-  });
+  return blocks
+    .filter(b => {
+      // Strip x-anthropic-billing-header blocks — they are a Claude Code fingerprint
+      // that real ZCode never sends.
+      if (b.text.startsWith("x-anthropic-billing-header:")) return false;
+      return true;
+    })
+    .map(b => {
+      let text = b.text;
+      // Step 1: Replace identity string
+      if (CLAUDE_CODE_IDENTITY_RE.test(text)) {
+        text = text.replace(CLAUDE_CODE_IDENTITY_RE, ZCODE_IDENTITY_REPLACEMENT);
+      }
+      // Step 2: Replace remaining "Claude Code" references
+      if (CLAUDE_CODE_REF_RE.test(text)) {
+        text = text.replace(CLAUDE_CODE_REF_RE, CLAUDE_CODE_REF_REPLACEMENT);
+      }
+      return text === b.text ? b : { ...b, text };
+    });
 }
 
 /**
@@ -721,6 +767,45 @@ function stripThinkingBlocksFromMessages(body: Record<string, unknown>): boolean
 }
 
 /**
+ * Convert `document` type content blocks to `text` type blocks.
+ *
+ * Claude Code sends `document` blocks (e.g. attached log files) with the
+ * structure: `{ type: "document", source: { type: "text", media_type, data } }`.
+ * The ZCode gateway does not accept `document` as a content block type — it
+ * returns 3001 "parameter error". We convert them to `text` blocks, preserving
+ * the document data as plain text.
+ *
+ * No-op if no `document` blocks are found.
+ */
+function convertDocumentBlocks(body: Record<string, unknown>): boolean {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return false;
+
+  let changed = false;
+  for (const msg of messages) {
+    if (!isPlainObject(msg)) continue;
+    const content = msg.content;
+    if (!Array.isArray(content)) continue;
+
+    for (let i = 0; i < content.length; i++) {
+      const block = content[i];
+      if (!isPlainObject(block)) continue;
+      if ((block as Record<string, unknown>).type !== "document") continue;
+
+      // Extract text from the document block's source.data field
+      const source = (block as Record<string, unknown>).source;
+      let text = "";
+      if (isPlainObject(source) && typeof (source as Record<string, unknown>).data === "string") {
+        text = (source as Record<string, unknown>).data as string;
+      }
+      content[i] = { type: "text", text: text || " " };
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
  * Sanitize content blocks in `messages[].content` to remove fields that GLM
  * upstream / ZCode gateway reject with 3001 "parameter error".
  *
@@ -735,12 +820,11 @@ function stripThinkingBlocksFromMessages(body: Record<string, unknown>): boolean
  *      tool_use, image, etc.). Direct GLM API accepts cache_control on text
  *      blocks, so we keep it for prompt caching.
  *
- * 2. `is_error` (tool_result blocks only):
- *    - Stripped in BOTH modes. Anthropic's official API accepts `is_error` on
- *      tool_result blocks, but the ZCode gateway does not — it returns 3001.
- *      This field is informational (Claude Code sets it to `false` on success)
- *      and the upstream infers success/failure from the content, so removing
- *      it is safe.
+ * 2. `is_error:false` (tool_result blocks only):
+ *    - Stripped when `is_error === false`. Real ZCode client only sends
+ *      `is_error:true` (for actual errors). Claude Code adds `is_error:false`
+ *      on success (62 in sample). The gateway may reject `is_error:false`.
+ *      We keep `is_error:true` — real ZCode preserves it.
  *
  * Root cause history:
  *   - v2.1.3.3beta0: stripped thinking blocks (round-2 3001)
@@ -748,6 +832,8 @@ function stripThinkingBlocksFromMessages(body: Record<string, unknown>): boolean
  *   - v2.1.3.6beta0: stripped cache_control from tool_use (round-3 3001 variant)
  *   - v2.1.3.9beta0: strip cache_control from text too in start-plan;
  *                    strip is_error from tool_result in both modes
+ *   - v0.1.9: keep is_error (real ZCode has is_error:true in sample)
+ *   - v0.1.10: strip is_error:false only; keep is_error:true
  */
 function sanitizeContentBlocks(
   body: Record<string, unknown>,
@@ -772,9 +858,16 @@ function sanitizeContentBlocks(
       // (Pre-v0.1.9 behavior was: start-plan strips ALL cc, coding-plan
       // strips non-text cc. Both are obsolete now.)
 
-      // v0.1.9+: KEEP is_error — real ZCode client preserves it (sample:
-      // messages[6].content[0] has is_error=true on a timeout result).
-      // (Pre-v0.1.9 behavior was: strip is_error in both modes. Obsolete now.)
+      // Strip is_error:false from tool_result blocks. Real ZCode client only
+      // sends is_error:true (for actual errors). Claude Code adds is_error:false
+      // on success (62 in sample). The gateway may reject is_error:false.
+      // Keep is_error:true — real ZCode preserves it.
+      if ((block as Record<string, unknown>).type === "tool_result"
+          && "is_error" in (block as Record<string, unknown>)
+          && (block as Record<string, unknown>).is_error === false) {
+        delete (block as Record<string, unknown>).is_error;
+        changed = true;
+      }
     }
   }
   return changed;
