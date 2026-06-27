@@ -71,7 +71,7 @@ const stats = {
   success: 0,
   failed: 0,
   retried: 0,
-  requests: [] as Array<{ id: string; time: string; model: string; status: number; ttfb: string; tokens: string; inputTokens: string; captchaMs?: string; retried?: boolean }>,
+  requests: [] as Array<{ id: string; time: string; model: string; status: number; ttfb: string; tokens: string; inputTokens: string; cacheReadTokens?: string; captchaMs?: string; retried?: boolean }>,
   models: {} as Record<string, { count: number; avgTtfb: number; tokens: number; inputTokens: number }>,
   // vceshi0.0.6+: per-credential usage stats (in-memory, reset on restart).
   // Keyed by maskApiKey(apiKey) to avoid leaking plaintext keys in stats.
@@ -99,7 +99,7 @@ const seenIds = new Set<string>();
  * - inputTokens: from upstream usage.input_tokens / prompt_tokens
  * - credentialKey: maskApiKey(cred.apiKey) for per-credential usage tracking
  */
-export function recordStat(entry: { id: string; time: string; model: string; status: number; ttfb: string; tokens: string; inputTokens?: string; credentialKey?: string; retried?: boolean; captchaMs?: string }) {
+export function recordStat(entry: { id: string; time: string; model: string; status: number; ttfb: string; tokens: string; inputTokens?: string; cacheReadTokens?: string; credentialKey?: string; retried?: boolean; captchaMs?: string }) {
   const existingIdx = requestIndex.get(entry.id);
   if (existingIdx !== undefined) {
     // Update the existing entry — do NOT increment counters again.
@@ -149,6 +149,7 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
       ...old,
       ...entry,
       inputTokens: entry.inputTokens ?? old.inputTokens ?? "0",
+      cacheReadTokens: entry.cacheReadTokens ?? old.cacheReadTokens,
       captchaMs: entry.captchaMs ?? old.captchaMs ?? "0",
       retried: entry.retried || old.retried,
     };
@@ -183,7 +184,7 @@ export function recordStat(entry: { id: string; time: string; model: string; sta
   if (entry.retried) stats.retried++;
   // G5: Track by status code
   stats.byStatus[entry.status] = (stats.byStatus[entry.status] ?? 0) + 1;
-  const fullEntry = { ...entry, inputTokens: entry.inputTokens ?? "0", captchaMs: entry.captchaMs ?? "0" };
+  const fullEntry = { ...entry, inputTokens: entry.inputTokens ?? "0", captchaMs: entry.captchaMs ?? "0", cacheReadTokens: entry.cacheReadTokens };
   stats.requests.push(fullEntry);
   requestIndex.set(entry.id, idx);
   // vceshi0.0.7+: track lifetime-seen ids to handle post-trim retries.

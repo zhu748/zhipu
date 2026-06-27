@@ -203,4 +203,81 @@ describe("anthropicSseToBatchMessage", () => {
       input: { a: 1 },
     });
   });
+
+  it("v0.2.0.6: preserves cache_read_input_tokens / cache_creation_input_tokens in usage", async () => {
+    // Real GLM upstream returns these fields in message_delta.usage when
+    // prompt caching is active. The reassembler MUST preserve them so the
+    // batch JSON response carries the same usage info as the SSE stream.
+    const sse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_c1","model":"glm-5.2","usage":{"input_tokens":0,"output_tokens":0}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1152,"output_tokens":4413,"cache_read_input_tokens":40000,"cache_creation_input_tokens":0}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+    const result = await anthropicSseToBatchMessage(makeStream([sse]), "fallback");
+    if ("error" in result) throw new Error("unexpected error");
+    expect(result.message.usage.input_tokens).toBe(1152);
+    expect(result.message.usage.output_tokens).toBe(4413);
+    expect(result.message.usage.cache_read_input_tokens).toBe(40000);
+    expect(result.message.usage.cache_creation_input_tokens).toBe(0);
+    expect(result.inputTokens).toBe(1152);
+    expect(result.outputTokens).toBe(4413);
+  });
+
+  it("v0.2.0.6: handles streams without cache fields (no regression)", async () => {
+    // Old-style streams without cache fields should still work — the
+    // cache_read_input_tokens / cache_creation_input_tokens fields should
+    // simply be undefined on the resulting message.usage.
+    const sse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_c2","model":"glm-4.6","usage":{"input_tokens":10,"output_tokens":0}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+    const result = await anthropicSseToBatchMessage(makeStream([sse]), "fallback");
+    if ("error" in result) throw new Error("unexpected error");
+    expect(result.message.usage.input_tokens).toBe(10);
+    expect(result.message.usage.output_tokens).toBe(5);
+    expect(result.message.usage.cache_read_input_tokens).toBeUndefined();
+    expect(result.message.usage.cache_creation_input_tokens).toBeUndefined();
+  });
+
+  it("v0.2.0.6: cache fields in message_start are forwarded too (defensive)", async () => {
+    // Some upstreams put cache fields in message_start.usage as well.
+    // We forward them, but message_delta values overwrite (authoritative).
+    const sse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_c3","model":"glm-5.2","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":5000}}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":40000}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+    const result = await anthropicSseToBatchMessage(makeStream([sse]), "fallback");
+    if ("error" in result) throw new Error("unexpected error");
+    // message_delta's value (40000) wins over message_start's (5000)
+    expect(result.message.usage.cache_read_input_tokens).toBe(40000);
+    expect(result.message.usage.input_tokens).toBe(100);
+    expect(result.message.usage.output_tokens).toBe(50);
+  });
+
+  it("v0.2.0.7: spec-compliant stream — input_tokens ONLY in message_start (not in message_delta)", async () => {
+    // Per Anthropic SSE protocol:
+    //   - message_start carries authoritative input_tokens at message.usage
+    //   - message_delta carries output_tokens only (NO input_tokens)
+    // This test verifies the reassembler correctly reads input_tokens from
+    // message_start.message.usage, NOT from top-level usage.
+    // @see handler.ts observeStream.parseSse — same fix applies there.
+    const sse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_spec","model":"glm-5.2","usage":{"input_tokens":84213,"output_tokens":0,"cache_read_input_tokens":40000}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"response"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4413}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+    const result = await anthropicSseToBatchMessage(makeStream([sse]), "fallback");
+    if ("error" in result) throw new Error("unexpected error");
+    // input_tokens came from message_start.message.usage (84213), NOT message_delta
+    expect(result.message.usage.input_tokens).toBe(84213);
+    expect(result.message.usage.output_tokens).toBe(4413); // from message_delta
+    expect(result.message.usage.cache_read_input_tokens).toBe(40000); // from message_start
+    expect(result.inputTokens).toBe(84213);
+    expect(result.outputTokens).toBe(4413);
+  });
 });

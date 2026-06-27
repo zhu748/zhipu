@@ -1083,6 +1083,7 @@ export async function proxyRequest(
   let passthroughOutputTokens = 0;
   let passthroughBody: ReadableStream<Uint8Array> | string | null = null;
   const ct = upstreamResp.headers.get("content-type") ?? "";
+  let passthroughCacheReadTokens = 0;
   if (ct.includes("application/json") && upstreamResp.body) {
     try {
       const raw = await upstreamResp.text();
@@ -1091,10 +1092,12 @@ export async function proxyRequest(
       if (usage) {
         passthroughInputTokens = usage.input_tokens ?? usage.prompt_tokens ?? 0;
         passthroughOutputTokens = usage.output_tokens ?? usage.completion_tokens ?? 0;
+        // v0.2.0.6: extract cache_read_input_tokens for accurate input total
+        passthroughCacheReadTokens = usage.cache_read_input_tokens ?? 0;
       }
     } catch { /* non-JSON or parse error — leave as 0, fall back to original body */ }
   }
-  printRow(reqId, format, meta, upstreamResp.status, started, headersAt, passthroughOutputTokens, 0, 0, false, passthroughInputTokens, maskApiKey(cred.apiKey), totalCaptchaMs);
+  printRow(reqId, format, meta, upstreamResp.status, started, headersAt, passthroughOutputTokens, 0, 0, false, passthroughInputTokens, maskApiKey(cred.apiKey), totalCaptchaMs, passthroughCacheReadTokens);
   // Reconstruct the response with the read body so passthrough still has content
   if (passthroughBody !== null) {
     return new Response(passthroughBody, {
@@ -1428,6 +1431,8 @@ async function translatedBatchResponse(
   // vceshi0.0.6+: capture input tokens from translated OpenAI response usage
   const inTok = openaiResp.usage?.prompt_tokens ?? 0;
   const outTok = openaiResp.usage?.completion_tokens ?? 0;
+  // v0.2.0.6: capture cache-read tokens from upstream Anthropic usage
+  const cacheReadTok = parsedAnthropic.usage?.cache_read_input_tokens ?? 0;
 
   const respHeaders = new Headers();
   respHeaders.set("content-type", "application/json");
@@ -1438,7 +1443,7 @@ async function translatedBatchResponse(
 
   if (clientAcceptsGzip(clientReq)) {
     respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs);
+    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs, cacheReadTok);
     // Note: Bun.gzipSync blocks the event loop briefly (~5-20ms for 200KB).
     // Bun's typing only exposes gzipSync (not an async Bun.gzip), and the
     // alternative (Bun.deflateSync with GZIP format) is also sync. In
@@ -1450,7 +1455,7 @@ async function translatedBatchResponse(
       headers: respHeaders,
     });
   }
-  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs);
+  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs, cacheReadTok);
   return new Response(payload, {
     status: upstream.status,
     headers: respHeaders,
@@ -1510,6 +1515,8 @@ async function translatedResponsesBatchResponse(
   // vceshi0.0.6+: capture input/output tokens from translated Responses API usage
   const inTok = responsesResp.usage?.input_tokens ?? 0;
   const outTok = responsesResp.usage?.output_tokens ?? 0;
+  // v0.2.0.6: capture cache-read tokens from upstream Anthropic usage
+  const cacheReadTok = parsedAnthropic.usage?.cache_read_input_tokens ?? 0;
 
   const respHeaders = new Headers();
   respHeaders.set("content-type", "application/json");
@@ -1520,13 +1527,13 @@ async function translatedResponsesBatchResponse(
 
   if (clientAcceptsGzip(clientReq)) {
     respHeaders.set("content-encoding", "gzip");
-    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs);
+    printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs, cacheReadTok);
     return new Response(Bun.gzipSync(payload), {
       status: upstream.status,
       headers: respHeaders,
     });
   }
-  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs);
+  printRow(reqId, format, meta, upstream.status, started, headersAt, outTok, 0, 0, false, inTok, credKey, captchaMs, cacheReadTok);
   return new Response(payload, {
     status: upstream.status,
     headers: respHeaders,
@@ -1667,6 +1674,7 @@ function printRow(
   inputTokens: number = 0,
   credKey?: string,
   captchaMs: number = 0,
+  cacheReadTokens: number = 0,
 ): void {
   printHeader();
   const ts = new Date(started).toISOString().slice(11, 19);
@@ -1677,17 +1685,24 @@ function printRow(
   const captcha = captchaMs > 0 ? `${captchaMs}ms` : "-";
   const total = streamEndAt > started ? `${streamEndAt - started}ms` : "-";
   const tok = tokens > 0 ? String(tokens) : "-";
-  const inTok = inputTokens > 0 ? String(inputTokens) : "-";
+  // v0.2.0.6: input token display reflects the TOTAL input the model saw
+  // (new input + cache_read + cache_creation). When cache is in play, also
+  // show the cache-hit portion inline so users can see prompt caching is
+  // working: "in: 41152 (c:40000) out: 4413".
+  const totalInput = inputTokens + cacheReadTokens;
+  const inTok = totalInput > 0 ? String(totalInput) : "-";
+  const cacheMarker = cacheReadTokens > 0 ? `(c:${cacheReadTokens})` : "";
+  const inField = `${inTok.padStart(5)}${cacheMarker}`.trim();
   const tps = avgTps > 0 ? avgTps.toFixed(1) : "-";
   // When captcha took a significant portion of TTFB, show the breakdown
   if (captchaMs > 0 && ttfbMs > 0) {
     const netTtfb = ttfbMs - captchaMs;
     console.log(
-      `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inTok.padStart(5)} out:${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |  TTFB=${ttfbMs}ms (net ${netTtfb}ms + captcha ${captchaMs}ms)`,
+      `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inField} out:${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |  TTFB=${ttfbMs}ms (net ${netTtfb}ms + captcha ${captchaMs}ms)`,
     );
   } else {
     console.log(
-      `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inTok.padStart(5)} out:${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |`,
+      `| ${reqId.padEnd(4)} | ${ts.padEnd(10)} | ${tag} | ${meta.model.padEnd(11)} | ${mode.padEnd(6)} | ${String(status).padStart(4)} | ${ttfb.padStart(7)} | ${captcha.padStart(7)} | in:${inField} out:${tok.padStart(5)} | ${tps.padStart(6)} | ${total.padStart(7)} |`,
     );
   }
   // Record stats for the admin dashboard
@@ -1698,7 +1713,8 @@ function printRow(
     status,
     ttfb: String(ttfbMs),
     tokens: String(tokens),
-    inputTokens: String(inputTokens),
+    inputTokens: String(totalInput),
+    cacheReadTokens: cacheReadTokens > 0 ? String(cacheReadTokens) : undefined,
     credentialKey: credKey,
     retried,
     captchaMs: String(captchaMs),
@@ -1719,6 +1735,13 @@ function observeStream(
   const compressed = contentEncoding !== null;
   let tokens = 0;
   let inputTokens = 0;
+  // v0.2.0.6: cache-read / cache-creation tokens — GLM returns these as
+  // separate fields in message_delta.usage when prompt caching is in play.
+  // Without tracking them, the log shows the small `input_tokens` value
+  // (e.g. 1152) instead of the actual total the model saw (e.g. 41152 =
+  // 1152 new + 40000 cached). The dashboard prints `in: 41152 (c:40000)`
+  // so users can see cache is working.
+  let cacheReadTokens = 0;
   let sseBuffer = "";
   let firstChunkAt = 0;
 
@@ -1729,12 +1752,52 @@ function observeStream(
       if (!dataStr || dataStr === "[DONE]") continue;
       try {
         const j = JSON.parse(dataStr);
+        // v0.2.0.7: Read message_start.message.usage — per Anthropic SSE
+        // protocol, input_tokens lives at j.message.usage (NOT top-level
+        // j.usage). The message_start event carries the authoritative
+        // input_tokens count; message_delta only carries output_tokens per
+        // spec. Without this branch, Anthropic-spec-compliant upstreams would
+        // show inputTokens=0 forever (we'd miss the real value entirely).
+        //
+        // GLM (z.ai) currently sends input_tokens=0 here (non-standard — it
+        // puts the real value in message_delta instead). We use `> 0` guard
+        // so GLM's 0 placeholder doesn't overwrite any value we might capture
+        // later from message_delta. This makes the fix safe for GLM while
+        // correctly handling spec-compliant upstreams.
+        //
+        // @see src/proxy/sse-to-batch.ts handleEvent() — same pattern.
+        if (j.type === "message_start" && j.message?.usage) {
+          const u = j.message.usage;
+          if (typeof u.input_tokens === "number" && u.input_tokens > 0) {
+            inputTokens = u.input_tokens;
+          }
+          if (typeof u.cache_read_input_tokens === "number" && u.cache_read_input_tokens > 0) {
+            cacheReadTokens = u.cache_read_input_tokens;
+          }
+          // Don't read output_tokens from message_start — per Anthropic spec
+          // it's always 0 here; the real value comes in message_delta later.
+        }
         // Prefer authoritative usage fields over event counting
         if (j.usage?.completion_tokens) { tokens = j.usage.completion_tokens; }
         if (j.usage?.output_tokens) { tokens = j.usage.output_tokens; }
         // vceshi0.0.6+: capture input tokens from upstream usage
         if (j.usage?.prompt_tokens) { inputTokens = j.usage.prompt_tokens; }
         if (j.usage?.input_tokens) { inputTokens = j.usage.input_tokens; }
+        // v0.2.0.6: capture cache token fields (Anthropic prompt-caching extension)
+        // - cache_read_input_tokens: tokens served from cache (free or discounted)
+        // - cache_creation_input_tokens: tokens newly written to cache this turn
+        // Both fields together with input_tokens represent the TOTAL input
+        // context the model saw on this turn.
+        if (j.usage?.cache_read_input_tokens) { cacheReadTokens = j.usage.cache_read_input_tokens; }
+        if (j.usage?.cache_creation_input_tokens) {
+          // cache_creation counts as new input that's being added to cache;
+          // we treat it as part of input_tokens (it was already paid for as
+          // input this turn) — only show cache_read separately as the "free"
+          // portion. If the upstream puts cache_creation in a separate field
+          // AND also doesn't count it in input_tokens, we'd need to add it.
+          // Empirically GLM includes cache_creation in input_tokens, so we
+          // don't double-count here.
+        }
         // OpenAI Chat Completions content delta: choices[0].delta.content
         const oai = j.choices?.[0]?.delta?.content;
         if (typeof oai === "string" && oai.length > 0) { tokens++; continue; }
@@ -1754,12 +1817,14 @@ function observeStream(
         if (j.type === "response.completed" && j.response?.usage) {
           if (j.response.usage.output_tokens) tokens = j.response.usage.output_tokens;
           if (j.response.usage.input_tokens) inputTokens = j.response.usage.input_tokens;
+          if (j.response.usage.cache_read_input_tokens) cacheReadTokens = j.response.usage.cache_read_input_tokens;
           continue;
         }
         // Anthropic message_delta carries usage (final event with stop_reason)
         if (j.type === "message_delta" && j.usage) {
           if (j.usage.output_tokens) tokens = j.usage.output_tokens;
           if (j.usage.input_tokens) inputTokens = j.usage.input_tokens;
+          if (j.usage.cache_read_input_tokens) cacheReadTokens = j.usage.cache_read_input_tokens;
           continue;
         }
       } catch {}
@@ -1789,7 +1854,7 @@ function observeStream(
     const ttfbMs = (firstChunkAt > 0 ? firstChunkAt : endAt) - requestSentAt;
     const totalMs = endAt - requestSentAt;
     const avgTps = tokens > 0 && totalMs > 0 ? tokens / (totalMs / 1000) : 0;
-    printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, tokens, avgTps, endAt, false, inputTokens, credKey, captchaMs);
+    printRow(reqId, format, meta, status, requestSentAt, requestSentAt + ttfbMs, tokens, avgTps, endAt, false, inputTokens, credKey, captchaMs, cacheReadTokens);
   })().catch(() => {});
 }
 
@@ -1847,18 +1912,28 @@ async function logUpstreamResponseDebug(reqId: string, resp: Response, _isStream
     // Read the clone's body with a timeout so a hung stream doesn't block
     // the request forever. 3s is enough to get the first SSE event or the
     // full JSON body of an error response.
+    //
+    // v0.2.0.6: For SSE streams, the AUTHORITATIVE usage (including cache
+    // token counts) is in the `message_delta` event near the END of the
+    // stream — the previous 2KB cap + "stop at first \n\n" logic always
+    // captured only message_start (with 0/0 placeholder usage). We now
+    // keep reading until we see `message_delta` (which carries the real
+    // usage) or hit the 8KB / 3s limit. This lets users see real token
+    // counts in the debug log without enabling full request logging.
     const previewPromise = (async () => {
       if (!clone.body) return "(no body)";
       const reader = clone.body.getReader();
       const decoder = new TextDecoder();
       let preview = "";
       const deadline = Date.now() + 3000;
-      while (preview.length < 2048 && Date.now() < deadline) {
+      const PREVIEW_CAP = ct.includes("text/event-stream") ? 8192 : 2048;
+      while (preview.length < PREVIEW_CAP && Date.now() < deadline) {
         const { done, value } = await reader.read();
         if (done) break;
         preview += decoder.decode(value, { stream: true });
-        // For SSE: stop after first complete event (enough to diagnose)
-        if (ct.includes("text/event-stream") && preview.includes("\n\n") && preview.length > 50) break;
+        // For SSE: stop after we see message_delta (carries real usage)
+        // — this is the event we care about for token diagnostics.
+        if (ct.includes("text/event-stream") && preview.includes('"type":"message_delta"')) break;
         // For JSON: stop when we likely have the full body (small error responses)
         if (ct.includes("application/json") && preview.length > 0 && preview.trim().endsWith("}")) break;
       }
@@ -1876,8 +1951,12 @@ async function logUpstreamResponseDebug(reqId: string, resp: Response, _isStream
       preview = "(body read failed)";
     }
 
-    const trimmed = preview.length > 1000
-      ? preview.slice(0, 1000) + `...(truncated, total ${preview.length} chars)`
+    // v0.2.0.6: For SSE streams, allow up to 8KB of preview so the
+    // message_delta event (carrying usage / cache tokens) is visible.
+    // JSON responses stay at 1KB (small error bodies don't need more).
+    const trimCap = ct.includes("text/event-stream") ? 8000 : 1000;
+    const trimmed = preview.length > trimCap
+      ? preview.slice(0, trimCap) + `...(truncated, total ${preview.length} chars)`
       : preview;
     console.log(`${reqId} [debug] body preview (${preview.length} chars): ${trimmed || "(empty body)"}`);
   } catch (err) {

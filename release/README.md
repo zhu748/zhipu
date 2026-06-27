@@ -1,5 +1,79 @@
 # zcode-proxy 使用说明
 
+> **v0.2.0.6 — Token 计数修复：cache token 读取 + Anthropic SSE 协议合规**
+>
+> 本次发版聚焦于"日志里 token 计数显示偏小"的诊断与修复。v0.2.0.4 给 system 块和最后一块用户消息加了 `cache_control: ephemeral`（对齐 ZCode 客户端 wire shape）后，prompt cache 开始命中——但日志的 token 计数没跟上这个变化，导致用户看到 `in: 1152 out: 4413` 这种"看起来丢了几万 token"的怪现象。
+>
+> **本次改动**
+>
+> **1. 读取 cache_read_input_tokens（核心修复）**
+>
+> GLM 上游命中 prompt cache 时，`message_delta.usage` 被拆成 3 个字段：
+> ```json
+> "usage": {
+>   "input_tokens": 1152,              // 新增输入（小）
+>   "cache_read_input_tokens": 40000,  // 从缓存读取（大）
+>   "cache_creation_input_tokens": 0,  // 新写入缓存的
+>   "output_tokens": 4413
+> }
+> ```
+> 之前的 `observeStream` 只读 `input_tokens`，所以显示 1152 而不是真实总数 41152。
+>
+> v0.2.0.6 修复：在 `observeStream.parseSse` 提取 `cache_read_input_tokens`，日志新格式：
+> ```
+> | in: 41152 (c:40000) out: 4413 |   ← 显示总数 + (c:缓存命中数)
+> ```
+> 让你直观看到 prompt cache 在工作（40000 个 token 走了缓存路径，不重复计费/计费减半）。
+>
+> **2. 修复 parseSse 漏读 message_start 事件（协议合规性 bug）**
+>
+> Anthropic SSE 协议规定 `input_tokens` 只在流开头的 `message_start` 事件里出现一次，路径是 `j.message.usage.input_tokens`（嵌套在 message 字段里）。但 `parseSse` 之前只读顶层 `j.usage`，对 `message_start` 事件无效——这意味着标准 Anthropic 上游的 `input_tokens` 永远抓不到。
+>
+> 同项目的 `sse-to-batch.ts` 实现是正确的（读 `data.message.usage`），但 `parseSse` 是另一份手写实现，漏掉了这一条。
+>
+> v0.2.0.6 修复：在 `parseSse` 顶部添加 `message_start` 分支，读 `j.message.usage.input_tokens` / `cache_read_input_tokens`。用 `> 0` 守卫，避免 GLM 在 message_start 发 0 占位值覆盖 message_delta 后续提供的真实值。
+>
+> 修复后行为：
+> - 标准 Anthropic 上游（input_tokens 在 message_start）：正确捕获（修复前丢失）
+> - GLM（input_tokens=0 在 message_start，真实值在 message_delta）：行为不变
+>
+> **3. SSE→batch 重组器保留 cache 字段**
+>
+> 非流式客户端走 SSE→batch 缓冲路径时，重组器（`sse-to-batch.ts`）需要把 cache token 字段也保留到重组后的 `message.usage` 里，否则非流式客户端拿不到 cache 信息。
+>
+> v0.2.0.6 修复：`handleEvent` 接口扩展 `cache_read_input_tokens` / `cache_creation_input_tokens`，`message_start` 和 `message_delta` 事件转发这些字段，重组 `message.usage` 时保留它们。
+>
+> **4. debug 日志增强：SSE 预览扩到 8KB**
+>
+> 之前 debug 日志的 SSE 预览只有 2KB，在第一个 `\n\n` 就停了——永远只能看到 `message_start`（usage 是 0/0 占位）。真实的 usage 在流末尾的 `message_delta` 事件里，但 debug 日志读不到。
+>
+> v0.2.0.6 修复：
+> - SSE 预览上限：2KB → 8KB
+> - 停止条件：检测到 `message_delta` 事件（携带真实 usage）
+> - 这样开 debug 模式时能看到完整 usage JSON，包括 cache 字段
+>
+> **5. recordStat / stats 数组扩展 cacheReadTokens 字段**
+>
+> admin dashboard 的 stats 系统也跟上：`recordStat` 入参新增 `cacheReadTokens?:string`，`stats.requests` 数组类型扩展，reclassify 和 fullEntry 都传递该字段。dashboard 后续可以基于这个字段做更精细的"缓存命中率"统计。
+>
+> **6. 翻译路径同步修复**
+>
+> Codex（Responses API）和 OpenAI 格式的请求走翻译路径，它们的 batch 响应也需要正确提取 cache token：
+> - `translatedBatchResponse`（OpenAI 翻译）：从 `parsedAnthropic.usage.cache_read_input_tokens` 提取
+> - `translatedResponsesBatchResponse`（Responses 翻译）：同上
+> - batch passthrough path（Anthropic 直通）：从 `usage.cache_read_input_tokens` 提取
+>
+> **测试**：573/573 pass，TypeScript 零错误。新增 4 个测试用例：
+> - cache token 保留 / 无 cache 字段不回归 / message_start 与 message_delta 冲突时 message_delta 获胜 / spec-compliant 流验证
+>
+> **本质说明**
+>
+> "日志显示 token 少"不是对齐丢提示词——所有 Claude Code / Codex 原始内容完整透传。原因是 v0.2.0.4 给 system 块加 `cache_control: ephemeral` 后 prompt cache 大幅命中，cache 命中部分在 `cache_read_input_tokens` 字段里没被读到。这次修复让日志显示真实总数 + 缓存命中量，让你直观看到 cache 在工作。
+>
+> 关于 quota 额度消耗比预期少：这是**正常的**——start-plan 的 billing/balance API 返回的是 zcode 自己的"折算单位"，不是 raw token。prompt cache 命中部分在计费时大幅折扣（通常 10% 或 0%），所以 40000 cache token 实际可能只算 4000 个单位。这是 cache 在帮你省钱，不是 bug。
+>
+> ---
+
 > **v0.2.0.5 — 请求头对齐真实 ZCode 客户端（修正历史误判）**
 >
 > 本次发版修正了一个**与真实客户端相反**的请求头设计。v0.2.0.4 及之前基于一份错误的逆向笔记，把真实 ZCode 客户端**实际发送**的请求头当成了"WAF 指纹"而主动删除——这反而让请求看起来像"声称自己是 ZCode 却拿不出任何身份证据"，是最可疑的状态。

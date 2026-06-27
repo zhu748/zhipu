@@ -206,6 +206,15 @@ export interface AnthropicMessagesResponse {
   usage: {
     input_tokens: number;
     output_tokens: number;
+    /**
+     * v0.2.0.6: optional cache token fields. Anthropic prompt-caching
+     * extension returns these in `usage` when cache_control breakpoints
+     * are hit. They are optional — most non-cached responses don't have
+     * them. We extract them in handler.ts to show accurate input total
+     * in the dashboard row.
+     */
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
   };
 }
 

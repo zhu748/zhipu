@@ -117,6 +117,16 @@ export async function anthropicSseToBatchMessage(
             inputTokens = result.usage.input_tokens;
             (message.usage as any).input_tokens = result.usage.input_tokens;
           }
+          // v0.2.0.6: preserve cache_read_input_tokens / cache_creation_input_tokens
+          // in the rebuilt message.usage so the downstream batch path can extract
+          // them for the dashboard row. Without this, cache tokens are lost when
+          // we buffer SSE → batch JSON for non-stream clients.
+          if (typeof result.usage.cache_read_input_tokens === "number") {
+            (message.usage as any).cache_read_input_tokens = result.usage.cache_read_input_tokens;
+          }
+          if (typeof result.usage.cache_creation_input_tokens === "number") {
+            (message.usage as any).cache_creation_input_tokens = result.usage.cache_creation_input_tokens;
+          }
         }
         if (result.error) {
           return { error: result.error };
@@ -146,7 +156,9 @@ export async function anthropicSseToBatchMessage(
 }
 
 interface HandleEventResult {
-  usage?: { input_tokens?: number; output_tokens?: number };
+  // v0.2.0.6: cache_read_input_tokens / cache_creation_input_tokens added
+  // to preserve Anthropic prompt-caching usage info through SSE → batch.
+  usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
   error?: string;
 }
 
@@ -165,7 +177,17 @@ function handleEvent(
         if (typeof msg.id === "string") message.id = msg.id;
         if (typeof msg.model === "string") message.model = msg.model;
         if (msg.usage) {
-          return { usage: { input_tokens: msg.usage.input_tokens, output_tokens: msg.usage.output_tokens } };
+          // v0.2.0.6: forward cache token fields if present (message_start
+          // sometimes carries them; the authoritative values come from the
+          // later message_delta event, but we preserve these too).
+          return {
+            usage: {
+              input_tokens: msg.usage.input_tokens,
+              output_tokens: msg.usage.output_tokens,
+              cache_read_input_tokens: msg.usage.cache_read_input_tokens,
+              cache_creation_input_tokens: msg.usage.cache_creation_input_tokens,
+            },
+          };
         }
       }
       return {};
@@ -242,9 +264,19 @@ function handleEvent(
           message.stop_sequence = delta.stop_sequence;
         }
       }
-      // message_delta may carry final usage (output_tokens, input_tokens)
+      // message_delta may carry final usage (output_tokens, input_tokens,
+      // cache_read_input_tokens, cache_creation_input_tokens).
+      // This is the AUTHORITATIVE source for cache token counts —
+      // message_start carries placeholder 0/0 values.
       if (data.usage) {
-        return { usage: { input_tokens: data.usage.input_tokens, output_tokens: data.usage.output_tokens } };
+        return {
+          usage: {
+            input_tokens: data.usage.input_tokens,
+            output_tokens: data.usage.output_tokens,
+            cache_read_input_tokens: data.usage.cache_read_input_tokens,
+            cache_creation_input_tokens: data.usage.cache_creation_input_tokens,
+          },
+        };
       }
       return {};
     }

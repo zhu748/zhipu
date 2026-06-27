@@ -49,6 +49,11 @@ beforeAll(() => {
           // client's stream preference (wire-shape alignment with real ZCode
           // client). The mock returns the SAME text in both branches so batch
           // tests (which receive buffered SSE → JSON) see consistent content.
+          //
+          // v0.2.0.7+: mock follows Anthropic SSE spec — message_start carries
+          // authoritative input_tokens at message.usage (NOT top-level usage).
+          // message_delta only carries output_tokens. This verifies the proxy's
+          // parseSse correctly reads input_tokens from message_start.message.usage.
           const sse = [
             'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_int","model":"glm-4.6","usage":{"input_tokens":10,"output_tokens":0}}}\n\n',
             'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
