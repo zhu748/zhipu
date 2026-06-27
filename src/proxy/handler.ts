@@ -370,10 +370,12 @@ export async function proxyRequest(
       config.server.trustProxy,
     );
 
-  // Track the last anthropic-beta header actually sent upstream. Captured
-  // during the real fetch so diagnostics on 4xx don't need to build a second
-  // throwaway Request (which would generate fresh random UUIDs and log a
-  // header belonging to a different request than the one actually sent).
+  // Track the last anthropic-beta header actually sent upstream. Since v0.2.0.6
+  // we strip anthropic-beta ENTIRELY (the real ZCode client sends none — see
+  // upstream.ts STRIP_HEADERS), so this is always null on the wire. Kept for
+  // diagnostic completeness: the `anthropic-beta sent:` log line confirms the
+  // header is absent, and if a future change re-enables beta this capture
+  // already wires it to the real fetch (no throwaway Request needed).
   let lastSentBeta: string | null = null;
 
   // Fetch + SSE error detection in one shot. Used for both the initial fetch

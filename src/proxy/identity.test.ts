@@ -1,55 +1,64 @@
 /**
  * Tests for identity header builder.
  *
- * Updated 2026-06: real ZCode client uses Vercel AI SDK's anthropic provider,
- * sending ONLY `User-Agent: ai-sdk/anthropic/{version}`. The four "ZCode
- * desktop" headers (X-ZCode-App-Version / X-Title / X-ZCode-Agent /
- * HTTP-Referer) were removed — they were WAF fingerprint signals.
- *
- * @see _reverse/NOTEPAD.md "Real ZCode Request Headers (2026-06)"
+ * Verified against the ZCode Electron client's app.asar
+ * (buildZCodeSourceHeaders / withZCodeEndpointHeaders, 2026-06). The real
+ * client sends `ZCode/{appVersion}` as User-Agent plus the full X-ZCode-* /
+ * X-Title / HTTP-Referer identity set.
  */
 import { describe, it, expect } from "bun:test";
 import { buildIdentityHeaders } from "./identity.js";
 import type { ProxyIdentity } from "../config/types.js";
 
 const BASE: ProxyIdentity = {
-  appVersion: "1.2.3",
-  sourceTitle: "cli",
+  appVersion: "3.1.8",
+  sourceTitle: "Z Code@electron",
   refererOrigin: "https://zcode.z.ai",
 };
 
 describe("buildIdentityHeaders", () => {
-  it("emits User-Agent as ai-sdk/anthropic/{version} (matches real ZCode client)", () => {
+  it("emits User-Agent as ZCode/{appVersion} (matches real ZCode client)", () => {
     const h = buildIdentityHeaders(BASE);
-    // Real ZCode client UA, captured from reverse-engineered traffic.
-    expect(h["User-Agent"]).toBe("ai-sdk/anthropic/3.0.81");
+    // Real ZCode client UA, captured from app.asar buildZCodeSourceHeaders().
+    expect(h["User-Agent"]).toBe("ZCode/3.1.8");
   });
 
-  it("does NOT emit X-ZCode-App-Version (real ZCode client doesn't send it)", () => {
-    const h = buildIdentityHeaders({ ...BASE, appVersion: "9.9.9" }) as unknown as Record<string, string | undefined>;
-    expect(h["X-ZCode-App-Version"]).toBeUndefined();
+  it("emits X-ZCode-App-Version (real ZCode client sends it)", () => {
+    const h = buildIdentityHeaders({ ...BASE, appVersion: "9.9.9" });
+    expect(h["X-ZCode-App-Version"]).toBe("9.9.9");
+    expect(h["User-Agent"]).toBe("ZCode/9.9.9");
   });
 
-  it("does NOT emit X-Title (real ZCode client doesn't send it)", () => {
-    const h = buildIdentityHeaders({ ...BASE, sourceTitle: "electron" }) as unknown as Record<string, string | undefined>;
-    expect(h["X-Title"]).toBeUndefined();
+  it("emits X-Title from sourceTitle (real ZCode client sends it)", () => {
+    const h = buildIdentityHeaders({ ...BASE, sourceTitle: "Z Code@electron" });
+    expect(h["X-Title"]).toBe("Z Code@electron");
   });
 
-  it("does NOT emit X-ZCode-Agent (real ZCode client doesn't send it)", () => {
-    const h = buildIdentityHeaders(BASE) as unknown as Record<string, string | undefined>;
-    expect(h["X-ZCode-Agent"]).toBeUndefined();
+  it("emits HTTP-Referer from refererOrigin (real ZCode client sends it)", () => {
+    const h = buildIdentityHeaders({ ...BASE, refererOrigin: "https://zcode.z.ai" });
+    expect(h["HTTP-Referer"]).toBe("https://zcode.z.ai");
   });
 
-  it("does NOT emit HTTP-Referer (real ZCode client doesn't send it)", () => {
-    const h = buildIdentityHeaders({ ...BASE, refererOrigin: "https://example.com" }) as unknown as Record<string, string | undefined>;
-    expect(h["HTTP-Referer"]).toBeUndefined();
+  it("emits X-Platform as {platform}-{arch}", () => {
+    const h = buildIdentityHeaders(BASE) as unknown as Record<string, string>;
+    // Format: <process.platform>-<os.arch>, e.g. win32-x64 / linux-x64.
+    expect(h["X-Platform"]).toMatch(/^[a-z0-9]+-[a-z0-9]+$/i);
   });
 
-  it("User-Agent is independent of identity config (real ZCode uses fixed SDK version)", () => {
-    // Different identity configs should NOT change the UA — the real client
-    // always sends `ai-sdk/anthropic/3.0.81` regardless of its app version.
-    const h1 = buildIdentityHeaders({ ...BASE, appVersion: "1.0.0" });
-    const h2 = buildIdentityHeaders({ ...BASE, appVersion: "9.9.9" });
-    expect(h1["User-Agent"]).toBe(h2["User-Agent"]);
+  it("emits X-Os-Category mapped from platform (windows|macos|linux)", () => {
+    const h = buildIdentityHeaders(BASE) as unknown as Record<string, string>;
+    expect(["windows", "macos", "linux"]).toContain(h["X-Os-Category"]);
+  });
+
+  it("emits X-Client-Language and X-Client-Timezone", () => {
+    const h = buildIdentityHeaders(BASE) as unknown as Record<string, string>;
+    expect(h["X-Client-Language"]).toBeTruthy();
+    expect(h["X-Client-Timezone"]).toBeTruthy();
+  });
+
+  it("falls back gracefully when appVersion is empty", () => {
+    const h = buildIdentityHeaders({ ...BASE, appVersion: "" });
+    expect(h["User-Agent"]).toBe("ZCode/unknown");
+    expect(h["X-ZCode-App-Version"]).toBe("unknown");
   });
 });

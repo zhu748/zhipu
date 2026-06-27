@@ -85,15 +85,22 @@ describe("buildAuthHeaders", () => {
     expect(h["authorization"]).toBe("Bearer bmkey");
   });
 
-  it("injects only User-Agent (matches real ZCode client using Vercel AI SDK)", () => {
-    // Real ZCode client sends ONLY `User-Agent: ai-sdk/anthropic/{version}`.
-    // The four "ZCode desktop" headers were removed (2026-06 WAF fix).
+  it("injects the ZCode identity header set (matches real ZCode client)", () => {
+    // Real ZCode client sends `ZCode/{appVersion}` UA plus the full identity
+    // set (verified against app.asar buildZCodeSourceHeaders, 2026-06).
     const h = buildAuthHeaders("anthropic", ZAI_CRED, IDENTITY);
-    expect(h["User-Agent"]).toBe("ai-sdk/anthropic/3.0.81");
-    expect(h["X-ZCode-App-Version"]).toBeUndefined();
-    expect(h["X-Title"]).toBeUndefined();
-    expect(h["X-ZCode-Agent"]).toBeUndefined();
-    expect(h["HTTP-Referer"]).toBeUndefined();
+    expect(h["User-Agent"]).toBe("ZCode/test-1.0.0");
+    expect(h["X-ZCode-App-Version"]).toBe("test-1.0.0");
+    expect(h["X-Title"]).toBe("cli");
+    expect(h["HTTP-Referer"]).toBe("https://zcode.z.ai");
+    expect(h["X-Platform"]).toMatch(/^[a-z0-9]+-[a-z0-9]+$/i);
+  });
+
+  it("does NOT send fabricated trace headers (real ZCode client omits them)", () => {
+    const h = buildAuthHeaders("anthropic", ZAI_CRED, IDENTITY) as unknown as Record<string, string | undefined>;
+    expect(h["x-session-id"]).toBeUndefined();
+    expect(h["x-query-id"]).toBeUndefined();
+    expect(h["x-zcode-trace-id"]).toBeUndefined();
   });
 
   it("injects Accept: text/event-stream (real ZCode client always sends it)", () => {
@@ -101,34 +108,12 @@ describe("buildAuthHeaders", () => {
     expect(h["accept"]).toBe("text/event-stream");
   });
 
-  it("x-query-id is a bare UUID (no query_ prefix, matches real ZCode)", () => {
-    const h = buildAuthHeaders("anthropic", ZAI_CRED, IDENTITY);
-    const qid = h["x-query-id"];
-    expect(qid).toBeTruthy();
-    // UUID v4 format: 8-4-4-4-12 hex chars, no prefix
-    expect(qid).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
-    expect(qid?.startsWith("query_")).toBe(false);
-  });
-
-  it("x-session-id is stable per client fingerprint (matches real ZCode session behavior)", () => {
-    // Without a fingerprint (test path), each call generates a fresh UUID.
-    // With the same fingerprint, session ID is cached for 30 minutes.
-    const h1 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY, "coding-plan", "fp-test-1");
-    const h2 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY, "coding-plan", "fp-test-1");
-    expect(h1["x-session-id"]).toBeTruthy();
-    expect(h1["x-session-id"]).toBe(h2["x-session-id"]); // same fingerprint → same session
-
-    // Different fingerprint → different session
-    const h3 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY, "coding-plan", "fp-test-2");
-    expect(h3["x-session-id"]).not.toBe(h1["x-session-id"]);
-  });
-
-  it("generates unique x-request-id and x-zcode-trace-id per call", () => {
+  it("x-request-id is a fresh UUID per call (real ZCode client behavior)", () => {
     const h1 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY);
     const h2 = buildAuthHeaders("openai", ZAI_CRED, IDENTITY);
+    expect(h1["x-request-id"]).toBeTruthy();
+    expect(h1["x-request-id"]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
     expect(h1["x-request-id"]).not.toBe(h2["x-request-id"]);
-    expect(h1["x-zcode-trace-id"]).not.toBe(h2["x-zcode-trace-id"]);
-    expect(h1["x-query-id"]).not.toBe(h2["x-query-id"]);
   });
 });
 
@@ -142,8 +127,15 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("x-api-key")).toBe("testkey.testsecret");
     expect(upstream.headers.get("anthropic-version")).toBe("2023-06-01");
     expect(upstream.headers.get("content-type")).toBe("application/json");
-    expect(upstream.headers.get("user-agent")).toBe("ai-sdk/anthropic/3.0.81");
+    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0");
+    expect(upstream.headers.get("x-zcode-app-version")).toBe("test-1.0.0");
+    expect(upstream.headers.get("x-title")).toBe("cli");
+    expect(upstream.headers.get("http-referer")).toBe("https://zcode.z.ai");
     expect(upstream.headers.get("accept")).toBe("text/event-stream");
+    // Fabricated trace headers must NOT be present on the wire.
+    expect(upstream.headers.get("x-session-id")).toBeNull();
+    expect(upstream.headers.get("x-query-id")).toBeNull();
+    expect(upstream.headers.get("x-zcode-trace-id")).toBeNull();
 
     const body = await upstream.text();
     expect(body).toBe('{"model":"glm-4.6","messages":[]}');
@@ -158,20 +150,20 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("content-type")).toBe("application/json");
   });
 
-  it("filters anthropic-beta header to keep only claude-code-* flags", () => {
-    // ZCode gateway validates that beta flags match the request body. We strip
-    // context_management, output_config, thinking blocks etc. from the body,
-    // so we must also strip the corresponding beta flags from the header.
-    // Only claude-code-* flags are kept (client identification, no body field).
+  it("strips anthropic-beta header entirely (real ZCode client sends none)", () => {
+    // The real ZCode desktop client sends NO anthropic-beta header on normal
+    // /v1/messages traffic (verified against app.asar buildZCodeSourceHeaders,
+    // 2026-06). Beta flags are an Anthropic-SDK / Claude-Code-CLI artifact.
+    // Forwarding them — even claude-code-* — is a fingerprint mismatch, so we
+    // strip the header completely regardless of which flags it carries.
     const clientReq = makeClientReq("{}", {
       "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24",
     });
     const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
-    const beta = upstream.headers.get("anthropic-beta");
-    expect(beta).toBe("claude-code-20250219");
+    expect(upstream.headers.get("anthropic-beta")).toBeNull();
   });
 
-  it("drops anthropic-beta header entirely when no claude-code-* flags present", () => {
+  it("strips anthropic-beta header entirely when no claude-code-* flags present", () => {
     const clientReq = makeClientReq("{}", {
       "anthropic-beta": "prompt-caching-2024-07-31,some-other-flag",
     });
@@ -179,10 +171,12 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("anthropic-beta")).toBeNull();
   });
 
-  it("preserves claude-code-* anthropic-beta flag from client", () => {
+  it("strips a lone claude-code-* anthropic-beta flag too (no exceptions)", () => {
+    // Even when the ONLY flag is claude-code-*, we drop it — the real client
+    // never emits this header at all.
     const clientReq = makeClientReq("{}", { "anthropic-beta": "claude-code-20250219" });
     const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
-    expect(upstream.headers.get("anthropic-beta")).toBe("claude-code-20250219");
+    expect(upstream.headers.get("anthropic-beta")).toBeNull();
   });
 
   it("strips client Authorization header (prevents credential leak)", () => {
@@ -201,45 +195,23 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("x-api-key")).toBeNull();
   });
 
-  it("uses resolveClientIp for the session fingerprint (NOT XFF) when trustProxy is false", () => {
-    // vceshi0.0.8+: the session fingerprint must come from the TCP socket
-    // (resolveClientIp), NOT from X-Forwarded-For, unless the operator has
-    // explicitly opted in via trustProxy=true. Without this gate, any client
-    // could spoof XFF to share/pollute another user's upstream session ID.
-    const clientReq = makeClientReq("{}", {
-      "x-forwarded-for": "203.0.113.42", // attacker-controlled, must be IGNORED
-      "x-real-ip": "203.0.113.42", // ditto
-      authorization: "Bearer user-token",
-    });
-    const resolver = () => "198.51.100.1"; // the real socket peer
-    const upstream1 = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY, "coding-plan", undefined, resolver, false);
-    const upstream2 = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY, "coding-plan", undefined, resolver, false);
-    // Same resolver result + same auth → same session ID.
-    expect(upstream1.headers.get("x-session-id")).toBe(upstream2.headers.get("x-session-id"));
-  });
-
-  it("uses X-Forwarded-For for the fingerprint ONLY when trustProxy is true", () => {
+  it("accepts resolveClientIp/trustProxy args for API compat without emitting trace headers", () => {
+    // These args used to drive a session-id cache. Since the real ZCode client
+    // sends no session/query/trace headers, they are now accepted-but-unused.
+    // This test pins that contract: the signature stays stable and NO trace
+    // header is produced regardless of these args.
     const clientReq = makeClientReq("{}", {
       "x-forwarded-for": "203.0.113.42",
+      "x-real-ip": "203.0.113.42",
       authorization: "Bearer user-token",
     });
-    // No resolver — trustProxy is the only path that can produce an IP.
-    const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY, "coding-plan", undefined, undefined, true);
-    const upstream2 = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY, "coding-plan", undefined, undefined, true);
-    // Same XFF + same auth → same session ID.
-    expect(upstream.headers.get("x-session-id")).toBe(upstream2.headers.get("x-session-id"));
-  });
-
-  it("falls back to empty-string IP when neither resolver nor trustProxy is available", () => {
-    const clientReq = makeClientReq("{}", {
-      "x-forwarded-for": "203.0.113.42", // must be ignored
-      authorization: "Bearer user-token",
-    });
-    // No resolver, trustProxy=false → IP is "" but auth still produces a
-    // per-user-stable fingerprint, so session ID is still stable per user.
-    const upstream1 = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
-    const upstream2 = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
-    expect(upstream1.headers.get("x-session-id")).toBe(upstream2.headers.get("x-session-id"));
+    const resolver = () => "198.51.100.1";
+    const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY, "coding-plan", undefined, resolver, false);
+    expect(upstream.headers.get("x-session-id")).toBeNull();
+    expect(upstream.headers.get("x-query-id")).toBeNull();
+    expect(upstream.headers.get("x-zcode-trace-id")).toBeNull();
+    // Identity headers still present.
+    expect(upstream.headers.get("user-agent")).toBe("ZCode/test-1.0.0");
   });
 });
 

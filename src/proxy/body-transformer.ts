@@ -86,9 +86,9 @@
  *      ANY `/+err` on tool_result indicates a regression.
  *   2. Check the dumped `zcode-proxy-debug-<reqId>.json` file in the proxy's
  *      working directory — it contains the FULL transformed request body.
- *   3. The `anthropic-beta sent:` line should show ONLY `claude-code-*` flags
- *      in start-plan mode. Other flags reference features we strip from the
- *      body, causing header/body mismatch → 3001.
+ *   3. The `anthropic-beta sent:` line should show `(none)` — since v0.2.0.6
+ *      we strip anthropic-beta entirely (the real ZCode client sends none),
+ *      eliminating the header/body mismatch that was a 3001 cause.
  *
  * @see _reverse/NOTEPAD.md "How Credential is Used for LLM Calls"
  */

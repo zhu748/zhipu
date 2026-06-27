@@ -8,25 +8,26 @@
  * originally spoke OpenAI. The route's format is tracked separately in
  * `handler.ts` for response translation decisions.
  *
- * === HEADER FINGERPRINT ALIGNMENT (2026-06 WAF fix) ===
+ * === HEADER FINGERPRINT ALIGNMENT (2026-06, verified vs app.asar) ===
  *
- * Real ZCode client (reverse-engineered) sends:
- *   - User-Agent: ai-sdk/anthropic/3.0.81   (Vercel AI SDK, NOT ZCode/x.y.z)
+ * Reverse-engineered from the ZCode Electron client's buildZCodeSourceHeaders()
+ * / withZCodeEndpointHeaders(). The real client sends:
+ *   - User-Agent: ZCode/{appVersion}        (e.g. ZCode/3.1.8)
+ *   - X-ZCode-App-Version / X-Title / HTTP-Referer / X-Platform /
+ *     X-Client-Language / X-Client-Timezone / X-Os-Category / X-Os-Version
+ *     (these IDENTITY headers ARE how the client proves it is ZCode)
  *   - Accept: text/event-stream              (always, even for non-stream)
- *   - x-request-id: <uuid>                   (fresh per request)
- *   - x-zcode-trace-id: <uuid>               (fresh per request)
- *   - x-session-id: <uuid>                   (STABLE within a session)
- *   - x-query-id: <uuid>                     (fresh per query, NO "query_" prefix)
- *   - NO X-ZCode-App-Version / X-Title / X-ZCode-Agent / HTTP-Referer
- *   - NO anthropic-beta unless explicitly needed
+ *   - x-request-id: <uuid>                   (fresh per request, via
+ *                                             withRequestIdHeader())
+ *   - NO x-session-id / x-query-id / x-zcode-trace-id
+ *   - NO anthropic-beta (the real client sends none — verified 2026-06;
+ *                          we strip it entirely, including claude-code-*)
  *
- * Session ID stability is critical: real ZCode generates ONE session ID when
- * the Electron app starts and reuses it for the entire app lifecycle. The
- * previous implementation generated a fresh session ID per fetch (including
- * retries) — a clear WAF fingerprint. We now cache session IDs per client
- * (keyed on client IP + proxy API key) with a 30-minute TTL.
- *
- * @see _reverse/NOTEPAD.md "Real ZCode Request Headers (2026-06)"
+ * An earlier revision did the OPPOSITE (shipped `User-Agent: ai-sdk/anthropic/3.0.81`
+ * and stripped every X-ZCode-* header), based on a flawed reverse note. That
+ * made the request look like it was *pretending* to be ZCode while omitting
+ * every signal the real client uses to identify itself. We now emit the real
+ * client's identity set verbatim.
  */
 import type { Format } from "../translator/types.js";
 import type { ProviderDef } from "../provider/types.js";
@@ -44,9 +45,14 @@ const STRIP_HEADERS = new Set([
   "authorization",
   "x-api-key",
   "anthropic-version",
-  // NOTE: anthropic-beta is NOT in this set — it's handled separately below
-  // (filtered to keep only claude-code-* flags, matching the real ZCode
-  // client behavior).
+  // anthropic-beta: STRIP ENTIRELY. The real ZCode desktop client sends NO
+  // anthropic-beta header at all on normal /v1/messages traffic (verified
+  // against app.asar buildZCodeSourceHeaders, 2026-06). Beta flags are an
+  // Anthropic-SDK / Claude-Code-CLI artifact, not part of ZCode's fingerprint,
+  // so forwarding them is a tell. Previously we filtered to keep only
+  // claude-code-* flags, but that was based on a flawed assumption — there
+  // are no claude-code-* flags in the real client either.
+  "anthropic-beta",
   "content-length",
   "connection",
   "proxy-authorization",
@@ -56,10 +62,23 @@ const STRIP_HEADERS = new Set([
   "x-zcode-trace-id",
   "x-query-id",
   "x-session-id",
-  // Strip client-side SDK headers that would leak the proxy's true identity.
-  // Real ZCode only sends ai-sdk/anthropic UA — anything else here is a
-  // fingerprint. Also strip Vercel AI SDK headers from inbound requests
-  // (Cherry Studio / Codex CLI send these) so we don't double-inject.
+  // Proxy-forwarding headers injected by downstream clients or reverse
+  // proxies (X-Forwarded-* / X-Real-IP). The real ZCode desktop client never
+  // sends these — they'd leak the proxy chain. We read XFF/X-Real-IP only for
+  // diagnostics via clientIp(), never forward them upstream.
+  "x-forwarded-for",
+  "x-forwarded-proto",
+  "x-forwarded-host",
+  "x-forwarded-port",
+  "x-real-ip",
+  "x-real-port",
+  // Strip all client-side identity / SDK headers so nothing from the
+  // downstream client (Cherry Studio, Codex CLI, a browser) leaks upstream.
+  // We rebuild the full ZCode identity header set in buildIdentityHeaders()
+  // (User-Agent: ZCode/{version}, X-ZCode-App-Version, X-Title, HTTP-Referer,
+  // X-Platform, X-Client-*, X-Os-*). buildUpstreamRequest layers authHeaders
+  // AFTER passthrough, so our injected identity always wins; stripping here
+  // keeps the passthrough set clean and free of contradictory values.
   "user-agent",
   "accept",
   "accept-language",
@@ -70,6 +89,12 @@ const STRIP_HEADERS = new Set([
   "x-title",
   "x-zcode-agent",
   "x-zcode-app-version",
+  "x-platform",
+  "x-client-language",
+  "x-client-timezone",
+  "x-os-category",
+  "x-os-version",
+  "x-release-channel",
   "sec-fetch-site",
   "sec-fetch-mode",
   "sec-fetch-dest",
@@ -78,96 +103,37 @@ const STRIP_HEADERS = new Set([
   "sec-ch-ua-platform",
 ]);
 
-// ---------------------------------------------------------------------------
-// Session ID cache — keyed on client fingerprint (IP + proxy API key).
-//
-// Real ZCode generates one session-id when the Electron app starts and
-// reuses it for the entire app lifecycle (hours/days). The previous
-// implementation generated a fresh session-id per fetch, which is a strong
-// WAF fingerprint — no real client would spawn hundreds of sessions in
-// minutes.
-//
-// We cache per client fingerprint so each distinct downstream client gets
-// its own stable session ID, mimicking "one ZCode app instance per client".
-// 30-minute TTL mirrors typical Electron app session length.
-// ---------------------------------------------------------------------------
-
-interface SessionCacheEntry {
-  sessionId: string;
-  expiresAt: number;
-}
-
-const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
-const sessionCache = new Map<string, SessionCacheEntry>();
-
-// Cap the cache to prevent unbounded growth under proxy rotation / NAT pools.
-const SESSION_CACHE_MAX = 1024;
-
-function getSessionId(clientFingerprint: string): string {
-  const now = Date.now();
-  const existing = sessionCache.get(clientFingerprint);
-  if (existing && existing.expiresAt > now) {
-    // Refresh TTL on hit — active sessions shouldn't expire mid-use.
-    existing.expiresAt = now + SESSION_TTL_MS;
-    return existing.sessionId;
-  }
-  // Evict expired entries if cache is full.
-  if (sessionCache.size >= SESSION_CACHE_MAX) {
-    for (const [k, v] of sessionCache) {
-      if (v.expiresAt <= now) sessionCache.delete(k);
-    }
-    // If still full after eviction, drop the oldest 10%.
-    if (sessionCache.size >= SESSION_CACHE_MAX) {
-      const entries = [...sessionCache.entries()].sort((a, b) => a[1].expiresAt - b[1].expiresAt);
-      const dropCount = Math.ceil(SESSION_CACHE_MAX * 0.1);
-      for (let i = 0; i < dropCount; i++) sessionCache.delete(entries[i][0]);
-    }
-  }
-  const newId = crypto.randomUUID();
-  sessionCache.set(clientFingerprint, { sessionId: newId, expiresAt: now + SESSION_TTL_MS });
-  return newId;
-}
-
 /**
- * Derive a stable client fingerprint from the inbound request.
+ * Derive the client IP for logging/diagnostics (NOT for session IDs — see
+ * the note in buildAuthHeaders: the real client sends no session header).
  *
- * vceshi0.0.8+ SECURITY: previously this read X-Forwarded-For unconditionally,
- * which meant any client could spoof XFF to share/pollute another user's
- * upstream session ID — potentially causing cross-user session stickiness on
- * the upstream WAF. Now the fingerprint uses:
+ * vceshi0.0.8+ SECURITY: previously this read X-Forwarded-For unconditionally
+ * to key a session-ID cache; any client could spoof XFF to share/pollute
+ * another user's upstream session. The session cache is gone now, but the IP
+ * resolution is retained for diagnostics and (if re-introduced) should honor:
  *   1. The TCP socket peer address (via resolveClientIp, wired to Bun's
  *      server.requestIP) — un-spoofable, the default in production.
  *   2. X-Forwarded-For / X-Real-IP ONLY when the operator has explicitly
- *      opted in via `config.server.trustProxy = true` (because the proxy
- *      is behind a trusted reverse proxy).
- *   3. The empty string when neither is available (e.g., tests with no
- *      socket and no trustProxy). Combined with the auth header slice,
- *      this still produces a per-user-stable fingerprint.
- *
- * The auth header (Authorization / x-api-key) is always included so that
- * two different proxy users on the same IP don't share a session.
+ *      opted in via `config.server.trustProxy = true`.
  */
-function clientFingerprint(
+function clientIp(
   req: Request,
   resolveClientIp?: (req: Request) => string | undefined,
   trustProxy?: boolean,
 ): string {
-  let ip = "";
   if (resolveClientIp) {
-    try { ip = resolveClientIp(req) ?? ""; } catch { /* ignore */ }
+    try {
+      const ip = resolveClientIp(req);
+      if (ip) return ip;
+    } catch { /* ignore */ }
   }
-  if (!ip && trustProxy) {
-    // Only fall back to XFF when the operator has explicitly trusted it.
+  if (trustProxy) {
     const xRealIp = req.headers.get("x-real-ip");
-    if (xRealIp) {
-      ip = xRealIp;
-    } else {
-      const xff = req.headers.get("x-forwarded-for");
-      if (xff) ip = xff.split(",")[0].trim();
-    }
+    if (xRealIp) return xRealIp;
+    const xff = req.headers.get("x-forwarded-for");
+    if (xff) return xff.split(",")[0].trim();
   }
-  const auth = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
-  return `${ip}::${auth.slice(0, 32)}`;
+  return "";
 }
 
 /**
@@ -205,24 +171,22 @@ export function buildAuthHeaders(
   plan: "coding-plan" | "start-plan" = "coding-plan",
   clientFingerprintStr?: string,
 ): Record<string, string> {
+  // NOTE: clientFingerprintStr is retained in the signature for API
+  // stability (callers in handler.ts pass it) but is no longer used — the
+  // real ZCode client does NOT send x-session-id / x-query-id /
+  // x-zcode-trace-id headers (verified against app.asar, 2026-06). Those
+  // were fabricated headers and have been removed.
+  void clientFingerprintStr;
   const credStr = plan === "start-plan" && cred.jwt ? cred.jwt : credentialString(cred);
   const base: Record<string, string> = {
     ...buildIdentityHeaders(identity),
     // Accept: text/event-stream — real ZCode client ALWAYS sends this,
     // even for non-stream requests. Missing it is a fingerprint.
     "accept": "text/event-stream",
-    // x-request-id / x-zcode-trace-id: fresh UUID per request (real client
-    // behavior — these are per-request tracing IDs).
+    // x-request-id: fresh UUID per request. The real client sets this via
+    // withRequestIdHeader() (app.asar) — every request gets a new id if
+    // none is present. No other fabricated trace headers are sent.
     "x-request-id": crypto.randomUUID(),
-    "x-zcode-trace-id": crypto.randomUUID(),
-    // x-session-id: STABLE within a client session. Real ZCode reuses one
-    // session ID for the entire Electron app lifecycle. We cache per client
-    // fingerprint for 30 minutes. Falls back to a fresh UUID if no
-    // fingerprint is provided (test paths).
-    "x-session-id": clientFingerprintStr ? getSessionId(clientFingerprintStr) : crypto.randomUUID(),
-    // x-query-id: fresh UUID per request, NO "query_" prefix. The previous
-    // implementation prepended "query_" — real ZCode sends a bare UUID.
-    "x-query-id": crypto.randomUUID(),
   };
 
   if (format === "anthropic") {
@@ -243,45 +207,14 @@ function collectPassthroughHeaders(req: Request): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [key, value] of req.headers.entries()) {
     const lower = key.toLowerCase();
-    // STRIP_HEADERS now includes ALL identity / SDK / trace headers — we
-    // rebuild them from scratch in buildAuthHeaders to ensure they match
-    // the real ZCode client exactly. The only headers we passthrough are
+    // STRIP_HEADERS now includes ALL identity / SDK / trace / beta headers —
+    // we rebuild the ZCode identity set from scratch in buildAuthHeaders to
+    // match the real client exactly. The only headers we passthrough are
     // genuinely unknown ones (rare in practice).
     if (STRIP_HEADERS.has(lower)) continue;
     // Content-Type is set explicitly below; don't passthrough a potentially
     // wrong value from the client.
     if (lower === "content-type") continue;
-    if (lower === "anthropic-beta") {
-      // Filter out beta flags that correspond to features we strip from the
-      // request body. ZCode's start-plan gateway validates that the body
-      // matches what the beta flags declare — if we strip context_management
-      // from the body but leave the flag in the header, the gateway 3001s.
-      //
-      // Flags we strip (because we strip the corresponding body field):
-      //   - context-management-*        → we delete body.context_management
-      //   - effort-*                    → we delete body.output_config
-      //   - interleaved-thinking-*      → we strip thinking blocks from messages
-      //   - redact-thinking-*           → we strip thinking/redacted_thinking blocks
-      //   - prompt-caching-scope-*      → we sanitize cache_control on non-text blocks
-      //   - mid-conversation-system-*   → we relocate system messages to top-level system
-      //
-      // Flags we keep (body-compatible):
-      //   - claude-code-*               → client identification, no body field
-      //
-      // NOTE: real ZCode client (reverse-engineered 2026-06) does NOT send
-      // anthropic-beta at all in normal /v1/messages traffic. Keeping this
-      // filter is safe — if the client doesn't send the header, nothing
-      // happens. If they do, we filter to only the safe flags.
-      const filtered = value
-        .split(",")
-        .map(s => s.trim())
-        .filter(flag => flag.startsWith("claude-code-"))
-        .join(",");
-      if (filtered) {
-        result[lower] = filtered;
-      }
-      continue;
-    }
     result[lower] = value;
   }
   return result;
@@ -297,16 +230,18 @@ export function buildUpstreamRequest(
   plan: "coding-plan" | "start-plan" = "coding-plan",
   extraHeaders?: Record<string, string>,
   /**
-   * vceshi0.0.8+: socket-aware client IP resolver, used for the session
-   * fingerprint. See clientFingerprint() docstring for the security
-   * rationale. When omitted, falls back to XFF only if trustProxy is true.
+   * vceshi0.0.8+: socket-aware client IP resolver, retained for diagnostics.
+   * NOTE: as of the identity-header rework it is no longer used to derive a
+   * session ID (the real client sends no session header — see module header).
+   * Kept in the signature for API stability; the value is intentionally unused.
    */
   resolveClientIp?: (req: Request) => string | undefined,
   trustProxy?: boolean,
 ): Request {
+  // Resolve and discard — kept for API symmetry, no session header is built.
+  void clientIp(clientReq, resolveClientIp, trustProxy);
   const url = buildUpstreamURL(format, provider, plan);
-  const fp = clientFingerprint(clientReq, resolveClientIp, trustProxy);
-  const authHeaders = buildAuthHeaders(format, cred, identity, plan, fp);
+  const authHeaders = buildAuthHeaders(format, cred, identity, plan);
   const passthrough = collectPassthroughHeaders(clientReq);
 
   const headers: Record<string, string> = {

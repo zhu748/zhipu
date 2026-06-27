@@ -167,8 +167,8 @@ auth:
   apiKey: "abc"
 `);
     const cfg = loadConfig(path);
-    expect(cfg.identity.appVersion).toBe("3.1.5");
-    expect(cfg.identity.sourceTitle).toBe("cli");
+    expect(cfg.identity.appVersion).toBe("3.1.8");
+    expect(cfg.identity.sourceTitle).toBe("Z Code@electron");
     expect(cfg.identity.refererOrigin).toBe("https://zcode.z.ai");
   });
 
@@ -210,7 +210,7 @@ identity:
   appVersion: "v3.1.1-中文"
 `);
     const cfg = loadConfig(path);
-    expect(cfg.identity.appVersion).toBe("3.1.5");
+    expect(cfg.identity.appVersion).toBe("3.1.8");
   });
 
   it("retry: applies defaults when no retry section provided", () => {

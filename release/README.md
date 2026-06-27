@@ -1,5 +1,33 @@
 # zcode-proxy 使用说明
 
+> **v0.2.0.5 — 请求头对齐真实 ZCode 客户端（修正历史误判）**
+>
+> 本次发版修正了一个**与真实客户端相反**的请求头设计。v0.2.0.4 及之前基于一份错误的逆向笔记，把真实 ZCode 客户端**实际发送**的请求头当成了"WAF 指纹"而主动删除——这反而让请求看起来像"声称自己是 ZCode 却拿不出任何身份证据"，是最可疑的状态。
+>
+> 本次通过逆向**当前官方 ZCode 桌面客户端的 `app.asar`**（`buildZCodeSourceHeaders` / `withZCodeEndpointHeaders`），逐头对齐到字节级。**改动**
+>
+> **1. User-Agent 改回 `ZCode/{version}`（之前错误地用了 `ai-sdk/anthropic/3.0.81`）**
+>
+> 真实客户端的 UA 是 `ZCode/{appVersion}`，不是 Vercel AI SDK 的默认 UA。官方 asar 里**完全没有** `ai-sdk/anthropic/{version}` 的运行时拼接代码——即使底层用 `@ai-sdk/anthropic`，UA 也被 `buildZCodeSourceHeaders` 覆盖成 `ZCode/{版本}`。
+>
+> **2. 恢复发送 ZCode 身份头（这些才是客户端"自证身份"的关键）**
+>
+> 真实客户端发送，本项目之前却删掉了的头：`X-ZCode-App-Version`、`X-Title: Z Code@electron`、`HTTP-Referer: https://zcode.z.ai`、`X-Platform`（如 `win32-x64`）、`X-Client-Language`、`X-Client-Timezone`、`X-Os-Category`（windows/macos/linux）、`X-Os-Version`。环境特征头（平台/时区/语言/系统版本）取代理运行时真值，最忠实复现客户端在自己主机上的产出。
+>
+> **3. 删除自造的 trace 头（真实客户端根本不发）**
+>
+> 之前凭空添加的 `x-session-id` / `x-query-id` / `x-zcode-trace-id` 在官方 asar 里**零命中**。连同为它们服务的 session-id 缓存逻辑（`getSessionId` / `clientFingerprint`）一并删除。只保留真实客户端确实发送的 `x-request-id`（经 `withRequestIdHeader` 每请求新 UUID）。
+>
+> **4. app_version 统一到 3.1.8（当前官方客户端版本）**
+>
+> `DEFAULTS.APP_VERSION` 与 `quota.ts` 的 `DEFAULT_APP_VERSION` 从 3.1.5 提到 3.1.8，让 UA 里的版本号、额度查询的 app_version 都对齐当前官方客户端。`config.example.yaml` 示例配置同步更新（之前示例里硬编码了 3.1.5，会覆盖默认值）。start-plan 首次激活仍属 3.1.x 激活区间，行为不变。
+>
+> **5. 阻断代理转发头泄漏**
+>
+> 之前下游客户端（或反向代理）注入的 `X-Forwarded-For` / `X-Real-IP` 等头会**原样透传到上游**，而真实 ZCode 桌面客户端从不发这些头——属于身份泄漏点。本次把 `X-Forwarded-*` / `X-Real-IP` 全部加入剥离列表（仅保留用于诊断的读取逻辑，不再转发）。
+>
+> 涉及文件：`src/proxy/identity.ts`（重写）、`src/proxy/upstream.ts`（删 trace 头+session 缓存、剥离 XFF）、`src/config/loader.ts`（APP_VERSION→3.1.8、SOURCE_TITLE 默认→`Z Code@electron`）、`src/auth/quota.ts`（DEFAULT_APP_VERSION→3.1.8）、`config.example.yaml`（示例值对齐）+ 对应测试。**569/569 测试通过**。
+
 > **v0.2.0.4 — Claude Code + Codex 双路径 ZCode wire-shape 完全对齐**
 >
 > 本次发版聚焦于"客户端请求 → ZCode 上游"的请求体结构对齐，让 Claude Code 和 Codex CLI 两条客户端路径产出的 wire bytes 与真实 ZCode 桌面客户端完全一致（顶层字段顺序、thinking 格式、max_tokens、stream、tool_choice、system 块 cache_control 等），降低 WAF 指纹检测风险。

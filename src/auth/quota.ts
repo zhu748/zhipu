@@ -33,9 +33,9 @@ const ZCODE_PLAN_BASE = "https://zcode.z.ai/api/v1/zcode-plan";
 // client version (3.1.x) does. Using "2.0.0" here meant lealll's quota query
 // never activated a fresh account's start-plan — it returned {plans:[]} forever.
 // Verified end-to-end 2026-06-25: same jwt, app_version=2.0.0 -> empty;
-// app_version=3.1.5 -> instant activation. Activation is irreversible, so the
+// app_version=3.1.x -> instant activation. Activation is irreversible, so the
 // version only matters on the first successful query.
-const DEFAULT_APP_VERSION = "3.1.5";
+const DEFAULT_APP_VERSION = "3.1.8";
 const REQUEST_TIMEOUT_MS = 15_000;
 
 /** Normalized, UI-ready quota snapshot for one credential. */
@@ -104,7 +104,7 @@ function withTimeout(fetchImpl: FetchFn): FetchFn {
  *                   server as the start-plan activation gate — see
  *                   DEFAULT_APP_VERSION). Callers should pass the resolved
  *                   identity.appVersion from config so it matches the real
- *                   client. Defaults to DEFAULT_APP_VERSION ("3.1.5").
+ *                   client. Defaults to DEFAULT_APP_VERSION ("3.1.8").
  */
 export async function queryQuota(
   cred: Credential,
