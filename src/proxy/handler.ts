@@ -35,6 +35,20 @@ export interface ProxyHandlerOptions {
   auth: AuthManager;
   /** Override the global fetch (for testing). Defaults to global `fetch`. */
   fetchImpl?: typeof fetch;
+  /**
+   * Resolve the TCP-remote client IP for a request. In production this is
+   * wired to Bun's `server.requestIP(req)?.address`, which reads the real
+   * socket peer address and CANNOT be spoofed by headers. When omitted
+   * (e.g., in tests), the proxy path falls back to X-Forwarded-For ONLY
+   * when `config.server.trustProxy` is true, otherwise to the empty string.
+   *
+   * vceshi0.0.8+: previously the sessionCache fingerprint always read XFF
+   * without any trust gate, which meant any client could spoof XFF to
+   * share/pollute another user's upstream session ID. Now we use the
+   * socket address by default and only fall back to XFF when explicitly
+   * opted in.
+   */
+  resolveClientIp?: (req: Request) => string | undefined;
 }
 
 /**
@@ -53,8 +67,26 @@ export interface ProxyHandlerOptions {
  *
  * Connection-level errors (ECONNREFUSED, DNS failure, abort) surface as 502.
  */
-const UPSTREAM_TIMEOUT_STREAM_MS = 10 * 60_000;
-const UPSTREAM_TIMEOUT_BATCH_MS = 5 * 60_000;
+/**
+ * Default upstream timeout constants. The stream timeout is longer than
+ * the batch timeout because LLM streams can legitimately run for many
+ * minutes on long reasoning chains.
+ *
+ * These are DEFAULTS — operators can override via
+ * `config.server.upstreamTimeoutMs` (a single value applied to both
+ * stream and batch paths). When the config value is set (non-zero), it
+ * takes precedence over these constants. When unset (0 or undefined),
+ * the constants are used as-is. This lets operators tighten the timeout
+ * for fast networks or loosen it for very long context windows without
+ * recompiling.
+ *
+ * vceshi0.0.8+ bugfix: previously these constants were hardcoded and the
+ * `config.server.upstreamTimeoutMs` field was parsed by the loader but
+ * never read by the handler — the config was effectively dead. Now the
+ * handler reads the config value and falls back to these defaults.
+ */
+const DEFAULT_UPSTREAM_TIMEOUT_STREAM_MS = 10 * 60_000;
+const DEFAULT_UPSTREAM_TIMEOUT_BATCH_MS = 5 * 60_000;
 
 export async function proxyRequest(
   clientReq: Request,
@@ -301,7 +333,18 @@ export async function proxyRequest(
   // get caught by the catch block, and get converted to a synthetic 502 —
   // making retries completely ineffective.
   const buildUpstreamReq = (captcha?: Record<string, string>) =>
-    buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, currentPlan, captcha);
+    buildUpstreamRequest(
+      clientReq,
+      upstreamFormat,
+      provider,
+      cred,
+      transformedBody,
+      config.identity,
+      currentPlan,
+      captcha,
+      opts.resolveClientIp,
+      config.server.trustProxy,
+    );
 
   // Track the last anthropic-beta header actually sent upstream. Captured
   // during the real fetch so diagnostics on 4xx don't need to build a second
@@ -326,7 +369,13 @@ export async function proxyRequest(
   const fetchUpstreamDetected = async (captcha?: Record<string, string>): Promise<Response> => {
     const req = buildUpstreamReq(captcha);
     lastSentBeta = req.headers.get("anthropic-beta");
-    const timeoutMs = meta.stream ? UPSTREAM_TIMEOUT_STREAM_MS : UPSTREAM_TIMEOUT_BATCH_MS;
+    // vceshi0.0.8+: read the operator-configured upstream timeout (if any)
+    // and fall back to the hardcoded defaults. A single config value applies
+    // to BOTH stream and batch paths — operators who want different stream
+    // vs batch timeouts should leave this unset and rely on the defaults.
+    const configuredTimeout = config.server.upstreamTimeoutMs ?? 0;
+    const defaultTimeout = meta.stream ? DEFAULT_UPSTREAM_TIMEOUT_STREAM_MS : DEFAULT_UPSTREAM_TIMEOUT_BATCH_MS;
+    const timeoutMs = configuredTimeout > 0 ? configuredTimeout : defaultTimeout;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     // Bun's native fetch accepts `{ proxy: "http://..." }` / `socks5://...`
@@ -473,7 +522,15 @@ export async function proxyRequest(
   //
   // 这种响应绝对不能重试 — 越撞越黑。立即返回一个明确的错误，避免
   // 进入 retry 循环让 IP 越拉越黑。
-  if (await isWafBlockResponse(upstreamResp)) {
+  // vceshi0.0.8+: checkWafBlock consumes the body to inspect it, and on
+  // the non-WAF path returns a FRESH Response with the body reconstructed.
+  // We reassign `upstreamResp` to the fresh response so all downstream
+  // code (`.body.tee()`, `.text()`, `.json()`) works as if the inspection
+  // never happened. Previously, the non-WAF path left `upstreamResp.body`
+  // in a consumed/locked state, causing `body.tee()` to throw on rare
+  // 200 + HTML upstream responses.
+  const wafCheck = await checkWafBlock(upstreamResp);
+  if (wafCheck.wafBlocked) {
     const ct = upstreamResp.headers.get("content-type") ?? "";
     console.error(
       `${reqId} ⚠️  ALIYUN WAF BLOCK DETECTED — status=${upstreamResp.status}, ` +
@@ -490,6 +547,8 @@ export async function proxyRequest(
       "See: https://errors.aliyun.com",
     );
   }
+  // Not a WAF block — use the reconstructed response (fresh readable body).
+  upstreamResp = wafCheck.response;
 
   if (upstreamResp.status === 401 && currentPlan === "start-plan") {
     printRow(reqId, format, meta, 401, started, headersAt, 0, 0, 0);
@@ -714,6 +773,31 @@ export async function proxyRequest(
           console.log(`${reqId} retry ${attempt} got 403 captcha challenge, re-solving...`);
           upstreamResp = await handleCaptchaChallenge(upstreamResp);
         }
+
+        // vceshi0.0.8+: also check for WAF block on retry — if the IP got
+        // blacklisted DURING the retry loop, we need to bail immediately
+        // (same rationale as the pre-loop check; hammering the WAF makes
+        // the blacklist worse). checkWafBlock returns a fresh response on
+        // the non-WAF path so downstream code can read the body normally.
+        const retryWafCheck = await checkWafBlock(upstreamResp);
+        if (retryWafCheck.wafBlocked) {
+          const ct = upstreamResp.headers.get("content-type") ?? "";
+          console.error(
+            `${reqId} ⚠️  ALIYUN WAF BLOCK DETECTED on retry ${attempt} — status=${upstreamResp.status}, ` +
+            `content-type=${ct}. STOPPING all retries. Your IP may have been blacklisted. ` +
+            `Recommend: 1) Change IP (restart router / use proxy), 2) Wait 24h, 3) Reduce request frequency.`,
+          );
+          try { upstreamResp.body?.cancel(); } catch {}
+          printRow(reqId, format, meta, upstreamResp.status, started, headersAt, 0, 0, 0);
+          return errorResponse(
+            503,
+            "waf_blocked",
+            "Request blocked by Aliyun WAF (status=" + upstreamResp.status + "). " +
+            "Your IP is likely blacklisted. Stop retrying immediately, change IP, and wait before retrying. " +
+            "See: https://errors.aliyun.com",
+          );
+        }
+        upstreamResp = retryWafCheck.response;
       } catch (err) {
         // Network error during retry — log the ACTUAL error so users can
         // diagnose (the old code just said "network error" with no detail).
@@ -1011,52 +1095,73 @@ function stripUndefinedStringFields(node: unknown): number {
  * We peek at the body to confirm it's actually a WAF page (not some other
  * html response) — the `errors.aliyun.com` string is the reliable signal.
  *
- * IMPORTANT: This function consumes the body. Callers must use the returned
- * boolean to decide whether to bail out — if true, the response body is
- * already read and the caller should return a synthetic error.
+ * Returns `{ wafBlocked: true }` if this is a WAF block. In that case the
+ * response body has already been consumed (for inspection) and MUST NOT be
+ * used further — the caller returns a synthetic error response.
+ *
+ * Returns `{ wafBlocked: false, response: <Response> }` if this is NOT a
+ * WAF block. The returned Response has a FRESH readable body reconstructed
+ * from the consumed text, so downstream code can read it normally (`.text()`,
+ * `.json()`, `.body.tee()`, etc.) as if the inspection never happened.
+ *
+ * vceshi0.0.8+ bugfix: previously this function returned `false` after
+ * consuming the body and stashed the text on the response object via
+ * `(resp as any)._wafCheckBody = text`. But NO downstream code path ever
+ * read `_wafCheckBody`, so for any 200 + HTML response that wasn't a WAF
+ * block, `upstreamResp.body` was already locked/consumed and
+ * `upstreamResp.body.tee()` would throw. Reconstructing a new Response
+ * here is the clean fix — the Body mixin's constructor accepts a string
+ * and produces a fresh, readable stream.
  */
-async function isWafBlockResponse(resp: Response): Promise<boolean> {
+async function checkWafBlock(resp: Response): Promise<{ wafBlocked: true } | { wafBlocked: false; response: Response }> {
   // Fast path: status codes that the WAF typically uses.
   // 405 = Method Not Allowed (the classic WAF block)
   // 403 = Forbidden (captcha challenge or WAF block)
   // 200 = sometimes the WAF returns 200 + HTML instead of an error status
   const isSuspectStatus = resp.status === 405 || resp.status === 403 || resp.status === 200;
-  if (!isSuspectStatus) return false;
+  if (!isSuspectStatus) return { wafBlocked: false, response: resp };
 
   const ct = resp.headers.get("content-type") ?? "";
   // WAF responses are HTML; legitimate API responses are JSON or SSE.
-  // If content-type is JSON or SSE, this is NOT a WAF block.
+  // If content-type is JSON or SSE, this is NOT a WAF block — and we don't
+  // need to consume the body to confirm, so we can return the original
+  // response untouched.
   if (ct.includes("application/json") || ct.includes("text/event-stream")) {
-    return false;
+    return { wafBlocked: false, response: resp };
   }
   // Strong signal: Tengine server header (Alibaba's nginx fork).
   // But not all WAF responses have it, so we don't require it.
   const server = resp.headers.get("server") ?? "";
 
   // Peek the body to confirm — look for the Aliyun error page signature.
-  // We need to clone the response first so the body stays readable if this
-  // turns out NOT to be a WAF block.
+  // We consume the body here, so we MUST reconstruct a fresh Response on
+  // the non-WAF path (see function docstring for why).
   try {
     const text = await resp.text();
     // The Aliyun WAF error page always contains this string.
     if (text.includes("errors.aliyun.com") || text.includes("aliyun") && text.includes("WAF")) {
-      return true;
+      return { wafBlocked: true };
     }
     // Secondary signal: Tengine server + status 405 + HTML body
     if (resp.status === 405 && ct.includes("text/html") && server.toLowerCase().includes("tengine")) {
-      return true;
+      return { wafBlocked: true };
     }
-    // Not a WAF block — reconstruct the response with the read body so
-    // downstream code can still read it.
-    // (Note: this is tricky — we've consumed the body. The caller checks
-    // the return value and bails if true. If false, we need to put the
-    // body back. We can't modify resp in place, so we use a hack: stash
-    // the body text on the response object via a Symbol.)
-    (resp as any)._wafCheckBody = text;
-    (resp as any)._wafCheckBodyConsumed = true;
-    return false;
+    // Not a WAF block — reconstruct a fresh Response with the consumed
+    // body text. The new Response has the same status, headers, and a
+    // brand-new readable body stream that downstream code can read freely.
+    return {
+      wafBlocked: false,
+      response: new Response(text, {
+        status: resp.status,
+        statusText: resp.statusText,
+        headers: resp.headers,
+      }),
+    };
   } catch {
-    return false;
+    // Body read failed — return original resp (body may still be readable
+    // if the read threw before consuming; if not, downstream will error
+    // anyway and there's nothing we can do here).
+    return { wafBlocked: false, response: resp };
   }
 }
 

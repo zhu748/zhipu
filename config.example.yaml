@@ -8,6 +8,22 @@ server:
   #   http://0.0.0.0:8080/admin directly does NOT work on Windows / macOS.
   host: "0.0.0.0"
 
+  # Whether to trust X-Forwarded-For / X-Real-IP headers for client IP
+  # detection (used by the admin dashboard loopback gate when proxyApiKey
+  # is NOT configured).
+  #   false (default) = client IP read from the TCP socket (un-spoofable)
+  #   true             = trust XFF/X-Real-IP (set ONLY when behind a trusted
+  #                      reverse proxy like nginx/Caddy that overwrites them)
+  trustProxy: false
+
+  # Upstream request timeout in milliseconds. Applied to BOTH stream and
+  # batch requests. Set to 0 (or omit) to use the defaults:
+  #   - stream requests: 10 minutes (600000 ms)
+  #   - batch requests:  5 minutes (300000 ms)
+  # Lower this if your network is fast and you want faster failure detection;
+  # raise it if you regularly run very long reasoning chains that exceed 10 min.
+  upstreamTimeoutMs: 0
+
 auth:
   # "apikey" = use a pre-obtained API key directly
   # "oauth"  = use OAuth login flow (run `zcode-proxy auth login <zai|bigmodel>` first)

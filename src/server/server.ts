@@ -19,19 +19,37 @@ export interface ServerOptions {
   fetchImpl?: typeof fetch;
   /** Path to the config file (for admin dashboard save). */
   configPath?: string;
+  /**
+   * Pre-built admin options. When provided (used by startServer so the
+   * Bun.serve closure can wire resolveClientIp), createFetchHandler uses
+   * this instance directly instead of building its own. When omitted
+   * (used by tests), createFetchHandler builds a fresh AdminOptions with
+   * no resolveClientIp — which means loopback detection falls back to
+   * the "unknown → allow" path, preserving the legacy test behavior.
+   */
+  adminOpts?: AdminOptions;
+  /**
+   * Resolve the TCP-remote client IP for a request. Wired to Bun's
+   * `server.requestIP(req)?.address` by startServer; tests omit it.
+   * Used by both the admin loopback gate and the proxy session-fingerprint
+   * cache so neither trusts spoofable X-Forwarded-For headers by default.
+   */
+  resolveClientIp?: (req: Request) => string | undefined;
 }
 
 /** Create a Bun.serve-compatible fetch handler. */
 export function createFetchHandler(opts: ServerOptions): (req: Request) => Promise<Response> {
   const { config, auth } = opts;
-  const proxyOpts = { config, auth, fetchImpl: opts.fetchImpl };
+  const proxyOpts = { config, auth, fetchImpl: opts.fetchImpl, resolveClientIp: opts.resolveClientIp };
   const corsAllow = config.corsAllowList;
 
-  const adminOpts: AdminOptions = {
+  const adminOpts: AdminOptions = opts.adminOpts ?? {
     config,
     auth,
     configPath: opts.configPath ?? "config.yaml",
     startTime: Date.now(),
+    fetchImpl: opts.fetchImpl,
+    resolveClientIp: opts.resolveClientIp,
   };
 
   // Pre-compute the health response body — it only depends on config.provider,
@@ -107,10 +125,32 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
 
 /** Start the Bun.serve server. Returns the server instance. */
 export function startServer(opts: ServerOptions): ReturnType<typeof Bun.serve> {
-  const handler = createFetchHandler(opts);
+  // Forward-declare `server` so the resolveClientIp closure can reference it.
+  // The closure is only invoked from inside `fetch(req)`, which only runs
+  // AFTER Bun.serve returns and assigns to `server` — so the closure always
+  // sees a defined value at call time.
+  let server: ReturnType<typeof Bun.serve> | undefined;
+
+  // Wire up the client-IP resolver so admin routes AND the proxy session
+  // fingerprint can read the real TCP peer address (Bun's server.requestIP)
+  // instead of trusting spoofable X-Forwarded-For headers.
+  const resolveClientIp = (req: Request): string | undefined => {
+    try { return server?.requestIP(req)?.address; } catch { return undefined; }
+  };
+
+  const adminOpts: AdminOptions = {
+    config: opts.config,
+    auth: opts.auth,
+    configPath: opts.configPath ?? "config.yaml",
+    startTime: Date.now(),
+    fetchImpl: opts.fetchImpl,
+    resolveClientIp,
+  };
+
+  const handler = createFetchHandler({ ...opts, adminOpts, resolveClientIp });
   const { port, host } = opts.config.server;
 
-  return Bun.serve({
+  server = Bun.serve({
     port,
     hostname: host,
     idleTimeout: 0, // 自用代理：禁用空闲超时，避免长 reasoning 的 LLM 请求被杀
@@ -120,6 +160,7 @@ export function startServer(opts: ServerOptions): ReturnType<typeof Bun.serve> {
       return handler(req);
     },
   });
+  return server;
 }
 
 /**
@@ -160,17 +201,20 @@ function addCorsHeaders(resp: Response, req: Request, allowList?: string[]): Res
 }
 
 function corsHeaders(req: Request, allowList?: string[]): Record<string, string> {
-  // Echo the requesting Origin only when it's been explicitly allowed, OR
-  // when no allowlist is configured (preserving the old permissive behavior
-  // for backwards compatibility). When the origin is NOT in the allowlist,
-  // we return "null" — which prevents the browser from reading the response
-  // cross-origin.
+  // CORS policy:
+  //   1. No Origin header (server-to-server / curl) → return "*" for
+  //      compatibility with simple clients. No browser involved, so the
+  //      CORS check doesn't apply.
+  //   2. Origin present + allowlist configured → echo Origin ONLY if it's
+  //      in the allowlist (case-insensitive). Otherwise "null".
+  //   3. Origin present + NO allowlist → return "null" (deny by default).
+  //      Previous versions echoed any Origin here for backwards compat,
+  //      but that defeated the purpose of CORS for users who hadn't read
+  //      the docs. The secure default is to deny; operators who want to
+  //      allow a specific frontend must set ZCODE_PROXY_CORS_ALLOWLIST.
   //
   // We do NOT use Access-Control-Allow-Credentials, so cookies are not sent
   // cross-origin — API auth is via Authorization header only.
-  //
-  // When no Origin header is present (server-to-server / curl), fall back to
-  // "*" for compatibility with simple clients.
   const origin = req.headers.get("origin");
   let allowOrigin: string;
   if (!origin) {
@@ -179,9 +223,11 @@ function corsHeaders(req: Request, allowList?: string[]): Record<string, string>
     // Allowlist configured — only echo if origin is in the list (case-insensitive).
     allowOrigin = allowList.some(o => o.toLowerCase() === origin.toLowerCase()) ? origin : "null";
   } else {
-    // No allowlist configured — preserve old permissive behavior (echo anything).
-    // Document this in README so operators can lock down via ZCODE_PROXY_CORS_ALLOWLIST.
-    allowOrigin = origin;
+    // No allowlist configured — secure default: deny cross-origin browser
+    // access. Server-to-server clients (no Origin header) still work via
+    // the "*" branch above. Operators who need browser access from a
+    // specific origin must set ZCODE_PROXY_CORS_ALLOWLIST.
+    allowOrigin = "null";
   }
   return {
     "access-control-allow-origin": allowOrigin,

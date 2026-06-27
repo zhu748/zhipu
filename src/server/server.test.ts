@@ -202,11 +202,11 @@ describe("CORS", () => {
     expect(resp.headers.get("access-control-allow-origin")).toBe("*");
   });
 
-  it("echoes requesting Origin instead of '*' (security: blocks third-party sites)", async () => {
-    // When a browser sends Origin: https://evil.example.com, the proxy should
-    // echo THAT origin back (not "*") so that:
-    //   1) Same-origin dashboard requests still work.
-    //   2) Arbitrary third-party sites can't read responses via CORS.
+  it("returns 'null' for unknown Origin when no allowlist is configured (secure default)", async () => {
+    // M23 fix: previously the proxy echoed any Origin back when no allowlist
+    // was configured, which defeated the purpose of CORS. The secure default
+    // is now to deny cross-origin browser access unless the operator has
+    // explicitly opted in via ZCODE_PROXY_CORS_ALLOWLIST.
     const config = makeConfig();
     const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test" });
     const handler = createFetchHandler({ config, auth });
@@ -216,8 +216,34 @@ describe("CORS", () => {
         headers: { origin: "https://evil.example.com" },
       }),
     );
-    expect(resp.headers.get("access-control-allow-origin")).toBe("https://evil.example.com");
+    expect(resp.headers.get("access-control-allow-origin")).toBe("null");
     expect(resp.headers.get("vary")).toBe("origin");
+  });
+
+  it("echoes Origin when it's in the allowlist", async () => {
+    const config = makeConfig({ corsAllowList: ["https://my-dashboard.local"] } as any);
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test" });
+    const handler = createFetchHandler({ config, auth });
+
+    const resp = await handler(
+      new Request("http://localhost/health", {
+        headers: { origin: "https://my-dashboard.local" },
+      }),
+    );
+    expect(resp.headers.get("access-control-allow-origin")).toBe("https://my-dashboard.local");
+  });
+
+  it("returns 'null' for Origin NOT in the allowlist", async () => {
+    const config = makeConfig({ corsAllowList: ["https://my-dashboard.local"] } as any);
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test" });
+    const handler = createFetchHandler({ config, auth });
+
+    const resp = await handler(
+      new Request("http://localhost/health", {
+        headers: { origin: "https://evil.example.com" },
+      }),
+    );
+    expect(resp.headers.get("access-control-allow-origin")).toBe("null");
   });
 
   it("falls back to '*' when no Origin header is present (server-to-server)", async () => {
@@ -229,8 +255,23 @@ describe("CORS", () => {
     expect(resp.headers.get("access-control-allow-origin")).toBe("*");
   });
 
-  it("OPTIONS echoes Origin too", async () => {
+  it("OPTIONS returns 'null' for unknown Origin", async () => {
     const config = makeConfig();
+    const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test" });
+    const handler = createFetchHandler({ config, auth });
+
+    const resp = await handler(
+      new Request("http://localhost/v1/models", {
+        method: "OPTIONS",
+        headers: { origin: "https://evil.example.com" },
+      }),
+    );
+    expect(resp.status).toBe(204);
+    expect(resp.headers.get("access-control-allow-origin")).toBe("null");
+  });
+
+  it("OPTIONS echoes Origin when in allowlist", async () => {
+    const config = makeConfig({ corsAllowList: ["https://my-dashboard.local"] } as any);
     const auth = new AuthManager({ mode: "apikey", provider: "zai", apiKey: "test" });
     const handler = createFetchHandler({ config, auth });
 

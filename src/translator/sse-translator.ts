@@ -12,10 +12,33 @@ interface TranslationState {
   roleSent: boolean;
   inputTokens: number;
   outputTokens: number;
+  /**
+   * Tracks active tool_use content blocks by their Anthropic block index.
+   * Key = Anthropic block index (from content_block_start.index).
+   * Value = { openaiIndex, id, name }.
+   *
+   * The OpenAI tool_calls array uses its own `index` (0, 1, 2...) which is
+   * separate from Anthropic's block index (text blocks and tool_use blocks
+   * share the same Anthropic index space). We assign each tool_use block a
+   * sequential OpenAI index when it starts, so OpenAI clients can correlate
+   * the initial `tool_calls[i].function.name` chunk with subsequent
+   * `tool_calls[i].function.arguments` delta chunks.
+   */
+  toolBlocks: Map<number, { openaiIndex: number; id: string; name: string }>;
+  /** Counter for assigning OpenAI tool_calls indices. */
+  nextToolIndex: number;
 }
 
 function initState(model: string): TranslationState {
-  return { messageId: "", model, roleSent: false, inputTokens: 0, outputTokens: 0 };
+  return {
+    messageId: "",
+    model,
+    roleSent: false,
+    inputTokens: 0,
+    outputTokens: 0,
+    toolBlocks: new Map(),
+    nextToolIndex: 0,
+  };
 }
 
 function makeChunk(
@@ -123,14 +146,65 @@ function translateEvent(state: TranslationState, sse: ParsedSSE): string | null 
       return null;
     }
 
+    case "content_block_start": {
+      // vceshi0.0.8+: handle tool_use blocks. Previously this case was
+      // skipped entirely, which meant OpenAI clients never received the
+      // tool_call's id / name — the streaming tool_use was completely
+      // lost. Now we emit an OpenAI-style tool_calls delta with the
+      // initial id + name + empty arguments string; subsequent
+      // input_json_delta events append to the arguments string.
+      const block = (data as any).content_block;
+      const blockIdx = (data as any).index ?? 0;
+      if (block?.type === "tool_use") {
+        const openaiIdx = state.nextToolIndex++;
+        state.toolBlocks.set(blockIdx, {
+          openaiIndex: openaiIdx,
+          id: block.id ?? `call_${blockIdx}`,
+          name: block.name ?? "",
+        });
+        return makeChunk(state, {
+          tool_calls: [{
+            index: openaiIdx,
+            id: block.id ?? `call_${blockIdx}`,
+            type: "function",
+            function: { name: block.name ?? "", arguments: "" },
+          }],
+        });
+      }
+      // text blocks (and any other block type) don't need an open chunk in
+      // the OpenAI format — OpenAI just streams content deltas directly.
+      return null;
+    }
+
     case "content_block_delta": {
       const delta = (data as any).delta;
       if (delta?.type === "text_delta") {
         return makeChunk(state, { content: delta.text });
       }
       if (delta?.type === "input_json_delta") {
-        return null;
+        // Forward the partial JSON arguments to the matching OpenAI
+        // tool_call entry. The Anthropic block index tells us which
+        // tool_use block this delta belongs to.
+        const blockIdx = (data as any).index ?? 0;
+        const tool = state.toolBlocks.get(blockIdx);
+        if (!tool) return null; // orphan delta — drop
+        return makeChunk(state, {
+          tool_calls: [{
+            index: tool.openaiIndex,
+            function: { arguments: delta.partial_json ?? "" },
+          }],
+        });
       }
+      return null;
+    }
+
+    case "content_block_stop": {
+      // vceshi0.0.8+: clean up the tool_use block tracking. No OpenAI
+      // event needs to be emitted — OpenAI's format doesn't have an
+      // explicit "tool call ended" marker; the finish_reason carries
+      // that information.
+      const blockIdx = (data as any).index ?? 0;
+      state.toolBlocks.delete(blockIdx);
       return null;
     }
 
@@ -160,8 +234,6 @@ function translateEvent(state: TranslationState, sse: ParsedSSE): string | null 
     }
 
     case "ping":
-    case "content_block_start":
-    case "content_block_stop":
       return null;
 
     default:

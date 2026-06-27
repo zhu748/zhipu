@@ -102,6 +102,98 @@ describe("anthropicSseToOpenaiSse", () => {
     const output = await collectStream(anthropicSseToOpenaiSse(input, "glm-4.6"));
     expect(output).toContain('"finish_reason":"length"');
   });
+
+  it("translates streaming tool_use blocks to OpenAI tool_calls", async () => {
+    // Reproduces the bug where streaming tool_use was completely dropped:
+    // content_block_start with tool_use type was skipped, and
+    // input_json_delta returned null. The OpenAI client never saw the
+    // tool_call id/name/arguments — only the finish_reason="tool_calls"
+    // at the end, with no way to know what the tool call actually was.
+    const sse = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"id":"msg_t1","model":"glm-4.6","usage":{"input_tokens":5,"output_tokens":0}}}',
+      '',
+      'event: content_block_start',
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_abc","name":"get_weather","input":{}}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"city\\""}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":":\\"SF\\"}"}}',
+      '',
+      'event: content_block_stop',
+      'data: {"type":"content_block_stop","index":0}',
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":12}}',
+      '',
+      'event: message_stop',
+      'data: {"type":"message_stop"}',
+      '',
+    ].join('\n');
+    const input = makeStream(sse);
+    const output = await collectStream(anthropicSseToOpenaiSse(input, "glm-4.6"));
+    // The tool_call id + name should reach the OpenAI client.
+    expect(output).toContain('"tool_calls"');
+    expect(output).toContain('"id":"toolu_abc"');
+    expect(output).toContain('"name":"get_weather"');
+    expect(output).toContain('"type":"function"');
+    // The initial arguments should be an empty string.
+    expect(output).toContain('"arguments":""');
+    // The input_json_delta content should be forwarded as arguments deltas.
+    expect(output).toContain('"arguments":"{\\"city\\""');
+    expect(output).toContain('"arguments":":\\"SF\\"}"');
+    // The finish_reason should be tool_calls (mapped from stop_reason=tool_use).
+    expect(output).toContain('"finish_reason":"tool_calls"');
+  });
+
+  it("translates streaming tool_use blocks with text content preceding them", async () => {
+    // Common case: the model first emits a text block ("Let me check..."),
+    // then a tool_use block. Both should be translated correctly and the
+    // OpenAI tool_calls index should be 0 (text blocks don't consume an
+    // OpenAI tool_calls slot).
+    const sse = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"id":"msg_t2","model":"glm-4.6","usage":{"input_tokens":5,"output_tokens":0}}}',
+      '',
+      'event: content_block_start',
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Looking up..."}}',
+      '',
+      'event: content_block_stop',
+      'data: {"type":"content_block_stop","index":0}',
+      '',
+      'event: content_block_start',
+      'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_xyz","name":"search","input":{}}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"q\\":\\"cats\\"}"}}',
+      '',
+      'event: content_block_stop',
+      'data: {"type":"content_block_stop","index":1}',
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":20}}',
+      '',
+      'event: message_stop',
+      'data: {"type":"message_stop"}',
+      '',
+    ].join('\n');
+    const input = makeStream(sse);
+    const output = await collectStream(anthropicSseToOpenaiSse(input, "glm-4.6"));
+    // Text content should be present.
+    expect(output).toContain('"content":"Looking up..."');
+    // Tool call should be present with id/name.
+    expect(output).toContain('"id":"toolu_xyz"');
+    expect(output).toContain('"name":"search"');
+    // Tool call arguments should be forwarded.
+    expect(output).toContain('"arguments":"{\\"q\\":\\"cats\\"}"');
+    // The OpenAI tool_calls index should be 0 (first tool call).
+    expect(output).toContain('"index":0');
+  });
 });
 
 describe("openaiSseToAnthropicSse", () => {

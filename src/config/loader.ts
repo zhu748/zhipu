@@ -24,6 +24,7 @@ const ENV = {
   RETRY_CREDENTIAL_SWITCH_THRESHOLD: "ZCODE_RETRY_CREDENTIAL_SWITCH_THRESHOLD",
   RETRY_EMPTY_STREAM_SWITCH_THRESHOLD: "ZCODE_RETRY_EMPTY_STREAM_SWITCH_THRESHOLD",
   UPSTREAM_TIMEOUT_MS: "ZCODE_UPSTREAM_TIMEOUT_MS",
+  TRUST_PROXY: "ZCODE_PROXY_TRUST_PROXY",
 } as const;
 
 const DEFAULTS = {
@@ -79,6 +80,10 @@ export function loadConfig(path: string): ProxyConfig {
     process.env[ENV.UPSTREAM_TIMEOUT_MS] ?? parsed?.server?.upstreamTimeoutMs,
     DEFAULTS.UPSTREAM_TIMEOUT_MS,
   );
+  // trustProxy: explicit env or YAML flag. Default false — client IP comes
+  // from the TCP socket (Bun's server.requestIP), which cannot be spoofed.
+  const trustProxyRaw = process.env[ENV.TRUST_PROXY] ?? parsed?.server?.trustProxy;
+  const trustProxy = trustProxyRaw === true || trustProxyRaw === "true" || trustProxyRaw === "1";
 
   // --- auth ---
   const proxyApiKey = process.env[ENV.PROXY_API_KEY] ?? parsed?.auth?.proxyApiKey;
@@ -177,7 +182,7 @@ export function loadConfig(path: string): ProxyConfig {
     : "max";
 
   const config: ProxyConfig = {
-    server: { port, host, upstreamTimeoutMs: upstreamTimeoutMs || undefined },
+    server: { port, host, upstreamTimeoutMs: upstreamTimeoutMs || undefined, trustProxy },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
     provider,
     plan,

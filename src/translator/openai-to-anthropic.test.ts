@@ -94,6 +94,68 @@ describe("translateRequestOpenAIToAnthropic", () => {
     expect(result.tools![0].description).toBe("Search the web");
     expect(result.tools![0].input_schema).toBeDefined();
   });
+
+  it("drops tools and tool_choice when tool_choice is 'none'", () => {
+    const req: OpenAIChatRequest = {
+      model: "glm-4.6",
+      messages: [{ role: "user", content: "Hi" }],
+      tools: [{
+        type: "function",
+        function: {
+          name: "search",
+          description: "Search the web",
+          parameters: { type: "object" },
+        },
+      }],
+      tool_choice: "none",
+    };
+    const result = translateRequestOpenAIToAnthropic(req);
+    expect(result.tools).toBeUndefined();
+    expect(result.tool_choice).toBeUndefined();
+  });
+
+  it("translates tool_choice 'required' to { type: 'any' }", () => {
+    const req: OpenAIChatRequest = {
+      model: "glm-4.6",
+      messages: [{ role: "user", content: "Hi" }],
+      tools: [{
+        type: "function",
+        function: { name: "search", parameters: { type: "object" } },
+      }],
+      tool_choice: "required",
+    };
+    const result = translateRequestOpenAIToAnthropic(req);
+    expect(result.tool_choice).toEqual({ type: "any" });
+    expect(result.tools).toHaveLength(1);
+  });
+
+  it("translates tool_choice 'auto' to { type: 'auto' }", () => {
+    const req: OpenAIChatRequest = {
+      model: "glm-4.6",
+      messages: [{ role: "user", content: "Hi" }],
+      tools: [{
+        type: "function",
+        function: { name: "search", parameters: { type: "object" } },
+      }],
+      tool_choice: "auto",
+    };
+    const result = translateRequestOpenAIToAnthropic(req);
+    expect(result.tool_choice).toEqual({ type: "auto" });
+  });
+
+  it("translates object-form tool_choice to { type: 'tool', name }", () => {
+    const req: OpenAIChatRequest = {
+      model: "glm-4.6",
+      messages: [{ role: "user", content: "Hi" }],
+      tools: [{
+        type: "function",
+        function: { name: "search", parameters: { type: "object" } },
+      }],
+      tool_choice: { type: "function", function: { name: "search" } },
+    };
+    const result = translateRequestOpenAIToAnthropic(req);
+    expect(result.tool_choice).toEqual({ type: "tool", name: "search" });
+  });
 });
 
 describe("translateResponseAnthropicToOpenAI", () => {

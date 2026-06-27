@@ -2390,7 +2390,7 @@ async function loadOverview(){
     const heroIcon=document.getElementById('heroIcon');
     const heroTitle=document.getElementById('heroTitle');
     if(health.ok){
-      document.getElementById('healthInfo').innerHTML='<span class="badge badge-success"><span class="badge-dot"></span>健康</span> &nbsp; 提供商：<strong>'+c.provider+'</strong>';
+      document.getElementById('healthInfo').innerHTML='<span class="badge badge-success"><span class="badge-dot"></span>健康</span> &nbsp; 提供商：<strong>'+escapeHtml(c.provider)+'</strong>';
       heroTitle.textContent='服务运行中';
       heroIcon.classList.remove('danger');
     }else{
@@ -2769,26 +2769,26 @@ function filterAccounts(){
     if(isDisabled) statusBadge+=' <span class="badge badge-danger">已禁用</span>';
     // vceshi0.0.6+: disable/enable toggle button
     const toggleBtn=isDisabled
-      ?`<button class="btn btn-success btn-sm" onclick="toggleDisabled('${escapeHtml(a.id)}',false)" title="启用此凭证">启用</button> `
-      :`<button class="btn btn-warn btn-sm" onclick="toggleDisabled('${escapeHtml(a.id)}',true)" title="禁用此凭证（不会被激活或自动切换到）">禁用</button> `;
+      ?`<button class="btn btn-success btn-sm" onclick="toggleDisabled('${escapeJsString(a.id)}',false)" title="启用此凭证">启用</button> `
+      :`<button class="btn btn-warn btn-sm" onclick="toggleDisabled('${escapeJsString(a.id)}',true)" title="禁用此凭证（不会被激活或自动切换到）">禁用</button> `;
     return `<tr>
-      <td><input value="${escapeHtml(displayName)}" onchange="renameAccount('${escapeHtml(a.id)}',this.value)" title="${a.name?'编辑名称（清空将回退到自动标签）':'编辑自动标签'}" ${isDisabled?'style="opacity:0.5"':''}></td>
+      <td><input value="${escapeHtml(displayName)}" onchange="renameAccount('${escapeJsString(a.id)}',this.value)" title="${a.name?'编辑名称（清空将回退到自动标签）':'编辑自动标签'}" ${isDisabled?'style="opacity:0.5"':''}></td>
       <td><span class="badge badge-info">${escapeHtml(a.provider)}</span></td>
-      <td><select onchange="changePlan('${escapeHtml(a.id)}',this.value)" ${isDisabled?'style="opacity:0.5"':''}><option value="coding-plan"${planVal==='coding-plan'?' selected':''}>Coding</option><option value="start-plan"${planVal==='start-plan'?' selected':''}>Start</option></select></td>
+      <td><select onchange="changePlan('${escapeJsString(a.id)}',this.value)" ${isDisabled?'style="opacity:0.5"':''}><option value="coding-plan"${planVal==='coding-plan'?' selected':''}>Coding</option><option value="start-plan"${planVal==='start-plan'?' selected':''}>Start</option></select></td>
       <td class="td-mono">${proxyBadge}${escapeHtml(a.apiKeyMask)}${a.hasSecret?' <span class="badge badge-success">secret</span>':''}${a.hasJwt?' <span class="badge badge-success">jwt</span>':''}</td>
       <td>${emailCell}</td>
       <td>${usageCell}</td>
       <td class="td-mute">${escapeHtml(created)}</td>
       <td>${statusBadge}</td>
       <td class="td-actions">
-        <button class="btn btn-ghost btn-sm" onclick="openAccountDetail('${escapeHtml(a.id)}')" title="查看完整凭证信息">查看</button>
-        <button class="btn btn-ghost btn-sm" onclick="openEditModal('${escapeHtml(a.id)}')" title="编辑名称和邮箱">编辑</button>
-        <button class="btn btn-ghost btn-sm" onclick="exportSingleAccountJson('${escapeHtml(a.id)}')" title="导出此账号的 JSON 凭证">导出</button>
-        <button class="btn btn-ghost btn-sm" onclick="checkQuota('${escapeHtml(a.id)}')" title="查询上游额度">额度</button>
-        <button class="btn btn-ghost btn-sm" onclick="openProxyModal('${escapeHtml(a.id)}','${escapeHtml(a.proxy||'')}',this.getAttribute('data-provider'))" data-provider="${escapeHtml(a.provider)}" title="配置代理">代理</button>
+        <button class="btn btn-ghost btn-sm" onclick="openAccountDetail('${escapeJsString(a.id)}')" title="查看完整凭证信息">查看</button>
+        <button class="btn btn-ghost btn-sm" onclick="openEditModal('${escapeJsString(a.id)}')" title="编辑名称和邮箱">编辑</button>
+        <button class="btn btn-ghost btn-sm" onclick="exportSingleAccountJson('${escapeJsString(a.id)}')" title="导出此账号的 JSON 凭证">导出</button>
+        <button class="btn btn-ghost btn-sm" onclick="checkQuota('${escapeJsString(a.id)}')" title="查询上游额度">额度</button>
+        <button class="btn btn-ghost btn-sm" onclick="openProxyModal('${escapeJsString(a.id)}','${escapeJsString(a.proxy||'')}',this.getAttribute('data-provider'))" data-provider="${escapeHtml(a.provider)}" title="配置代理">代理</button>
         ${toggleBtn}
-        ${(isActive||isDisabled)?'':`<button class="btn btn-primary btn-sm" onclick="activateAccount('${escapeHtml(a.id)}')">激活</button> `}
-        <button class="btn btn-danger btn-sm" onclick="deleteAccount('${escapeHtml(a.id)}','${escapeHtml(displayName).replace(/'/g,'\\\'')}')">删除</button>
+        ${(isActive||isDisabled)?'':`<button class="btn btn-primary btn-sm" onclick="activateAccount('${escapeJsString(a.id)}')">激活</button> `}
+        <button class="btn btn-danger btn-sm" onclick="deleteAccount('${escapeJsString(a.id)}','${escapeJsString(displayName)}')">删除</button>
       </td>
     </tr>`;
   }).join('');
@@ -3023,7 +3023,7 @@ async function openEditModal(id){
       </div>
       <div class="modal-footer">
         <button class="btn btn-ghost" onclick="closeModal('editModal')">取消</button>
-        <button class="btn btn-primary" onclick="saveAccountEdit('${escapeHtml(id)}')">保存</button>
+        <button class="btn btn-primary" onclick="saveAccountEdit('${escapeJsString(id)}')">保存</button>
       </div>
     </div>
   </div>`;
@@ -3465,7 +3465,7 @@ async function exportRenderCredential(){
             <pre style="background:var(--bg-1);border-radius:6px;padding:12px;font-family:monospace;font-size:11px;line-height:1.6;overflow:auto;max-height:180px;margin:0;color:var(--text-1);">${escapeHtml(d.json)}</pre>
           </div>
           <div style="display:flex;gap:8px;">
-            <button onclick="navigator.clipboard.writeText('${d.credential}').then(()=>toast('已复制 base64 凭证到剪贴板','success')).catch(()=>toast('复制失败，请手动选择','error'))" style="background:var(--primary);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;">
+            <button onclick="navigator.clipboard.writeText('${escapeJsString(d.credential)}').then(()=>toast('已复制 base64 凭证到剪贴板','success')).catch(()=>toast('复制失败，请手动选择','error'))" style="background:var(--primary);color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;">
               📋 复制 ZCODE_OAUTH_CREDENTIAL
             </button>
             <button onclick="this.closest('div[style*=fixed]').remove()" style="background:var(--bg-2);color:var(--text-1);border:1px solid var(--border);padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;">
@@ -3519,6 +3519,22 @@ async function importAccountsFromFile(input){
   input.value='';
 }
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+// Escape a string for safe interpolation inside a JavaScript single-quoted
+// string literal embedded in an HTML attribute. escapeHtml alone is NOT
+// sufficient here — the HTML parser decodes &#39; back to ' before passing
+// the attribute value to the JS engine, so a value like "x',alert(1)//"
+// would break out of the string context. escapeJsString emits a literal
+// backslash escape that the JS engine sees as a normal character.
+function escapeJsString(s){
+  return String(s)
+    .replace(/\\/g,'\\\\')   // backslash first
+    .replace(/'/g,"\\'")     // single quote
+    .replace(/"/g,'\\"')     // double quote (for safety in mixed contexts)
+    .replace(/\n/g,'\\n')    // newline
+    .replace(/\r/g,'\\r')    // carriage return
+    .replace(/\u2028/g,'\\u2028') // line separator (breaks JS parsers)
+    .replace(/\u2029/g,'\\u2029'); // paragraph separator
+}
 
 // --- OAuth ---
 let currentFlowId=sessionStorage.getItem('zcodeOAuthFlowId')||null;
@@ -3687,7 +3703,7 @@ async function submitCallback(){
     });
     const d=await r.json();
     if(r.ok){
-      resultBox.innerHTML=`<div class="hint" style="background:var(--success-soft);border-color:var(--success);border-left-color:var(--success)"><span class="hint-icon" style="color:var(--success)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span><div><strong>授权成功！</strong><br>提供商：<strong>${d.provider}</strong> &nbsp; API Key：<code class="code-inline">${d.apiKeyMask}</code>${d.userId?`<br>用户 ID：<code class="code-inline">${d.userId}</code>`:''}</div></div>`;
+      resultBox.innerHTML=`<div class="hint" style="background:var(--success-soft);border-color:var(--success);border-left-color:var(--success)"><span class="hint-icon" style="color:var(--success)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></span><div><strong>授权成功！</strong><br>提供商：<strong>${escapeHtml(d.provider)}</strong> &nbsp; API Key：<code class="code-inline">${escapeHtml(d.apiKeyMask)}</code>${d.userId?`<br>用户 ID：<code class="code-inline">${escapeHtml(d.userId)}</code>`:''}</div></div>`;
       toast('凭证保存成功','success');
       if(oauthExpiryTimer)clearInterval(oauthExpiryTimer);
       // vceshi0.0.7+: cancel any in-flight poll loop so it doesn't update
@@ -3700,11 +3716,11 @@ async function submitCallback(){
       // wouldn't appear in the multi-account table without this.
       loadAccountInfo();loadCredStore();loadAccountsList();
     }else{
-      resultBox.innerHTML=`<div class="hint hint-danger"><span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></span><div><strong>失败：</strong>${d.error||'换取失败'}${d.message?`<br>${d.message}`:''}</div></div>`;
+      resultBox.innerHTML=`<div class="hint hint-danger"><span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></span><div><strong>失败：</strong>${escapeHtml(d.error||'换取失败')}${d.message?`<br>${escapeHtml(d.message)}`:''}</div></div>`;
       toast(d.error||'回调换取失败','error');
     }
   }catch(e){
-    resultBox.innerHTML=`<div class="hint hint-danger"><span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></span><div><strong>错误：</strong>${e.message}</div></div>`;
+    resultBox.innerHTML=`<div class="hint hint-danger"><span class="hint-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></span><div><strong>错误：</strong>${escapeHtml(e.message)}</div></div>`;
     toast('回调提交失败','error');
   }
 }
@@ -4039,7 +4055,7 @@ function renderResponsesThinkingChips(){
     const reasoningTag=m.reasoning?'<span class="badge badge-info" style="margin-left:6px;font-size:9px;padding:1px 5px;">reasoning</span>':'';
     const cls=on?'btn btn-success btn-sm':'btn btn-ghost btn-sm';
     const check=on?'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px;"><polyline points="20 6 9 17 4 12"/></svg>':'';
-    return `<button type="button" class="${cls}" onclick="toggleResponsesThinking('${escapeHtml(m.id)}')" style="font-family:var(--font-mono);font-size:12px;">${check}${escapeHtml(m.id)}${reasoningTag}</button>`;
+    return `<button type="button" class="${cls}" onclick="toggleResponsesThinking('${escapeJsString(m.id)}')" style="font-family:var(--font-mono);font-size:12px;">${check}${escapeHtml(m.id)}${reasoningTag}</button>`;
   }).join('');
 }
 function toggleResponsesThinking(modelId){
@@ -4147,7 +4163,7 @@ async function loadDebugDumps(){
       <td><span class="badge badge-danger">${d.status}</span></td>
       <td class="td-mono" style="max-width:300px;overflow:hidden;text-overflow:ellipsis">${escapeHtml((d.upstreamError||'').slice(0,100))}</td>
       <td class="td-mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(d.anthropicBeta||'(none)')}</td>
-      <td class="td-actions"><button class="btn btn-primary btn-sm" onclick="viewDebugDump('${escapeHtml(d.id)}')">查看详情</button></td>
+      <td class="td-actions"><button class="btn btn-primary btn-sm" onclick="viewDebugDump('${escapeJsString(d.id)}')">查看详情</button></td>
     </tr>`).join('');
   }catch(e){console.error('loadDebugDumps failed:',e);tb.innerHTML='<tr><td colspan="6"><div class="empty-state" style="color:var(--danger)">加载失败</div></td></tr>'}
 }

@@ -764,6 +764,147 @@ describe("/admin/api/verify — security warning", () => {
     const resp = await callAdmin(req, opts);
     expect(resp!.status).toBe(401); // token check fails, but request reaches /verify
   });
+
+  it("rate-limits /verify after too many failures from the same IP", async () => {
+    // Use a resolver that returns a stable non-loopback IP so failures are
+    // tracked against a single bucket.
+    const opts = makeAdminOpts({
+      config: makeConfig({ auth: { mode: "apikey", apiKey: "test", proxyApiKey: "proxy-secret" } }),
+      resolveClientIp: () => "203.0.113.42",
+    });
+    // Send 10 wrong tokens — should all return 401.
+    for (let i = 0; i < 10; i++) {
+      const resp = await callAdmin(authedReq("/admin/api/verify", { token: "wrong" }), opts);
+      expect(resp!.status).toBe(401);
+    }
+    // 11th attempt — locked out.
+    const resp = await callAdmin(authedReq("/admin/api/verify", { token: "wrong" }), opts);
+    expect(resp!.status).toBe(429);
+  });
+
+  it("clears the failure counter after a successful verify", async () => {
+    const opts = makeAdminOpts({
+      config: makeConfig({ auth: { mode: "apikey", apiKey: "test", proxyApiKey: "proxy-secret" } }),
+      resolveClientIp: () => "203.0.113.43",
+    });
+    for (let i = 0; i < 5; i++) {
+      await callAdmin(authedReq("/admin/api/verify", { token: "wrong" }), opts);
+    }
+    // Correct token — should clear the counter and return 200.
+    const ok = await callAdmin(authedReq("/admin/api/verify", { token: "proxy-secret" }), opts);
+    expect(ok!.status).toBe(200);
+    // After clear, 5 more wrong tokens should NOT be locked (need 10).
+    for (let i = 0; i < 5; i++) {
+      const resp = await callAdmin(authedReq("/admin/api/verify", { token: "wrong" }), opts);
+      expect(resp!.status).toBe(401);
+    }
+  });
+});
+
+describe("/admin API — security headers", () => {
+  it("dashboard HTML response includes CSP / X-Frame-Options / nosniff", async () => {
+    const opts = makeAdminOpts();
+    const resp = await callAdmin(new Request("http://localhost/admin"), opts);
+    expect(resp!.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+    expect(resp!.headers.get("x-frame-options")).toBe("DENY");
+    expect(resp!.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(resp!.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("API JSON responses include security headers", async () => {
+    const opts = makeAdminOpts({
+      config: makeConfig({ auth: { mode: "apikey", apiKey: "test", proxyApiKey: "proxy-secret" } }),
+    });
+    const resp = await callAdmin(authedReq("/admin/api/verify"), opts);
+    expect(resp!.headers.get("x-frame-options")).toBe("DENY");
+    expect(resp!.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+});
+
+describe("/admin API — request body size limit", () => {
+  it("rejects JSON body larger than 1 MiB with 413", async () => {
+    const opts = makeAdminOpts({
+      config: makeConfig({ auth: { mode: "apikey", apiKey: "test", proxyApiKey: "proxy-secret" } }),
+    });
+    // Build a ~2 MiB JSON body.
+    const big = { id: "x", label: "A".repeat(2 * 1024 * 1024) };
+    const req = authedReq("/admin/api/accounts/active", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(big),
+    });
+    const resp = await callAdmin(req, opts);
+    expect(resp!.status).toBe(413);
+  });
+
+  it("accepts JSON body under the limit", async () => {
+    const opts = makeAdminOpts({
+      config: makeConfig({ auth: { mode: "apikey", apiKey: "test", proxyApiKey: "proxy-secret" } }),
+    });
+    const small = { id: "nonexistent", label: "ok" };
+    const req = authedReq("/admin/api/accounts/label", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(small),
+    });
+    const resp = await callAdmin(req, opts);
+    // 404 because the account doesn't exist — but NOT 413.
+    expect(resp!.status).toBe(404);
+  });
+});
+
+describe("/admin API — loopback gate with requestIP", () => {
+  it("allows admin API when resolveClientIp returns a loopback IP", async () => {
+    const opts = makeAdminOpts({
+      config: makeConfig({ auth: { mode: "apikey", apiKey: "test" /* no proxyApiKey */ } }),
+      resolveClientIp: () => "127.0.0.1",
+    });
+    const resp = await callAdmin(authedReq("/admin/api/config"), opts);
+    expect(resp!.status).toBe(200);
+  });
+
+  it("rejects admin API when resolveClientIp returns a non-loopback IP", async () => {
+    const opts = makeAdminOpts({
+      config: makeConfig({ auth: { mode: "apikey", apiKey: "test" /* no proxyApiKey */ } }),
+      resolveClientIp: () => "203.0.113.99",
+    });
+    const resp = await callAdmin(authedReq("/admin/api/config"), opts);
+    expect(resp!.status).toBe(401);
+    expect(await resp!.json()).toMatchObject({ error: { type: "authentication_required" } });
+  });
+
+  it("ignores X-Forwarded-For when trustProxy is false", async () => {
+    const opts = makeAdminOpts({
+      config: makeConfig({ auth: { mode: "apikey", apiKey: "test" /* no proxyApiKey */ } }),
+      resolveClientIp: () => "203.0.113.99", // real socket IP is non-loopback
+    });
+    // Attacker spoofs XFF to claim loopback — should be ignored.
+    const req = new Request("http://localhost/admin/api/config", {
+      headers: {
+        "x-forwarded-for": "127.0.0.1",
+        "x-real-ip": "127.0.0.1",
+        authorization: "Bearer ignored",
+      },
+    });
+    const resp = await callAdmin(req, opts);
+    expect(resp!.status).toBe(401);
+  });
+
+  it("trusts X-Forwarded-For when trustProxy is true", async () => {
+    const opts = makeAdminOpts({
+      config: makeConfig({ server: { port: 8080, host: "127.0.0.1", trustProxy: true } as any }),
+      resolveClientIp: () => "203.0.113.99", // real socket is the reverse proxy (non-loopback)
+    });
+    // Reverse proxy sets XFF to the real client, which is loopback → allowed.
+    const req = new Request("http://localhost/admin/api/config", {
+      headers: {
+        "x-forwarded-for": "127.0.0.1",
+        authorization: "Bearer ignored",
+      },
+    });
+    const resp = await callAdmin(req, opts);
+    expect(resp!.status).toBe(200);
+  });
 });
 
 // ---------------------------------------------------------------------------

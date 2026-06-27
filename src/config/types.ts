@@ -171,6 +171,17 @@ export interface ProxyConfig {
      * leak resources indefinitely). Default: 300000 (5 minutes).
      */
     upstreamTimeoutMs?: number;
+    /**
+     * Whether to trust X-Forwarded-For / X-Real-IP headers for client IP
+     * detection. Enable ONLY when the proxy is behind a trusted reverse proxy
+     * (e.g., nginx, Caddy, Render's load balancer) that overwrites these
+     * headers. Default: false — client IP is read from the TCP socket via
+     * Bun's server.requestIP(), which cannot be spoofed by the client.
+     *
+     * When false, XFF/X-Real-IP headers are ignored entirely. When true,
+     * X-Real-IP takes precedence, then the first entry of X-Forwarded-For.
+     */
+    trustProxy?: boolean;
   };
   auth: AuthConfig;
   /** Active upstream provider. */

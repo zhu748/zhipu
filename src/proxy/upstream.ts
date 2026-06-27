@@ -131,13 +131,41 @@ function getSessionId(clientFingerprint: string): string {
 /**
  * Derive a stable client fingerprint from the inbound request.
  *
- * Uses the client IP (X-Forwarded-For first hop, fallback to socket remote)
- * combined with the Authorization / x-api-key header (so two different proxy
- * users on the same IP don't share a session).
+ * vceshi0.0.8+ SECURITY: previously this read X-Forwarded-For unconditionally,
+ * which meant any client could spoof XFF to share/pollute another user's
+ * upstream session ID — potentially causing cross-user session stickiness on
+ * the upstream WAF. Now the fingerprint uses:
+ *   1. The TCP socket peer address (via resolveClientIp, wired to Bun's
+ *      server.requestIP) — un-spoofable, the default in production.
+ *   2. X-Forwarded-For / X-Real-IP ONLY when the operator has explicitly
+ *      opted in via `config.server.trustProxy = true` (because the proxy
+ *      is behind a trusted reverse proxy).
+ *   3. The empty string when neither is available (e.g., tests with no
+ *      socket and no trustProxy). Combined with the auth header slice,
+ *      this still produces a per-user-stable fingerprint.
+ *
+ * The auth header (Authorization / x-api-key) is always included so that
+ * two different proxy users on the same IP don't share a session.
  */
-function clientFingerprint(req: Request): string {
-  const xff = req.headers.get("x-forwarded-for");
-  const ip = xff ? xff.split(",")[0].trim() : "";
+function clientFingerprint(
+  req: Request,
+  resolveClientIp?: (req: Request) => string | undefined,
+  trustProxy?: boolean,
+): string {
+  let ip = "";
+  if (resolveClientIp) {
+    try { ip = resolveClientIp(req) ?? ""; } catch { /* ignore */ }
+  }
+  if (!ip && trustProxy) {
+    // Only fall back to XFF when the operator has explicitly trusted it.
+    const xRealIp = req.headers.get("x-real-ip");
+    if (xRealIp) {
+      ip = xRealIp;
+    } else {
+      const xff = req.headers.get("x-forwarded-for");
+      if (xff) ip = xff.split(",")[0].trim();
+    }
+  }
   const auth = req.headers.get("authorization") ?? req.headers.get("x-api-key") ?? "";
   return `${ip}::${auth.slice(0, 32)}`;
 }
@@ -268,9 +296,16 @@ export function buildUpstreamRequest(
   identity: ProxyIdentity,
   plan: "coding-plan" | "start-plan" = "coding-plan",
   extraHeaders?: Record<string, string>,
+  /**
+   * vceshi0.0.8+: socket-aware client IP resolver, used for the session
+   * fingerprint. See clientFingerprint() docstring for the security
+   * rationale. When omitted, falls back to XFF only if trustProxy is true.
+   */
+  resolveClientIp?: (req: Request) => string | undefined,
+  trustProxy?: boolean,
 ): Request {
   const url = buildUpstreamURL(format, provider, plan);
-  const fp = clientFingerprint(clientReq);
+  const fp = clientFingerprint(clientReq, resolveClientIp, trustProxy);
   const authHeaders = buildAuthHeaders(format, cred, identity, plan, fp);
   const passthrough = collectPassthroughHeaders(clientReq);
 

@@ -42,6 +42,14 @@ export function translateRequestOpenAIToAnthropic(req: OpenAIChatRequest): Anthr
   if (req.top_p !== undefined) result.top_p = req.top_p;
   if (req.stream !== undefined) result.stream = req.stream;
   if (req.stop) result.stop_sequences = Array.isArray(req.stop) ? req.stop : [req.stop];
+  // tool_choice "none" means "do not call any tools" — Anthropic has no "none"
+  // enum, so we achieve the same effect by dropping the tools array entirely
+  // AND not setting tool_choice. Returning { type: "any" } here would have the
+  // *opposite* semantics ("must call a tool") when tools is non-empty.
+  if (req.tool_choice === "none") {
+    return result;
+  }
+
   if (req.tools?.length) {
     result.tools = req.tools.map(translateToolOpenAIToAnthropic);
   }
@@ -131,13 +139,16 @@ function translateToolOpenAIToAnthropic(tool: OpenAIToolDefinition): AnthropicTo
  * Translate OpenAI tool_choice to Anthropic tool_choice format.
  * OpenAI: "none" | "auto" | "required" | { type: "function", function: { name: string } }
  * Anthropic: { type: "auto" | "any" | "tool", name?: string }
+ *
+ * NOTE: "none" is handled by the caller — when tool_choice === "none" we drop
+ * both the tools array and tool_choice so the model has no tools to call.
+ * This function must never receive "none".
  */
 function translateToolChoiceOpenAIToAnthropic(
   toolChoice: string | { type: "function"; function: { name: string } },
 ): { type: "auto" | "any" | "tool"; name?: string } {
   if (typeof toolChoice === "string") {
     switch (toolChoice) {
-      case "none": return { type: "any" }; // Anthropic has no "none"; "any" with empty tools effectively disables
       case "required": return { type: "any" };
       case "auto":
       default: return { type: "auto" };

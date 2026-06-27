@@ -200,6 +200,47 @@ describe("buildUpstreamRequest", () => {
     expect(upstream.headers.get("authorization")).toBe("Bearer testkey.testsecret");
     expect(upstream.headers.get("x-api-key")).toBeNull();
   });
+
+  it("uses resolveClientIp for the session fingerprint (NOT XFF) when trustProxy is false", () => {
+    // vceshi0.0.8+: the session fingerprint must come from the TCP socket
+    // (resolveClientIp), NOT from X-Forwarded-For, unless the operator has
+    // explicitly opted in via trustProxy=true. Without this gate, any client
+    // could spoof XFF to share/pollute another user's upstream session ID.
+    const clientReq = makeClientReq("{}", {
+      "x-forwarded-for": "203.0.113.42", // attacker-controlled, must be IGNORED
+      "x-real-ip": "203.0.113.42", // ditto
+      authorization: "Bearer user-token",
+    });
+    const resolver = () => "198.51.100.1"; // the real socket peer
+    const upstream1 = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY, "coding-plan", undefined, resolver, false);
+    const upstream2 = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY, "coding-plan", undefined, resolver, false);
+    // Same resolver result + same auth → same session ID.
+    expect(upstream1.headers.get("x-session-id")).toBe(upstream2.headers.get("x-session-id"));
+  });
+
+  it("uses X-Forwarded-For for the fingerprint ONLY when trustProxy is true", () => {
+    const clientReq = makeClientReq("{}", {
+      "x-forwarded-for": "203.0.113.42",
+      authorization: "Bearer user-token",
+    });
+    // No resolver — trustProxy is the only path that can produce an IP.
+    const upstream = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY, "coding-plan", undefined, undefined, true);
+    const upstream2 = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY, "coding-plan", undefined, undefined, true);
+    // Same XFF + same auth → same session ID.
+    expect(upstream.headers.get("x-session-id")).toBe(upstream2.headers.get("x-session-id"));
+  });
+
+  it("falls back to empty-string IP when neither resolver nor trustProxy is available", () => {
+    const clientReq = makeClientReq("{}", {
+      "x-forwarded-for": "203.0.113.42", // must be ignored
+      authorization: "Bearer user-token",
+    });
+    // No resolver, trustProxy=false → IP is "" but auth still produces a
+    // per-user-stable fingerprint, so session ID is still stable per user.
+    const upstream1 = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
+    const upstream2 = buildUpstreamRequest(clientReq, "anthropic", ZAI_PROVIDER, ZAI_CRED, "{}", IDENTITY);
+    expect(upstream1.headers.get("x-session-id")).toBe(upstream2.headers.get("x-session-id"));
+  });
 });
 
 describe("proxyRequest", () => {

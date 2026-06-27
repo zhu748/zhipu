@@ -34,6 +34,19 @@ export interface AdminOptions {
    * global fetch. Test code passes a mock here to avoid real network calls.
    */
   fetchImpl?: typeof fetch;
+  /**
+   * Resolve the TCP-remote client IP for a request. In production this is
+   * wired to Bun's `server.requestIP(req)?.address`, which reads the real
+   * socket peer address and CANNOT be spoofed by headers. When omitted
+   * (e.g., in tests where there is no real socket), client IP detection
+   * falls back to "unknown" — and the loopback gate then defaults to
+   * allowing the request (preserving the legacy dev behavior for direct
+   * local connections).
+   *
+   * X-Forwarded-For / X-Real-IP are NEVER trusted unless the operator
+   * explicitly opts in via `config.server.trustProxy = true`.
+   */
+  resolveClientIp?: (req: Request) => string | undefined;
 }
 
 // In-memory stats collector.
@@ -512,6 +525,18 @@ export function getDashboardHTML(): string {
 
 /** Handle admin API routes. Returns null if the path doesn't match. */
 export async function handleAdminRoute(req: Request, opts: AdminOptions): Promise<Response | null> {
+  const resp = await handleAdminRouteInner(req, opts);
+  if (!resp) return null;
+  // Apply security headers to every admin response (dashboard page + API).
+  // Skipped for SSE streams (logs/stream) — adding headers post-stream-start
+  // is a no-op anyway, and we don't want to interfere with the response
+  // once the streaming writer has flushed.
+  if (resp.headers.get("content-type")?.includes("text/event-stream")) return resp;
+  return withSecurityHeaders(resp);
+}
+
+/** Inner implementation — returns raw responses without security headers. */
+async function handleAdminRouteInner(req: Request, opts: AdminOptions): Promise<Response | null> {
   const url = new URL(req.url);
   const path = url.pathname;
   const method = req.method;
@@ -550,17 +575,25 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
     // still do so by binding to 0.0.0.0 + setting proxyApiKey (recommended)
     // or by accepting the risk and proxying via SSH.
     if (!opts.config.auth.proxyApiKey) {
-      // Detect loopback from X-Forwarded-For (when behind a trusted reverse
-      // proxy) OR from the connection's remote address. Bun exposes the
-      // latter via the `req` Request's underlying socket — but the Fetch
-      // API doesn't expose socket info, so we rely on a header convention.
-      // We check X-Real-IP first (Nginx default), then X-Forwarded-For
-      // (general proxy), then assume loopback if neither is set (direct
-      // local connection — the common dev case).
-      const xRealIp = req.headers.get("x-real-ip") ?? "";
-      const xForwardedFor = req.headers.get("x-forwarded-for") ?? "";
-      const remoteIp = xRealIp || (xForwardedFor ? xForwardedFor.split(",")[0].trim() : "");
-      const isLoopback = remoteIp === ""
+      // Client IP resolution priority:
+      //   1. resolveClientIp (Bun's server.requestIP — TCP socket peer,
+      //      cannot be spoofed by headers)
+      //   2. X-Real-IP / X-Forwarded-For — ONLY when config.server.trustProxy
+      //      is true (operator explicitly opted in because they're behind a
+      //      trusted reverse proxy that overwrites these headers).
+      //   3. "unknown" → defaults to loopback (preserves dev behavior for
+      //      direct local connections and for tests that have no socket).
+      let remoteIp: string | undefined;
+      if (opts.resolveClientIp) {
+        try { remoteIp = opts.resolveClientIp(req); } catch { /* ignore */ }
+      }
+      if (opts.config.server.trustProxy) {
+        const xRealIp = req.headers.get("x-real-ip") ?? "";
+        const xForwardedFor = req.headers.get("x-forwarded-for") ?? "";
+        const xffIp = xRealIp || (xForwardedFor ? xForwardedFor.split(",")[0].trim() : "");
+        if (xffIp) remoteIp = xffIp;
+      }
+      const isLoopback = !remoteIp
         || remoteIp === "127.0.0.1"
         || remoteIp === "::1"
         || remoteIp === "localhost"
@@ -592,14 +625,26 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // the dashboard can surface the security warning to the user instead of
   // silently letting anyone in.
   if (path === "/admin/api/verify" && method === "GET") {
+    const clientIp = resolveIpForRateLimit(req, opts);
+    // Rate-limit: if this IP has exceeded the failure threshold, reject
+    // without even checking the token — prevents timing-based oracle
+    // attacks where an attacker could distinguish "locked" vs "wrong"
+    // by response time.
+    if (isVerifyLocked(clientIp)) {
+      return errorResponse(429, "rate_limited", "Too many failed verification attempts. Try again later.");
+    }
     const authHeader = req.headers.get("authorization") ?? "";
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
     if (!opts.config.auth.proxyApiKey) {
       return jsonResp({ valid: true, warning: "no_auth", message: "proxyApiKey not configured — admin dashboard is open to anyone with network access" });
     }
     if (timingSafeEqual(token, opts.config.auth.proxyApiKey)) {
+      // Successful verification clears the failure counter for this IP,
+      // so a user who mistypes once doesn't carry a strike forever.
+      verifyFailures.delete(clientIp);
       return jsonResp({ valid: true });
     }
+    recordVerifyFailure(clientIp);
     return errorResponse(401, "authentication_error", "Invalid token");
   }
 
@@ -611,7 +656,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Update config
   if (path === "/admin/api/config" && method === "PUT") {
     try {
-      const body = await req.json() as Record<string, unknown>;
+      const parsed = await readJsonBody<Record<string, unknown>>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       // Prevent masked placeholder values from overwriting real secrets.
       // The sanitizeConfig() GET endpoint returns "***configured***" for
       // secret fields; if the dashboard sends those back unchanged we skip them.
@@ -729,7 +776,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Add API key
   if (path === "/admin/api/credentials" && method === "POST") {
     try {
-      const body = await req.json() as { provider: string; apiKey: string; plan?: string; proxy?: string };
+      const parsed = await readJsonBody<{ provider: string; apiKey: string; plan?: string; proxy?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       // Field validation (vceshi0.0.5+): reject empty apiKey / unknown provider
       // before they get persisted as garbage that breaks later requests.
       if (!body.apiKey || typeof body.apiKey !== "string" || !body.apiKey.trim()) {
@@ -798,7 +847,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Switch active account
   if (path === "/admin/api/accounts/active" && method === "PUT") {
     try {
-      const body = await req.json() as { id?: string };
+      const parsed = await readJsonBody<{ id?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (!body.id) return errorResponse(400, "missing_param", "id is required");
       const ok = await switchAccount(body.id);
       if (!ok) return errorResponse(404, "not_found", "Account not found");
@@ -836,7 +887,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Update account label
   if (path === "/admin/api/accounts/label" && method === "PUT") {
     try {
-      const body = await req.json() as { id?: string; label?: string };
+      const parsed = await readJsonBody<{ id?: string; label?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (!body.id || typeof body.label !== "string") {
         return errorResponse(400, "missing_param", "id and label are required");
       }
@@ -851,7 +904,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Update account plan
   if (path === "/admin/api/accounts/plan" && method === "PUT") {
     try {
-      const body = await req.json() as { id?: string; plan?: string };
+      const parsed = await readJsonBody<{ id?: string; plan?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (!body.id || !body.plan) {
         return errorResponse(400, "missing_param", "id and plan are required");
       }
@@ -894,23 +949,50 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Accepts an empty/whitespace string to clear the override.
   if (path === "/admin/api/accounts/proxy" && method === "PUT") {
     try {
-      const body = await req.json() as { id?: string; proxy?: string };
+      const parsed = await readJsonBody<{ id?: string; proxy?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (!body.id || typeof body.id !== "string") {
         return errorResponse(400, "missing_param", "id is required");
       }
       if (typeof body.proxy !== "string") {
         return errorResponse(400, "missing_param", "proxy is required (use empty string to clear)");
       }
-      // Basic scheme validation. We accept http://, https://, socks5://,
-      // and socks5h:// (Bun supports both). Empty string clears the override.
+      // M3 fix: validate via new URL() instead of a loose regex. The old
+      // regex `/^(https?|socks5h?):\/\/[^\s]+$/i` allowed single quotes,
+      // angle brackets and other characters that could escape the inline
+      // onclick JS string in the dashboard, causing stored XSS. URL()
+      // parsing rejects malformed URLs, and we additionally block any
+      // host containing HTML/JS metacharacters as defense-in-depth.
+      // Empty string clears the override.
       const trimmed = body.proxy.trim();
       if (trimmed) {
-        const ok = /^(https?|socks5h?):\/\/[^\s]+$/i.test(trimmed);
-        if (!ok) {
+        let proxyUrl: URL;
+        try {
+          proxyUrl = new URL(trimmed);
+        } catch {
           return errorResponse(
             400,
             "invalid_param",
             "proxy must be a valid URL with scheme http://, https://, socks5://, or socks5h://",
+          );
+        }
+        const allowedProtocols = ["http:", "https:", "socks5:", "socks5h:"];
+        if (!allowedProtocols.includes(proxyUrl.protocol)) {
+          return errorResponse(
+            400,
+            "invalid_param",
+            "proxy must be a valid URL with scheme http://, https://, socks5://, or socks5h://",
+          );
+        }
+        // Reject hosts containing HTML/JS metacharacters — these can never
+        // appear in a legitimate hostname and would escape any inline JS
+        // string context in the dashboard.
+        if (/[<>'"\s]/.test(proxyUrl.host)) {
+          return errorResponse(
+            400,
+            "invalid_param",
+            "proxy host contains invalid characters",
           );
         }
       }
@@ -948,7 +1030,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   //           so the dashboard can render the error message cleanly)
   if (path === "/admin/api/accounts/proxy-test" && method === "POST") {
     try {
-      const body = await req.json() as { proxy?: string; provider?: string };
+      const parsed = await readJsonBody<{ proxy?: string; provider?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (typeof body.proxy !== "string") {
         return errorResponse(400, "missing_param", "proxy is required");
       }
@@ -956,11 +1040,30 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
       if (!trimmed) {
         return errorResponse(400, "invalid_param", "proxy URL cannot be empty (use 'No proxy' on the dashboard instead)");
       }
-      if (!/^(https?|socks5h?):\/\/[^\s]+$/i.test(trimmed)) {
+      // M3 fix: validate via new URL() (consistent with /accounts/proxy).
+      let proxyUrl: URL;
+      try {
+        proxyUrl = new URL(trimmed);
+      } catch {
         return errorResponse(
           400,
           "invalid_param",
           "proxy must be a valid URL with scheme http://, https://, socks5://, or socks5h://",
+        );
+      }
+      const allowedProtocols = ["http:", "https:", "socks5:", "socks5h:"];
+      if (!allowedProtocols.includes(proxyUrl.protocol)) {
+        return errorResponse(
+          400,
+          "invalid_param",
+          "proxy must be a valid URL with scheme http://, https://, socks5://, or socks5h://",
+        );
+      }
+      if (/[<>'"\s]/.test(proxyUrl.host)) {
+        return errorResponse(
+          400,
+          "invalid_param",
+          "proxy host contains invalid characters",
         );
       }
 
@@ -1038,7 +1141,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // per-account so querying account A doesn't block account B.
   if (path === "/admin/api/accounts/quota" && method === "POST") {
     try {
-      const body = await req.json() as { id?: string };
+      const parsed = await readJsonBody<{ id?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (!body.id || typeof body.id !== "string") {
         return errorResponse(400, "missing_param", "id is required and must be a string");
       }
@@ -1104,7 +1209,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // resolve it via the biz API first. See zcode-config.ts.
   if (path === "/admin/api/import" && method === "POST") {
     try {
-      const body = await req.json() as { provider: string; plan?: string };
+      const parsed = await readJsonBody<{ provider: string; plan?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (body.provider !== "zai" && body.provider !== "bigmodel") {
         return errorResponse(400, "invalid_param", "provider must be 'zai' or 'bigmodel'");
       }
@@ -1223,7 +1330,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // fields preserve their current value. Empty string clears the field.
   if (path === "/admin/api/accounts/edit" && method === "PUT") {
     try {
-      const body = await req.json() as { id?: string; name?: string; email?: string };
+      const parsed = await readJsonBody<{ id?: string; name?: string; email?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (!body.id || typeof body.id !== "string") {
         return errorResponse(400, "missing_param", "id is required and must be a string");
       }
@@ -1295,7 +1404,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // When disabled, the credential is excluded from auto-switch + manual activation.
   if (path === "/admin/api/accounts/disabled" && method === "PUT") {
     try {
-      const body = await req.json() as { id?: string; disabled?: boolean };
+      const parsed = await readJsonBody<{ id?: string; disabled?: boolean }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (!body.id || typeof body.id !== "string") {
         return errorResponse(400, "missing_param", "id is required and must be a string");
       }
@@ -1384,7 +1495,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Import accounts from backup
   if (path === "/admin/api/accounts/import" && method === "POST") {
     try {
-      const body = await req.json() as { accounts?: unknown[] };
+      const parsed = await readJsonBody<{ accounts?: unknown[] }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (!Array.isArray(body.accounts)) {
         return errorResponse(400, "invalid_param", "accounts array is required");
       }
@@ -1414,7 +1527,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // OAuth init
   if (path === "/admin/api/oauth/init" && method === "POST") {
     try {
-      const body = await req.json() as { provider?: string; plan?: string };
+      const parsed = await readJsonBody<{ provider?: string; plan?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       // vceshi0.0.7+: validate provider explicitly. The old code did an
       // unchecked `as "zai" | "bigmodel"` cast, which meant an unknown
       // provider would slip through and crash deep inside the OAuth client
@@ -1572,7 +1687,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // User pastes the redirected browser URL (containing ?code=...&state=...) after authorizing
   if (path === "/admin/api/oauth/callback" && method === "POST") {
     try {
-      const body = await req.json() as { flowId?: string; callbackUrl?: string };
+      const parsed = await readJsonBody<{ flowId?: string; callbackUrl?: string }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       const flowId = body.flowId;
       const callbackUrl = body.callbackUrl ?? "";
 
@@ -1701,7 +1818,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // until the user noticed. Now we mirror validateConfigForSave's check.
   if (path === "/admin/api/endpoints" && method === "PUT") {
     try {
-      const body = await req.json() as { zai?: Record<string, unknown>; bigmodel?: Record<string, unknown> };
+      const parsed = await readJsonBody<{ zai?: Record<string, unknown>; bigmodel?: Record<string, unknown> }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       // Validate first; only apply if all fields pass.
       const allowedFields = ["anthropicBase", "openaiBase"] as const;
       for (const provKey of ["zai", "bigmodel"] as const) {
@@ -1750,7 +1869,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Update routing rules (full replace)
   if (path === "/admin/api/routing-rules" && method === "PUT") {
     try {
-      const body = await req.json() as { rules?: Array<{ pattern?: string; provider?: string; endpoint?: string; note?: string }> };
+      const parsed = await readJsonBody<{ rules?: Array<{ pattern?: string; provider?: string; endpoint?: string; note?: string }> }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (!Array.isArray(body.rules)) {
         return errorResponse(400, "invalid_request", "rules must be an array");
       }
@@ -1788,7 +1909,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Update model mappings (full replace)
   if (path === "/admin/api/model-mappings" && method === "PUT") {
     try {
-      const body = await req.json() as { mappings?: Array<{ from?: string; to?: string; note?: string }> };
+      const parsed = await readJsonBody<{ mappings?: Array<{ from?: string; to?: string; note?: string }> }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (!Array.isArray(body.mappings)) {
         return errorResponse(400, "invalid_request", "mappings must be an array");
       }
@@ -1845,7 +1968,9 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
   // Update responses-thinking config (full replace)
   if (path === "/admin/api/responses-thinking" && method === "PUT") {
     try {
-      const body = await req.json() as { models?: unknown };
+      const parsed = await readJsonBody<{ models?: unknown }>(req);
+      if (!parsed.ok) return parsed.error;
+      const body = parsed.body;
       if (!Array.isArray(body.models)) {
         return errorResponse(400, "invalid_request", "models must be an array of strings");
       }
@@ -2089,6 +2214,153 @@ export async function handleAdminRoute(req: Request, opts: AdminOptions): Promis
 }
 
 // --- Helpers ---
+
+/**
+ * Maximum allowed JSON request body size for admin API routes (1 MiB).
+ * All admin mutation endpoints accept small structured payloads (credentials,
+ * config patches, OAuth flow ids) — anything larger is almost certainly
+ * malicious or a misconfigured client. Limiting prevents OOM from a
+ * malicious 1GB JSON body reaching `await req.json()`.
+ */
+const MAX_ADMIN_BODY_BYTES = 1 * 1024 * 1024;
+
+/**
+ * Read and parse a JSON request body with a size limit. Returns
+ * `{ ok: false, error }` when the body is too large or not valid JSON,
+ * so callers can early-return without exception handling boilerplate.
+ */
+async function readJsonBody<T = unknown>(req: Request): Promise<{ ok: true; body: T } | { ok: false; error: Response }> {
+  // Content-Length is set by virtually all well-behaved clients. If it's
+  // missing we still cap the actual read via the streaming check below.
+  const declared = req.headers.get("content-length");
+  if (declared) {
+    const n = parseInt(declared, 10);
+    if (Number.isFinite(n) && n > MAX_ADMIN_BODY_BYTES) {
+      return { ok: false, error: errorResponse(413, "request_too_large", `Request body exceeds ${MAX_ADMIN_BODY_BYTES} byte limit`) };
+    }
+  }
+  // Read the body as text with an explicit cap — defends against clients
+  // that omit Content-Length (chunked transfer encoding) or lie about it.
+  const reader = req.body?.getReader();
+  if (!reader) {
+    // No body — treat as empty object (some GETs reach here erroneously).
+    try { return { ok: true, body: {} as T }; } catch { return { ok: false, error: errorResponse(400, "invalid_request", "Empty body") }; }
+  }
+  let received = 0;
+  const chunks: Uint8Array[] = [];
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > MAX_ADMIN_BODY_BYTES) {
+        try { await reader.cancel(); } catch { /* ignore */ }
+        return { ok: false, error: errorResponse(413, "request_too_large", `Request body exceeds ${MAX_ADMIN_BODY_BYTES} byte limit`) };
+      }
+      chunks.push(value);
+    }
+  } catch (e) {
+    return { ok: false, error: errorResponse(400, "invalid_request", `Failed to read body: ${(e as Error).message}`) };
+  }
+  const text = new TextDecoder().decode(Buffer.concat(chunks));
+  if (!text) return { ok: true, body: {} as T };
+  try {
+    return { ok: true, body: JSON.parse(text) as T };
+  } catch (e) {
+    return { ok: false, error: errorResponse(400, "invalid_request", `Invalid JSON: ${(e as Error).message}`) };
+  }
+}
+
+/** Security headers added to all admin responses (dashboard + API). */
+function withSecurityHeaders(resp: Response): Response {
+  const headers = new Headers(resp.headers);
+  // CSP: only allow same-origin scripts/styles. External connections are
+  // limited to the known upstream OAuth / quota endpoints. Inline scripts
+  // are NOT allowed (dashboard uses inline event handlers today, so we use
+  // 'unsafe-inline' for script-src as a temporary measure — TODO: replace
+  // inline handlers with addEventListener to drop 'unsafe-inline').
+  if (!headers.has("content-security-policy")) {
+    headers.set("content-security-policy",
+      "default-src 'self'; " +
+      "script-src 'self' 'unsafe-inline'; " +
+      "style-src 'self' 'unsafe-inline'; " +
+      "connect-src 'self' https://zcode.z.ai https://api.z.ai https://open.bigmodel.cn; " +
+      "img-src 'self' data:; " +
+      "font-src 'self' data:; " +
+      "frame-ancestors 'none'; " +
+      "base-uri 'self'; " +
+      "form-action 'self'");
+  }
+  if (!headers.has("x-frame-options")) headers.set("x-frame-options", "DENY");
+  if (!headers.has("x-content-type-options")) headers.set("x-content-type-options", "nosniff");
+  if (!headers.has("referrer-policy")) headers.set("referrer-policy", "same-origin");
+  // Dashboard returns secrets on some endpoints — never cache.
+  if (!headers.has("cache-control")) headers.set("cache-control", "no-store");
+  return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers });
+}
+
+/**
+ * In-memory rate limiter for the /admin/api/verify endpoint. Tracks failed
+ * attempts per client IP; after MAX_FAILURES within the WINDOW, all further
+ * attempts from that IP are rejected with 429 until the lockout expires.
+ *
+ * This is a soft limit — it lives in process memory and resets on restart.
+ * Its purpose is to make brute-forcing proxyApiKey impractical from a
+ * single IP, not to defend against a distributed attacker (that requires
+ * proxyApiKey to be strong, which is the operator's responsibility).
+ */
+const VERIFY_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 min
+const VERIFY_RATE_LIMIT_MAX_FAILURES = 10;
+const verifyFailures = new Map<string, { count: number; firstAt: number }>();
+
+/** Record a failed /verify attempt for `ip`. Evicts stale entries to bound memory. */
+function recordVerifyFailure(ip: string): void {
+  const now = Date.now();
+  // Lazy GC: drop entries older than the window.
+  for (const [k, v] of verifyFailures) {
+    if (now - v.firstAt > VERIFY_RATE_LIMIT_WINDOW_MS) verifyFailures.delete(k);
+  }
+  const existing = verifyFailures.get(ip);
+  if (existing) {
+    existing.count++;
+    // If the first attempt is older than the window, reset the counter.
+    if (now - existing.firstAt > VERIFY_RATE_LIMIT_WINDOW_MS) {
+      existing.count = 1;
+      existing.firstAt = now;
+    }
+  } else {
+    verifyFailures.set(ip, { count: 1, firstAt: now });
+  }
+}
+
+/** Returns true if `ip` is currently rate-locked-out. */
+function isVerifyLocked(ip: string): boolean {
+  const v = verifyFailures.get(ip);
+  if (!v) return false;
+  if (Date.now() - v.firstAt > VERIFY_RATE_LIMIT_WINDOW_MS) {
+    verifyFailures.delete(ip);
+    return false;
+  }
+  return v.count >= VERIFY_RATE_LIMIT_MAX_FAILURES;
+}
+
+/** Resolve a client IP for rate-limiting purposes. Prefers the socket-based resolver. */
+function resolveIpForRateLimit(req: Request, opts: AdminOptions): string {
+  if (opts.resolveClientIp) {
+    try {
+      const ip = opts.resolveClientIp(req);
+      if (ip) return ip;
+    } catch { /* ignore */ }
+  }
+  // Fall back to XFF ONLY if trustProxy (consistent with the loopback gate).
+  if (opts.config.server.trustProxy) {
+    const xRealIp = req.headers.get("x-real-ip") ?? "";
+    if (xRealIp) return xRealIp;
+    const xff = req.headers.get("x-forwarded-for") ?? "";
+    if (xff) return xff.split(",")[0].trim();
+  }
+  return "unknown";
+}
 
 function jsonResp(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
