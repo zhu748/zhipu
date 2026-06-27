@@ -878,7 +878,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     expect(parsed.system[2].text).toBe("Custom client instructions");
   });
 
-  it("rewrites 'You are Claude Code' → 'You are ZCode, an interactive coding agent'", () => {
+  it("rewrites 'You are Claude Code' → 'You are ZCode model working in Claude Code'", () => {
     const body = JSON.stringify({
       model: "glm-5.2",
       messages: [{ role: "user", content: "hi" }],
@@ -893,7 +893,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     const parsed = JSON.parse(out as string);
     // Find the rewritten block (it's in the client blocks, after the 2 ZCode blocks)
     const clientBlocks = parsed.system.slice(2);
-    const identityBlock = clientBlocks.find((b: any) => b.text.includes("You are ZCode, an interactive coding agent"));
+    const identityBlock = clientBlocks.find((b: any) => b.text.includes("You are ZCode model working in Claude Code"));
     expect(identityBlock).toBeDefined();
     expect(identityBlock.text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
   });
@@ -912,7 +912,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     const out = transformRequestBody(body, { format: "anthropic" });
     const parsed = JSON.parse(out as string);
     const clientBlocks = parsed.system.slice(2);
-    const identityBlock = clientBlocks.find((b: any) => b.text.includes("You are ZCode, an interactive coding agent"));
+    const identityBlock = clientBlocks.find((b: any) => b.text.includes("You are ZCode model working in Claude Code"));
     expect(identityBlock).toBeDefined();
     expect(identityBlock.text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude");
   });
@@ -935,7 +935,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     const text = Array.isArray(sysMsg.content)
       ? sysMsg.content.map((b: any) => b.text || "").join("")
       : String(sysMsg.content);
-    expect(text).toContain("You are ZCode, an interactive coding agent");
+    expect(text).toContain("You are ZCode model working in Claude Code");
     expect(text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
   });
 
@@ -1010,7 +1010,7 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     expect(billingBlock).toBeUndefined();
   });
 
-  it("replaces 'Claude Code' references in system text with 'ZCode'", () => {
+  it("preserves 'Claude Code' references in harness instructions (functional descriptions)", () => {
     const body = JSON.stringify({
       model: "glm-5.2",
       messages: [{ role: "user", content: "hi" }],
@@ -1026,9 +1026,9 @@ describe("transformRequestBody — alignZCodeFormat (ZCode wire format alignment
     const clientBlocks = parsed.system.slice(2);
     const harnessBlock = clientBlocks.find((b: any) => b.text.includes("available as a CLI"));
     expect(harnessBlock).toBeDefined();
-    expect(harnessBlock.text).not.toContain("Claude Code");
-    expect(harnessBlock.text).toContain("ZCode is available as a CLI");
-    expect(harnessBlock.text).toContain("Fast mode for ZCode uses Claude Opus");
+    // "Claude Code" references in harness instructions are preserved — they are
+    // functional descriptions the model relies on, not identity strings.
+    expect(harnessBlock.text).toContain("Claude Code is available as a CLI");
   });
 });
 
@@ -1164,7 +1164,7 @@ describe("transformRequestBody — alignZCodeFormat (field fill + drop, v0.2.0+)
     // 8. system starts with 2 ZCode blocks, then client's (rewritten) block
     expect(parsed.system.length).toBe(3);
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
-    expect(parsed.system[2].text).toContain("You are ZCode, an interactive coding agent");
+    expect(parsed.system[2].text).toContain("You are ZCode model working in Claude Code");
     expect(parsed.system[2].text).not.toContain("You are Claude Code, Anthropic's official CLI for Claude.");
   });
 });
@@ -1372,7 +1372,7 @@ describe("transformRequestBody — alignZCodeFormat (message body fingerprint al
     // 7. system: 2 ZCode blocks + client block (with identity rewritten)
     expect(parsed.system.length).toBe(3);
     expect(parsed.system[0].text).toBe("You are ZCode, an interactive coding agent");
-    expect(parsed.system[2].text).toContain("You are ZCode, an interactive coding agent");
+    expect(parsed.system[2].text).toContain("You are ZCode model working in Claude Code");
 
     // 8. thinking simplified + budget injected; max_tokens=64000; output_config injected
     expect(parsed.thinking).toEqual({ type: "enabled", budget_tokens: 32000 });

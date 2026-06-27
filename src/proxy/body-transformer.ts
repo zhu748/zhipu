@@ -474,16 +474,7 @@ const ZCODE_OFFICIAL_SYSTEM_BLOCKS: ReadonlyArray<{ type: "text"; text: string; 
  *   - "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
  */
 const CLAUDE_CODE_IDENTITY_RE = /You are Claude Code, Anthropic's official CLI for Claude(?:, running within the Claude Agent SDK)?\./;
-const ZCODE_IDENTITY_REPLACEMENT = "You are ZCode, an interactive coding agent.";
-
-/**
- * Additional Claude Code references in system text that need rewriting.
- * These are NOT identity strings — they're references within the harness
- * instructions (e.g. "Claude Code is available as a CLI"). Replace with
- * ZCode-equivalent phrasing that doesn't leak the non-ZCode client identity.
- */
-const CLAUDE_CODE_REF_RE = /Claude Code/g;
-const CLAUDE_CODE_REF_REPLACEMENT = "ZCode";
+const ZCODE_IDENTITY_REPLACEMENT = "You are ZCode model working in Claude Code.";
 
 function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, unknown> | null {
   let changed = false;
@@ -520,33 +511,23 @@ function alignZCodeRequestFormat(body: Record<string, unknown>): Record<string, 
       if ((msg as Record<string, unknown>).role !== "system") continue;
       const content = (msg as Record<string, unknown>).content;
       if (typeof content === "string") {
-        let rewritten = content;
-        if (CLAUDE_CODE_IDENTITY_RE.test(rewritten)) {
-          rewritten = rewritten.replace(CLAUDE_CODE_IDENTITY_RE, ZCODE_IDENTITY_REPLACEMENT);
-        }
-        if (CLAUDE_CODE_REF_RE.test(rewritten)) {
-          rewritten = rewritten.replace(CLAUDE_CODE_REF_RE, CLAUDE_CODE_REF_REPLACEMENT);
-        }
-        if (rewritten !== content) {
-          (msg as Record<string, unknown>).content = rewritten;
+        if (CLAUDE_CODE_IDENTITY_RE.test(content)) {
+          (msg as Record<string, unknown>).content = content.replace(
+            CLAUDE_CODE_IDENTITY_RE,
+            ZCODE_IDENTITY_REPLACEMENT,
+          );
           changed = true;
         }
       } else if (Array.isArray(content)) {
         for (const block of content) {
           if (!isPlainObject(block)) continue;
           const text = (block as Record<string, unknown>).text;
-          if (typeof text === "string") {
-            let rewritten = text;
-            if (CLAUDE_CODE_IDENTITY_RE.test(rewritten)) {
-              rewritten = rewritten.replace(CLAUDE_CODE_IDENTITY_RE, ZCODE_IDENTITY_REPLACEMENT);
-            }
-            if (CLAUDE_CODE_REF_RE.test(rewritten)) {
-              rewritten = rewritten.replace(CLAUDE_CODE_REF_RE, CLAUDE_CODE_REF_REPLACEMENT);
-            }
-            if (rewritten !== text) {
-              (block as Record<string, unknown>).text = rewritten;
-              changed = true;
-            }
+          if (typeof text === "string" && CLAUDE_CODE_IDENTITY_RE.test(text)) {
+            (block as Record<string, unknown>).text = text.replace(
+              CLAUDE_CODE_IDENTITY_RE,
+              ZCODE_IDENTITY_REPLACEMENT,
+            );
+            changed = true;
           }
         }
       }
@@ -633,10 +614,15 @@ function normalizeSystemToArray(system: unknown): SystemBlock[] {
 }
 
 /**
- * Rewrite Claude Code identity + references in system blocks → ZCode equivalents.
+ * Rewrite Claude Code identity in system blocks + strip billing header.
  * 1. Replace the identity string ("You are Claude Code, Anthropic's official CLI for Claude...")
- * 2. Replace remaining "Claude Code" references in harness instructions
- * 3. Strip x-anthropic-billing-header blocks (ZCode never sends these)
+ *    → "You are ZCode model working in Claude Code."
+ *    The "in Claude Code" part is intentional — the model needs to know it's working
+ *    inside Claude Code so it can function correctly (tool usage, harness behavior, etc.)
+ * 2. Strip x-anthropic-billing-header blocks (ZCode never sends these)
+ * 3. Do NOT replace "Claude Code" references in harness instructions — those are
+ *    functional descriptions (e.g. "Claude Code is available as a CLI") that the
+ *    model relies on for correct behavior.
  */
 function rewriteClaudeCodeIdentity(blocks: SystemBlock[]): SystemBlock[] {
   return blocks
@@ -648,13 +634,8 @@ function rewriteClaudeCodeIdentity(blocks: SystemBlock[]): SystemBlock[] {
     })
     .map(b => {
       let text = b.text;
-      // Step 1: Replace identity string
       if (CLAUDE_CODE_IDENTITY_RE.test(text)) {
         text = text.replace(CLAUDE_CODE_IDENTITY_RE, ZCODE_IDENTITY_REPLACEMENT);
-      }
-      // Step 2: Replace remaining "Claude Code" references
-      if (CLAUDE_CODE_REF_RE.test(text)) {
-        text = text.replace(CLAUDE_CODE_REF_RE, CLAUDE_CODE_REF_REPLACEMENT);
       }
       return text === b.text ? b : { ...b, text };
     });
