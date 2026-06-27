@@ -1,5 +1,41 @@
 # zcode-proxy 使用说明
 
+> **v0.2.0 — ClaudeCode→ZCode 请求转换对齐修复（身份改写 + document 块 + is_error 处理）**
+>
+> 修复了 v0.1.9 中 ClaudeCode 长任务请求转换为 ZCode 格式时的三个关键问题，确保转换后的请求在身份、内容块类型和字段值上与真实 ZCode 客户端一致。
+>
+> **本次改动**
+>
+> 1. **修复身份改写失败**：ClaudeCode 新版身份串变更为 `"You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."`，旧版 `.includes()` 匹配失败导致 "Claude Code" 身份泄漏到网关。改为正则匹配，兼容新旧两种格式，替换为 `"You are ZCode, an interactive coding agent."`。
+>
+> 2. **替换 system 文本中所有 "Claude Code" 引用**：ClaudeCode 的 harness 指令中多处出现 "Claude Code"（如 "Claude Code is available as a CLI"），现在全部替换为 "ZCode"，消除身份指纹。
+>
+> 3. **剥离 x-anthropic-billing-header 系统 block**：ClaudeCode 在 system[0] 插入 billing header（`x-anthropic-billing-header: cc_version=...`），ZCode 从不发送此块，现在从 system 数组中移除。
+>
+> 4. **新增 convertDocumentBlocks()**：ClaudeCode 会发送 `type: "document"` 的内容块（如附件日志文件），ZCode 网关不接受此类型，现在自动转换为 `type: "text"` 块，保留文档文本内容。
+>
+> 5. **剥离 is_error:false**：ClaudeCode 给每个成功的 tool_result 标记 `is_error: false`，但真实 ZCode 客户端成功时省略该字段（49 个成功 tool_result 中 0 个带 is_error），只在失败时发送 `is_error: true`。现在剥离 `is_error: false`，保留 `is_error: true`。
+>
+> **当前对齐效果**（用 ClaudeCode 真实长任务请求转换后对比真实 ZCode 抓包）：
+>
+> | 维度 | v0.2.0 转换后 | 真实 ZCode |
+> |---|---|---|
+> | 顶层字段顺序 | ✅ model→max_tokens→thinking→output_config→system→messages→tools→tool_choice | ✅ 一致（stream 除外） |
+> | thinking 格式 | ✅ {type:"enabled", budget_tokens:32000} | ✅ 一致 |
+> | max_tokens | ✅ 64000 | ✅ 一致 |
+> | output_config | ✅ {effort:"max"} | ✅ 一致 |
+> | tool_choice | ✅ {type:"auto"} | ✅ 一致 |
+> | ZCode 官方 2 条 system 块 | ✅ 前置注入 | ✅ 一致 |
+> | 身份泄漏 | ✅ 无 "Claude Code" 残留 | ✅ 一致 |
+> | billing header | ✅ 已剥离 | ✅ 一致 |
+> | document 类型块 | ✅ 转为 text | ✅ 一致 |
+> | is_error:false | ✅ 已剥离 | ✅ 一致 |
+> | is_error:true | ✅ 保留 | ✅ 一致 |
+> | thinking/redacted_thinking | ✅ 已剥离 | ✅ 一致 |
+> | cache_control | ✅ 最后 user text block | ✅ 一致 |
+> | context_management | ✅ 已删除 | ✅ 一致 |
+> | metadata | ✅ 已删除 | ✅ 一致 |
+
 > **v0.1.9 — 正式版：ZCode 请求体对齐成为默认行为（移除测试开关）**
 >
 > 在 vceshi0.1.5 ~ vceshi0.1.7 经过 3 个测试版本验证后，将「对齐 ZCode 请求格式」从测试开关转正为默认且唯一的行为。同时适配了 OpenAI / Responses 格式：所有客户端请求（无论 Anthropic / OpenAI / Responses）最终都通过 translator 转成 Anthropic 格式后走对齐逻辑，统一对齐到真实 ZCode 客户端的 wire format。514/514 测试通过，TypeScript 编译零错误。
