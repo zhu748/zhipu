@@ -1,5 +1,21 @@
 # zcode-proxy 使用说明
 
+> **v0.2.0.1 — 修复 Responses API (Codex) 工具翻译 + 身份改写增强**
+>
+> 在 v0.2.0 基础上修复 Codex CLI 通过 Responses API 发送请求时的工具翻译问题，并增强 ClaudeCode 身份改写的兼容性。
+>
+> **本次改动**
+>
+> 1. **修复 `type: "custom"` 工具转换**：Codex 的 `apply_patch` 工具使用自定义 grammar 格式而非 JSON Schema，之前被直接过滤掉导致 Codex 报错。现在转为标准 function 工具，创建 `{ patch: string }` 的 input_schema，grammar 格式信息追加到 description。
+>
+> 2. **修复 `function_call.arguments` 非JSON格式**：Codex 的 custom 工具发送 freeform 文本作为 arguments（不是 JSON），之前 JSON.parse 失败后丢弃。现在解析失败时包裹为 `{ patch: "原文" }`，与 custom 工具的 input_schema 匹配。
+>
+> 3. **转换 `type: "tool_search"` 工具**：Codex 用此工具做延迟工具发现，转为 function 工具保留 schema，让模型知道可以搜索工具。
+>
+> 4. **修复身份改写正则**：ClaudeCode 新版身份串增加 `, running within the Claude Agent SDK.` 后缀，之前 `.includes()` 匹配失败，改为正则兼容新旧两种格式。
+>
+> 5. **剥离 `x-anthropic-billing-header` 系统 block** + **剥离 `is_error:false`** + **`document` 块转 text**（v0.2.0 改动一并包含）。
+
 > **v0.2.0 — ClaudeCode→ZCode 请求转换对齐修复（身份改写 + document 块 + is_error 处理）**
 >
 > 修复了 v0.1.9 中 ClaudeCode 长任务请求转换为 ZCode 格式时的三个关键问题，确保转换后的请求在身份、内容块类型和字段值上与真实 ZCode 客户端一致。
