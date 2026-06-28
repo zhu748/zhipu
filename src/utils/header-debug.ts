@@ -10,32 +10,33 @@
  * Trigger: only the FIRST fetch attempt per request is recorded. Retries and
  * captcha re-solve fetches call the same fetchUpstreamDetected() but pass
  * isInitialAttempt=false, so they skip the logger entirely. This keeps the
- * output one-file-per-request — essential for diffing "what changed between
+ * output one-pair-per-request — essential for diffing "what changed between
  * what the client sent and what the proxy sent upstream".
+ *
+ * Output: TWO files per request (so you can diff/grep them independently):
+ *   ./header-debug/{timestamp}_{reqId}_inbound.json   ← client → proxy (raw)
+ *   ./header-debug/{timestamp}_{reqId}_upstream.json  ← proxy → z.ai (translated)
+ *
+ * Both files share the same {timestamp}_{reqId}_ prefix so they sort together
+ * in `ls` and are trivial to pair in a diff tool:
+ *   diff *_001_inbound.json *_001_upstream.json
  *
  * Output location:
  *   - $ZCODE_PROXY_HEADER_DEBUG_DIR if set (absolute path recommended)
  *   - else ./header-debug/ relative to process.cwd()
- * The directory is created lazily on first write (mkdir -p). Files are named
- * `{timestamp}_{reqId}.json` so they sort chronologically and never collide.
+ * The directory is created lazily on first write (mkdir -p).
  *
- * File format: one JSON object per file (NOT JSONL — one file per request
- * makes it easy to open in a JSON viewer / diff tool). Structure:
+ * File format: each file is a standalone JSON object (2-space indent for
+ * readability). Structure:
  *   {
  *     "reqId": "...",
  *     "timestamp": "ISO-8601",
  *     "format": "anthropic" | "openai" | "openai-responses",
- *     "inbound": {
- *       "method": "POST",
- *       "url": "/v1/messages",
- *       "headers": { "content-type": "...", "authorization": "Bearer ***", ... }
- *     },
- *     "upstream": {
- *       "method": "POST",
- *       "url": "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
- *       "headers": { "user-agent": "ZCode/3.1.8", "authorization": "Bearer abc12345...wxyz", ... },
- *       "bodyPreview": "... first 16KB of transformed body ..."
- *     }
+ *     "side": "inbound" | "upstream",
+ *     "method": "POST",
+ *     "url": "...",
+ *     "headers": { "content-type": "...", "authorization": "Bearer ***", ... },
+ *     "bodyPreview": "... first 16KB of request body ..."
  *   }
  *
  * Security:
@@ -133,25 +134,66 @@ function headersToRecord(headers: Headers): Record<string, string> {
 /** Max bytes of the transformed request body to include in the debug file. */
 const MAX_BODY_PREVIEW_BYTES = 16 * 1024;
 
-export interface HeaderDebugRecord {
+/**
+ * Inbound record — the RAW request the proxy received from the client,
+ * before any translation. Written to `{prefix}_inbound.json`.
+ */
+export interface InboundHeaderDebugRecord {
+  /** Shared id with the matching _upstream.json file for easy pairing. */
   reqId: string;
+  /** ISO-8601 timestamp — identical to the paired upstream file's timestamp. */
   timestamp: string;
+  /** Client format (anthropic | openai | openai-responses). */
   format: string;
-  inbound: {
-    method: string;
-    url: string;
-    headers: Record<string, string>;
-  };
-  upstream: {
-    method: string;
-    url: string;
-    headers: Record<string, string>;
-    bodyPreview?: string;
-  };
+  /** Which side of the pair this file represents. Always "inbound" here. */
+  side: "inbound";
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  /**
+   * Raw client request body (if any), truncated to 16KB. This is the
+   * UNTRANSLATED body the client sent — useful for diffing against
+   * _upstream.json's bodyPreview to verify the translation pipeline.
+   */
+  bodyPreview?: string;
 }
 
 /**
- * Write a header debug record to disk as a JSON file.
+ * Upstream record — the TRANSLATED request the proxy sends to z.ai,
+ * after format conversion + identity injection + auth + captcha. Written
+ * to `{prefix}_upstream.json`.
+ */
+export interface UpstreamHeaderDebugRecord {
+  reqId: string;
+  timestamp: string;
+  format: string;
+  /** Which side of the pair this file represents. Always "upstream" here. */
+  side: "upstream";
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  /** Translated request body (truncated to 16KB) — what actually went upstream. */
+  bodyPreview?: string;
+}
+
+/**
+ * Write TWO header debug files for a single request: one for the inbound
+ * client request, one for the translated upstream request. The two files
+ * share the same `{timestamp}_{reqId}_` prefix so they sort together and
+ * are trivial to pair up in a file listing or diff tool.
+ *
+ * File layout per request:
+ *   ./header-debug/2026-06-28T04-30-00-123Z_001_inbound.json   ← client → proxy
+ *   ./header-debug/2026-06-28T04-30-00-123Z_001_upstream.json  ← proxy → z.ai
+ *
+ * Why two files instead of one combined file?
+ *   - Easier to diff: `diff *_inbound.json *_upstream.json` shows exactly
+ *     what the translation pipeline changed (headers + body).
+ *   - Easier to grep: `grep -r "user-agent" *_upstream.json` finds every
+ *     UA the proxy sent, without filtering out the inbound section.
+ *   - Easier to open in a JSON viewer: each file is small and focused.
+ *   - Matches the user's mental model: "one file for what I received,
+ *     one file for what I sent upstream".
  *
  * Fire-and-forget: returns void, never throws — debug logging must never
  * break a request. All errors are caught and logged to console.warn.
@@ -165,6 +207,9 @@ export interface HeaderDebugRecord {
  * @param transformedBody The translated body string sent upstream (optional —
  *                    included as a preview so the operator can verify body
  *                    transformation alongside header transformation).
+ * @param inboundBody The raw client request body string (optional — included
+ *                    in the inbound file so the operator can diff client
+ *                    body vs translated body).
  */
 export function recordHeaders(
   inboundReq: Request,
@@ -172,43 +217,68 @@ export function recordHeaders(
   reqId: string,
   format: string,
   transformedBody?: string,
+  inboundBody?: string,
 ): void {
   // Fire-and-forget — never let disk I/O or errors block the request path.
   void (async () => {
     try {
       const dir = await getDebugDir();
+      // Shared prefix: timestamp (sortable, filesystem-safe) + reqId.
+      // Both files use the same prefix so they're adjacent in `ls` output
+      // and trivial to pair in diff tools.
       const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const filename = `${timestamp}_${reqId}.json`;
-      const filepath = join(dir, filename);
+      const prefix = `${timestamp}_${reqId}`;
+      const inboundPath = join(dir, `${prefix}_inbound.json`);
+      const upstreamPath = join(dir, `${prefix}_upstream.json`);
+      const isoTs = new Date().toISOString();
 
-      const record: HeaderDebugRecord = {
+      // --- Inbound file: the raw client request as received ---
+      const inboundRecord: InboundHeaderDebugRecord = {
         reqId,
-        timestamp: new Date().toISOString(),
+        timestamp: isoTs,
         format,
-        inbound: {
-          method: inboundReq.method,
-          url: inboundReq.url,
-          headers: headersToRecord(inboundReq.headers),
-        },
-        upstream: {
-          method: upstreamReq.method,
-          url: upstreamReq.url,
-          headers: headersToRecord(upstreamReq.headers),
-          ...(transformedBody
-            ? {
-                bodyPreview: transformedBody.length > MAX_BODY_PREVIEW_BYTES
-                  ? transformedBody.slice(0, MAX_BODY_PREVIEW_BYTES) +
-                    `...(truncated, total ${transformedBody.length} chars)`
-                  : transformedBody,
-              }
-            : {}),
-        },
+        side: "inbound",
+        method: inboundReq.method,
+        url: inboundReq.url,
+        headers: headersToRecord(inboundReq.headers),
+        ...(inboundBody
+          ? {
+              bodyPreview: inboundBody.length > MAX_BODY_PREVIEW_BYTES
+                ? inboundBody.slice(0, MAX_BODY_PREVIEW_BYTES) +
+                  `...(truncated, total ${inboundBody.length} chars)`
+                : inboundBody,
+            }
+          : {}),
       };
 
-      // atomicWriteFile: write to temp then rename. Safe against partial writes
-      // if the process crashes mid-debug-log. JSON.stringify with 2-space indent
-      // for readability in a text editor / diff tool.
-      await atomicWriteFile(filepath, JSON.stringify(record, null, 2) + "\n", "utf-8");
+      // --- Upstream file: the translated request sent to z.ai ---
+      const upstreamRecord: UpstreamHeaderDebugRecord = {
+        reqId,
+        timestamp: isoTs,
+        format,
+        side: "upstream",
+        method: upstreamReq.method,
+        url: upstreamReq.url,
+        headers: headersToRecord(upstreamReq.headers),
+        ...(transformedBody
+          ? {
+              bodyPreview: transformedBody.length > MAX_BODY_PREVIEW_BYTES
+                ? transformedBody.slice(0, MAX_BODY_PREVIEW_BYTES) +
+                  `...(truncated, total ${transformedBody.length} chars)`
+                : transformedBody,
+            }
+          : {}),
+      };
+
+      // Write both files in parallel. atomicWriteFile (temp+rename) is safe
+      // against partial writes if the process crashes mid-debug-log. 2-space
+      // indent for readability in a text editor / diff tool.
+      const inboundJson = JSON.stringify(inboundRecord, null, 2) + "\n";
+      const upstreamJson = JSON.stringify(upstreamRecord, null, 2) + "\n";
+      await Promise.all([
+        atomicWriteFile(inboundPath, inboundJson, "utf-8"),
+        atomicWriteFile(upstreamPath, upstreamJson, "utf-8"),
+      ]);
     } catch (err) {
       // Never throw — debug logging is best-effort. Surface to console so the
       // operator notices if the debug dir is unwritable, but keep the request

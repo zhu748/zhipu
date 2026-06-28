@@ -404,13 +404,19 @@ export async function proxyRequest(
     //
     // Only the FIRST fetch attempt per request is recorded. Retries and
     // captcha re-solve fetches pass isInitialAttempt=false (the default),
-    // so they skip this block entirely — one file per request, no noise
+    // so they skip this block entirely — one pair per request, no noise
     // from retries. This is the user-requested behaviour: "重试的不记录".
+    //
+    // v0.2.0.9: recordHeaders writes TWO files — {prefix}_inbound.json
+    // (the raw client request) and {prefix}_upstream.json (the translated
+    // request sent to z.ai). Pass the raw `body` (client request body as
+    // received) as inboundBody so the operator can diff client body vs
+    // translated body alongside the header diff.
     //
     // Fire-and-forget (recordHeaders is async, never awaited, never throws).
     if (isInitialAttempt && config.logging?.headerDebug) {
       try {
-        recordHeaders(clientReq, req, reqId, format, transformedBody);
+        recordHeaders(clientReq, req, reqId, format, transformedBody, body);
       } catch (e) {
         // Defensive — recordHeaders already swallows errors, but belt + suspenders.
         void e;

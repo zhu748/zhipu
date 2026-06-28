@@ -1,5 +1,65 @@
 # zcode-proxy 使用说明
 
+> **v0.2.0.8 — 全面优化 + 请求头调试功能**
+>
+> 本次发版对代理进行了全面的代码优化（安全/性能/健壮性/可维护性），并新增了"请求头调试"功能，方便排查请求转换是否有缺陷。
+>
+> **本次改动**
+>
+> **1. 新增"请求头调试"功能（核心新功能）**
+>
+> 开启后，每个请求会写入**两个 JSON 文件**到 `./header-debug/` 目录：
+> - `{时间戳}_{reqId}_inbound.json` —— 代理**收到的原始客户端请求**（完整的请求头 + 请求体）
+> - `{时间戳}_{reqId}_upstream.json` —— 代理**翻译后发给 z.ai 的请求**（完整的请求头 + 翻译后的请求体）
+>
+> **重试不记录**——每个请求只产生一对文件，方便对比"客户端发了什么" vs "代理发了什么"，验证转换流程有没有缺陷。可以用 `diff *_inbound.json *_upstream.json` 直接对比。
+>
+> 三种开启方式：
+> - 环境变量：`ZCODE_PROXY_HEADER_DEBUG=1`
+> - YAML 配置：`logging.headerDebug: true`
+> - 管理面板"日志"页的"请求头调试"开关（热更新，无需重启）
+>
+> 敏感头（authorization / x-api-key / cookie）自动 mask 为 `first-8...last-4`，短值完全 mask。用完用 `rm -rf header-debug/` 清理。
+>
+> **2. 安全加固**
+>
+> - `/admin/api/verify` 现在也走 loopback gate（之前被豁免，会向非 loopback 暴露"代理未设认证"信息）
+> - `proxyApiKey` 强制最小 8 字符（阻止 trivial key 如 "x"、"test"）
+> - `setAccountProxy` 加 SSRF 校验，阻止把上游流量路由到云元数据端点（169.254.169.254 等）
+> - `timingSafeEqual` 改用 `node:crypto` 审计过的实现，替代手写版
+> - Dockerfile 改为多阶段构建 + `oven/bun:1.2-slim` + tini + **非 root 用户**（uid 1001）
+>
+> **3. 性能优化**
+>
+> - **长流式响应内存减半**：`body.tee()` + 并行 reader 改为 `TransformStream`，字节流过即解析，消除长 LLM 流（100K+ tokens）的内存翻倍问题
+> - `Bun.gzipSync` → `CompressionStream` 流式压缩，避免 200KB 响应阻塞事件循环 5-20ms
+> - `buildIdentityHeaders` 的 `Intl.DateTimeFormat()` + `os.release()` 改为模块级 memoize，每请求省 0.1-0.5ms CPU
+> - logWaiters 加 50 连接上限，防止 SSE 客户端 flood
+> - 删除账号时同步清理 quotaCache 条目
+>
+> **4. 健壮性**
+>
+> - `clearCredential()` 同步版的 `while(Date.now()<end){}` 忙等改为 `Atomics.wait`（真正让出 CPU，保留 sync API 契约）
+> - captcha 求解加外层硬超时安全网（`Promise.race`），完全不改变 JSDOM 求解逻辑，仅防止 Promise 永挂导致 JSDOM 实例泄漏
+> - OAuth callback server `maxConnections=5`，防止 fd 耗尽
+> - `body.cancel()` 的静默 catch 加诊断注释
+>
+> **5. 部署兼容性**
+>
+> - 修复 `package.json` 中无效的 `typescript: "^6.0.3"`（TS 最高 5.x）→ `^5.5.0`
+> - `@types/bun: "latest"` → `^1.2.0` 固定
+> - `render-start.sh` 的 `sha256sum` 改为兼容 macOS（`shasum -a 256`）+ bun fallback
+>
+> **6. 可维护性**
+>
+> - 死代码（`openaiSseToAnthropicSse` / `anthropic-to-openai.ts`）加 `@deprecated` 标注
+> - `openai-to-anthropic.ts` 的 4 处 `(b as any).text` 改为 type guards
+> - 修复 TS 5.9 严格泛型导致的 `CompressionStream`/`Uint8Array` 类型错误
+>
+> **约束遵守**：加密密钥固定 `520` 未动；captcha JSDOM 求解逻辑完全未改（只加外层安全网）。
+>
+> ---
+>
 > **v0.2.0.7 — 重大修复：凭证丢失 bug + 命令行无限重试 + 管理面板刷新卡顿**
 >
 > 本次发版修复了用户在 Windows 长时间运行后报告的三个关联问题：账号突然全部消失、管理面板切不动账号、命令行客户端一直在重试。同时大幅优化了管理面板刷新卡顿。

@@ -274,32 +274,39 @@ export interface ProxyConfig {
     /**
      * Header debug logging (v0.2.0.9+).
      *
-     * When true, the proxy writes a JSON file per request to
+     * When true, the proxy writes TWO JSON files per request to
      * `./header-debug/` (relative to the process working directory, or
-     * `$ZCODE_PROXY_HEADER_DEBUG_DIR` if set) capturing:
-     *   - The full set of headers RECEIVED from the client (inbound request)
-     *   - The full set of headers SENT to z.ai upstream (after translation
-     *     + identity injection + auth + captcha), EXACTLY as they go on the wire
-     *   - Request method, URL, format, reqId, timestamp, and the transformed
-     *     request body (truncated to 16KB to bound file size)
+     * `$ZCODE_PROXY_HEADER_DEBUG_DIR` if set):
+     *
+     *   `{timestamp}_{reqId}_inbound.json`   ← the RAW request received from
+     *                                          the client (before translation)
+     *   `{timestamp}_{reqId}_upstream.json`  ← the TRANSLATED request sent to
+     *                                          z.ai (after identity injection +
+     *                                          auth + captcha), EXACTLY as it
+     *                                          goes on the wire
+     *
+     * Both files share the same `{timestamp}_{reqId}_` prefix so they sort
+     * together and are trivial to pair in a diff tool:
+     *   diff *_001_inbound.json *_001_upstream.json
+     *
+     * Each file captures: reqId, timestamp, format, side ("inbound"|"upstream"),
+     * method, url, headers (sensitive headers masked), and a bodyPreview
+     * (truncated to 16KB).
      *
      * Only the FIRST fetch attempt per request is recorded — retries and
-     * captcha re-solve fetches are NOT logged, so each request produces at
-     * most one file. This makes it easy to diff "what the client sent" vs
-     * "what the proxy sent upstream" to verify the translation pipeline has
-     * no defects (missing/extra/wrong-value headers).
+     * captcha re-solve fetches are NOT logged, so each request produces
+     * exactly one pair of files. This makes it easy to diff "what the client
+     * sent" vs "what the proxy sent upstream" to verify the translation
+     * pipeline has no defects (missing/extra/wrong-value headers).
      *
      * Default: false. Env var: ZCODE_PROXY_HEADER_DEBUG=1 to enable at
      * startup. Also hot-toggleable via dashboard "日志配置" (PUT /config
      * with `{"logging":{"headerDebug":true}}`).
      *
      * SECURITY: header files may contain auth tokens (Authorization,
-     * x-api-key) in plaintext — they're written to disk for debugging.
-     * Auth values are masked in the inbound section (matching the verbose
-     * log behaviour) but the upstream section records them verbatim
-     * (truncated to first-8...last-4) because the whole point is to verify
-     * what actually went upstream. Keep the output dir private; clear it
-     * with `rm -rf header-debug/` when done.
+     * x-api-key) — they're masked (first-8...last-4; short values fully
+     * masked as ***) but still written to disk for debugging. Keep the
+     * output dir private; clear it with `rm -rf header-debug/` when done.
      */
     headerDebug?: boolean;
   };
