@@ -1830,6 +1830,10 @@ td input{font-family:var(--font-mono)}
             调试模式
           </label>
           <label class="switch-label">
+            <label class="switch"><input type="checkbox" id="logHeaderDebugToggle" onchange="toggleHeaderDebugMode()"><span class="slider"></span></label>
+            请求头调试
+          </label>
+          <label class="switch-label">
             <label class="switch"><input type="checkbox" id="logExpandAll" onchange="renderLogs()"><span class="slider"></span></label>
             全部展开
           </label>
@@ -3907,7 +3911,36 @@ async function syncLogDebugToggle(){
     const r=await fetch(API+'/admin/api/config',{headers:authHeaders()});
     const c=await r.json();
     document.getElementById('logDebugToggle').checked=!!c.logging?.debug;
+    // v0.2.0.9+: also sync the header-debug toggle (same fetch, free ride).
+    document.getElementById('logHeaderDebugToggle').checked=!!c.logging?.headerDebug;
   }catch{/* non-fatal — toggle just stays unchecked */}
+}
+/**
+ * Toggle header debug logging (v0.2.0.9+). When ON, the server writes a JSON
+ * file per request to ./header-debug/ capturing inbound client headers +
+ * translated upstream headers. Only the first fetch per request is recorded
+ * (retries are skipped). Use this to verify the translation pipeline has no
+ * header defects. Auth tokens are masked. Clear with `rm -rf header-debug/`
+ * when done.
+ */
+async function toggleHeaderDebugMode(){
+  const checked=document.getElementById('logHeaderDebugToggle').checked;
+  try{
+    const cfgResp=await fetch(API+'/admin/api/config',{headers:authHeaders()});
+    const cfg=await cfgResp.json();
+    cfg.logging={...(cfg.logging||{}),headerDebug:checked};
+    const r=await fetch(API+'/admin/api/config',{method:'PUT',headers:authHeaders(),body:JSON.stringify(cfg)});
+    if(r.ok){
+      toast(checked?'请求头调试已开启 — 每个请求的入站+上游请求头将写入 ./header-debug/ 目录':'请求头调试已关闭','success');
+    }else{
+      toast('切换请求头调试失败','error');
+      document.getElementById('logHeaderDebugToggle').checked=!checked;
+    }
+  }catch(e){
+    console.error('toggleHeaderDebugMode failed:',e);
+    toast('切换请求头调试失败','error');
+    document.getElementById('logHeaderDebugToggle').checked=!checked;
+  }
 }
 function clearLogs(){logLines=[];expandedLogSeqs.clear();document.getElementById('logBox').innerHTML=''}
 document.getElementById('logLevel').addEventListener('change',renderLogs);

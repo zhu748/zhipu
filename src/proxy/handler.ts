@@ -29,6 +29,7 @@ import type { OpenAIChatRequest, OpenAIResponseRequest, AnthropicMessagesRespons
 import { recordStat, recordDebugDump, appendLog } from "../admin/api.js";
 import { sleep } from "../utils/sleep.js";
 import { exportAccounts, switchAccount, maskApiKey } from "../auth/store.js";
+import { recordHeaders } from "../utils/header-debug.js";
 
 /** Options for the proxy handler. */
 export interface ProxyHandlerOptions {
@@ -392,9 +393,30 @@ export async function proxyRequest(
   // call (not captured in a closure) so a credential switch mid-retry picks
   // up the new account's proxy automatically — without this, switching from
   // a proxied account to a direct one would keep using the old proxy.
-  const fetchUpstreamDetected = async (captcha?: Record<string, string>): Promise<Response> => {
+  const fetchUpstreamDetected = async (captcha?: Record<string, string>, isInitialAttempt: boolean = false): Promise<Response> => {
     const req = buildUpstreamReq(captcha);
     lastSentBeta = req.headers.get("anthropic-beta");
+
+    // v0.2.0.9+: header debug logging — record the inbound client request
+    // headers + the translated upstream request headers to a JSON file, so
+    // the operator can diff "what the client sent" vs "what the proxy sent
+    // upstream" and verify the translation pipeline has no header defects.
+    //
+    // Only the FIRST fetch attempt per request is recorded. Retries and
+    // captcha re-solve fetches pass isInitialAttempt=false (the default),
+    // so they skip this block entirely — one file per request, no noise
+    // from retries. This is the user-requested behaviour: "重试的不记录".
+    //
+    // Fire-and-forget (recordHeaders is async, never awaited, never throws).
+    if (isInitialAttempt && config.logging?.headerDebug) {
+      try {
+        recordHeaders(clientReq, req, reqId, format, transformedBody);
+      } catch (e) {
+        // Defensive — recordHeaders already swallows errors, but belt + suspenders.
+        void e;
+      }
+    }
+
     // vceshi0.0.8+: read the operator-configured upstream timeout (if any)
     // and fall back to the hardcoded defaults. A single config value applies
     // to BOTH stream and batch paths — operators who want different stream
@@ -533,7 +555,11 @@ export async function proxyRequest(
     // got at the start of this function might have expired by now if there
     // was any await in between (config loading, body parsing, etc.).
     captchaHeaders = await refreshCaptchaHeaders();
-    upstreamResp = await fetchUpstreamDetected(captchaHeaders);
+    // isInitialAttempt=true: this is the FIRST fetch for this request.
+    // Header debug logging (if enabled) records inbound + upstream headers
+    // here. Retries below call fetchUpstreamDetected without this flag, so
+    // only the first attempt is logged.
+    upstreamResp = await fetchUpstreamDetected(captchaHeaders, true);
   } catch (err) {
     printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
     return errorResponse(502, "upstream_unreachable", (err as Error).message);

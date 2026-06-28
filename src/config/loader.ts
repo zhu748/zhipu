@@ -162,6 +162,14 @@ export function loadConfig(path: string): ProxyConfig {
     ? (parsed as any).logging.file
     : undefined;
 
+  // v0.2.0.9+: header debug logging — writes per-request JSON files capturing
+  // the inbound client headers + the outbound (translated) upstream headers,
+  // so the operator can verify the translation pipeline has no header defects.
+  // Only the FIRST fetch per request is recorded (retries/captcha re-solves
+  // are skipped) to keep the output one-file-per-request.
+  const headerDebug = process.env.ZCODE_PROXY_HEADER_DEBUG === "1"
+    || (typeof (parsed as any)?.logging === "object" && (parsed as any).logging?.headerDebug === true);
+
   // --- CORS allowlist ---
   const corsAllowList = resolveCorsAllowList(process.env.ZCODE_PROXY_CORS_ALLOWLIST);
 
@@ -195,7 +203,7 @@ export function loadConfig(path: string): ProxyConfig {
     thinkingLevel,
     corsAllowList,
     identity,
-    logging: { level: logLevel, verbose: verboseLogging, debug: debugLogging, file: logFile },
+    logging: { level: logLevel, verbose: verboseLogging, debug: debugLogging, file: logFile, headerDebug },
     retry,
     routingRules,
     modelMappings,

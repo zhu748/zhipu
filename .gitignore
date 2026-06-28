@@ -16,5 +16,9 @@ dist/
 *.zip
 release/zcode-proxy.exe
 zcode-proxy-debug-*.json
+# v0.2.0.9+: header debug output dir — per-request JSON files with (masked) auth
+# tokens. Never track these — they're debugging artifacts that may contain
+# sensitive header values.
+/header-debug/
 # Render: local data dir (only relevant if you `docker run` with a bind mount)
 /data/

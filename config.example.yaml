@@ -95,6 +95,15 @@ logging:
   # captcha 403 returned, including the error JSON body. Uses resp.clone() so
   # it doesn't consume the original response. Env var: ZCODE_PROXY_DEBUG_LOGGING=1
   # debug: false
+  # Header debug logging (v0.2.0.9+): writes a JSON file per request to
+  # ./header-debug/ (or $ZCODE_PROXY_HEADER_DEBUG_DIR) capturing the FULL
+  # inbound client headers + the translated upstream headers actually sent
+  # to z.ai. Only the FIRST fetch attempt per request is recorded — retries
+  # and captcha re-solves are NOT logged, so each request = one file. Use
+  # this to verify the translation pipeline has no header defects (missing /
+  # extra / wrong-value headers). Auth tokens are masked (first-8...last-4).
+  # Clear with `rm -rf header-debug/` when done. Env var: ZCODE_PROXY_HEADER_DEBUG=1
+  # headerDebug: false
 
 # Retry configuration for upstream requests.
 # When the upstream returns a retryable status code (e.g. 529 site overloaded),
