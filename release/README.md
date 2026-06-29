@@ -1,5 +1,55 @@
 # zcode-proxy 使用说明
 
+> **v0.2.1.0 — 流式翻译路径 token 计数修复（cache_read_input_tokens + reasoning_tokens 透传）**
+>
+> 修复 v0.2.0.6 引入的 token 计数 bug：当客户端使用 OpenAI Chat Completions 或 Responses API 协议接入代理、且 `stream:true` 时，dashboard 严重低估输入 token（少约 35 倍），且不显示 thinking 量标记 `(th:M)`。Anthropic 直通路径不受影响，计数一直正确。
+>
+> **本次改动**
+>
+> **1. Bug #1：流式翻译路径丢失 `cache_read_input_tokens`（核心修复）**
+>
+> 当上游 GLM 启用 prompt cache（`cache_read_input_tokens > 0`）时，dashboard 显示 `in: 1152` 而不是 `in: 41152 (c:40000)`，少约 35 倍。
+>
+> 根因：`createStatsTransform` 接在翻译器**之后**，stats 解析器只能看到翻译器吐出来的内容。但两个流式翻译器（`sse-translator.ts` 和 `anthropic-to-responses.ts`）的 `message_start` 分支只读 `input_tokens`，没读 `cache_read_input_tokens`；最终 usage chunk 也没有这个字段。v0.2.0.6 修 cache_read 时只补了直通路径，漏了翻译路径。
+>
+> 修复：两个翻译器的 `TranslationState` / `StreamState` 加 `cacheReadInputTokens` 字段；`message_start` 读、`message_delta` 覆盖（message_delta 是权威源）；最终 usage chunk / `response.completed` payload 透传 `cache_read_input_tokens`。OpenAI 客户端会忽略未知 usage 字段，安全。
+>
+> **2. Bug #2：流式翻译路径丢弃 `thinking_delta` 事件**
+>
+> 上游开 thinking 时，GLM 流式发 `thinking_delta` 事件。两个翻译器的 `content_block_delta` 分支只处理 `text_delta` 和 `input_json_delta`，对 `thinking_delta` 直接 fall-through 丢弃。结果 dashboard 永远不显示 `(th:M)` 标记。
+>
+> 修复：两个翻译器加 `thinkingTokens` 计数器；`content_block_delta` 加 `thinking_delta` 分支累加计数；最终 usage 以 `reasoning_tokens` 字段输出（Chat Completions 流式 chunk）或 `output_tokens_details.reasoning_tokens`（Responses API）。注意：**不向前端客户端输出 thinking 内容**——OpenAI/Responses 协议没有标准的 reasoning 流式格式，硬塞会破坏 strict 客户端。只透传计数给 stats observer 用。
+>
+> **3. Bug #3：`reasoning_tokens` 硬编码为 0**
+>
+> `anthropic-to-responses.ts` 的 `buildResponseSnapshot` 和 `translateResponseAnthropicToResponses` 写死 `output_tokens_details: { reasoning_tokens: 0 }`，即使上游开了 thinking 也报 0。修复为使用真实 thinking 计数；batch 路径同步从 `resp.usage.reasoning_tokens`（GLM 扩展字段）读取。
+>
+> **4. 上游权威值优先**
+>
+> 如果 GLM 在 `message_delta.usage` 里返回了权威 `reasoning_tokens` 计数，优先采用它而不是我们的 chunk 计数（chunk 计数是近似值，一个 thinking_delta 事件算 1）。GLM 不总是返回这个字段，但返回时它就是真实值。
+>
+> **5. Stats observer 增强**
+>
+> `observeStreamParseSse`（`src/proxy/handler.ts`）新增三处 `reasoning_tokens` 提取点：
+> - `response.completed.response.usage.output_tokens_details.reasoning_tokens`（Responses API 流式）
+> - `message_delta.usage.reasoning_tokens`（Anthropic 流式，GLM 扩展）
+> - Chat Completions chunk 的扩展 usage 字段（`j.choices && j.usage`，无 `type` 字段时匹配）
+>
+> **6. 测试覆盖**
+>
+> 新增 9 个回归测试（604/604 全过，TypeScript 零错误）：
+> - `sse-translator.test.ts` +3：cache_read_input_tokens 透传、thinking_delta 计数、上游权威值优先
+> - `anthropic-to-responses.test.ts` +6：batch + 流式路径的 cache/reasoning 透传
+>
+> 端到端验证：同一条上游 SSE（`input=1152, cache=40000, output=529, thinking=2 chunks`）经过 Anthropic 直通 / Chat Completions 翻译 / Responses API 翻译三条路径后，stats observer 提取的计数完全一致：`in: 41152 (c:40000) out: 529 (th:2)`。
+>
+> **影响范围**：
+> - **Claude Code（Anthropic 直通）用户**：无变化，计数一直正确。
+> - **Codex CLI / OpenAI SDK（Responses API / Chat Completions 流式）用户**：dashboard 现在显示真实 input 总量 + cache 命中量 + thinking 量，之前严重低估。
+> - **配置兼容**：无需修改任何配置，开箱即得正确计数。
+>
+> ---
+
 > **v0.2.0.9 — 严格请求头白名单 + cache_control 指纹对齐**
 >
 > 基于 2026-06-28 对 app.asar Mf() (offset 886853) + SDK 字面量 (offset 1085109) + yU (offset 887429) 的最新解包,全面对齐真实 ZCode 客户端的请求头指纹。修复了多个之前未发现的指纹泄漏问题。

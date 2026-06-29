@@ -13,6 +13,26 @@ interface TranslationState {
   inputTokens: number;
   outputTokens: number;
   /**
+   * v0.2.0.10: cache tokens read from upstream Anthropic usage. The proxy's
+   * stats observer (handler.ts observeStreamParseSse) reads this field from
+   * the final usage chunk so the dashboard can show "in: N (c:M)".
+   * Without this, the Chat Completions streaming path silently dropped
+   * cache_read_input_tokens — the dashboard showed only the small
+   * input_tokens value (often ~35x smaller than reality when prompt
+   * caching is active).
+   */
+  cacheReadInputTokens: number;
+  /**
+   * v0.2.0.10: thinking chunk count from thinking_delta events. GLM streams
+   * these before the final text output when thinking is enabled. We count
+   * them so the final usage chunk can carry a `reasoning_tokens` field —
+   * the proxy's stats observer reads this and shows "out: N (th:M)".
+   * Chunk count is approximate (one per thinking_delta event), but it's
+   * the best we have without a tokeniser; the upstream message_delta.usage
+   * sometimes carries an authoritative count but not always.
+   */
+  thinkingTokens: number;
+  /**
    * Tracks active tool_use content blocks by their Anthropic block index.
    * Key = Anthropic block index (from content_block_start.index).
    * Value = { openaiIndex, id, name }.
@@ -36,6 +56,8 @@ function initState(model: string): TranslationState {
     roleSent: false,
     inputTokens: 0,
     outputTokens: 0,
+    cacheReadInputTokens: 0,
+    thinkingTokens: 0,
     toolBlocks: new Map(),
     nextToolIndex: 0,
   };
@@ -45,7 +67,7 @@ function makeChunk(
   state: TranslationState,
   delta: Record<string, unknown>,
   finishReason: string | null = null,
-  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number },
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number; cache_read_input_tokens?: number; reasoning_tokens?: number },
 ): string {
   const chunk: OpenAIStreamChunk & { usage?: typeof usage } = {
     id: state.messageId || "chatcmpl-stream",
@@ -139,6 +161,12 @@ function translateEvent(state: TranslationState, sse: ParsedSSE): string | null 
       state.messageId = msg?.id ?? "msg_stream";
       state.model = msg?.model ?? state.model;
       state.inputTokens = msg?.usage?.input_tokens ?? 0;
+      // v0.2.0.10: preserve cache_read_input_tokens from upstream. The
+      // proxy's stats observer reads this from the final usage chunk so the
+      // dashboard can show "in: N (c:M)". The authoritative value usually
+      // arrives in message_delta, but message_start sometimes carries it
+      // too (and is the only place GLM puts it for some models).
+      state.cacheReadInputTokens = msg?.usage?.cache_read_input_tokens ?? 0;
       if (!state.roleSent) {
         state.roleSent = true;
         return makeChunk(state, { role: "assistant" });
@@ -195,6 +223,18 @@ function translateEvent(state: TranslationState, sse: ParsedSSE): string | null 
           }],
         });
       }
+      // v0.2.0.10: count thinking_delta chunks so the final usage chunk can
+      // carry a reasoning_tokens field. OpenAI Chat Completions has no
+      // native streaming format for reasoning, so we don't emit anything
+      // to the client here (DeepSeek-style `reasoning_content` deltas were
+      // considered but would pollute the OpenAI protocol and break strict
+      // clients). The count is approximate — one per thinking_delta event —
+      // but it's enough for the dashboard's "(th:M)" indicator.
+      if (delta?.type === "thinking_delta") {
+        const t = delta?.thinking;
+        if (typeof t === "string" && t.length > 0) state.thinkingTokens++;
+        return null;
+      }
       return null;
     }
 
@@ -214,12 +254,31 @@ function translateEvent(state: TranslationState, sse: ParsedSSE): string | null 
       if (dataAny?.usage?.output_tokens !== undefined) {
         state.outputTokens = dataAny.usage.output_tokens;
       }
+      // v0.2.0.10: message_delta is the AUTHORITATIVE source for cache_read_input_tokens
+      // (message_start often carries placeholder 0). Update if present.
+      if (typeof dataAny?.usage?.cache_read_input_tokens === "number" && dataAny.usage.cache_read_input_tokens > 0) {
+        state.cacheReadInputTokens = dataAny.usage.cache_read_input_tokens;
+      }
+      // v0.2.0.10: if upstream provides an authoritative reasoning token count
+      // in message_delta.usage, prefer it over our chunk count. GLM doesn't
+      // always include this, but when it does, it's the real value.
+      if (typeof dataAny?.usage?.reasoning_tokens === "number" && dataAny.usage.reasoning_tokens > 0) {
+        state.thinkingTokens = dataAny.usage.reasoning_tokens;
+      }
       if (delta?.stop_reason) {
         const finishReason = mapStopReason(delta.stop_reason);
         return makeChunk(state, {}, finishReason, {
           prompt_tokens: state.inputTokens,
           completion_tokens: state.outputTokens,
           total_tokens: state.inputTokens + state.outputTokens,
+          // v0.2.0.10: forward cache_read_input_tokens so the proxy stats
+          // observer can show the cache-hit portion of input tokens. OpenAI
+          // clients ignore unknown usage fields, so this is a safe extension.
+          ...(state.cacheReadInputTokens > 0 ? { cache_read_input_tokens: state.cacheReadInputTokens } : {}),
+          // v0.2.0.10: forward reasoning_tokens (thinking) so the proxy can
+          // show "out: N (th:M)". OpenAI's Responses API uses this field
+          // name; we reuse it here for consistency.
+          ...(state.thinkingTokens > 0 ? { reasoning_tokens: state.thinkingTokens } : {}),
         });
       }
       return null;
@@ -230,6 +289,8 @@ function translateEvent(state: TranslationState, sse: ParsedSSE): string | null 
         prompt_tokens: state.inputTokens,
         completion_tokens: state.outputTokens,
         total_tokens: state.inputTokens + state.outputTokens,
+        ...(state.cacheReadInputTokens > 0 ? { cache_read_input_tokens: state.cacheReadInputTokens } : {}),
+        ...(state.thinkingTokens > 0 ? { reasoning_tokens: state.thinkingTokens } : {}),
       });
     }
 

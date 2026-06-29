@@ -74,6 +74,35 @@ describe("translateResponseAnthropicToResponses", () => {
     const result = translateResponseAnthropicToResponses(makeAnthropicResp(), "glm-4.6", "resp_prev_id");
     expect(result.previous_response_id).toBe("resp_prev_id");
   });
+
+  // v0.2.0.10: regression tests for cache_read_input_tokens + reasoning_tokens
+  // forwarding. Without these, the proxy dashboard under-reports token counts
+  // by ~35x when prompt caching is active for Responses API batch clients.
+  it("v0.2.0.10: forwards cache_read_input_tokens when present", () => {
+    const resp = makeAnthropicResp({
+      usage: { input_tokens: 1152, output_tokens: 5, cache_read_input_tokens: 40000 } as any,
+    });
+    const result = translateResponseAnthropicToResponses(resp);
+    expect(result.usage).toMatchObject({
+      input_tokens: 1152,
+      output_tokens: 5,
+      total_tokens: 1157,
+      cache_read_input_tokens: 40000,
+    });
+  });
+
+  it("v0.2.0.10: omits cache_read_input_tokens when not present (no zero-pollution)", () => {
+    const result = translateResponseAnthropicToResponses(makeAnthropicResp());
+    expect(result.usage).not.toHaveProperty("cache_read_input_tokens");
+  });
+
+  it("v0.2.0.10: forwards upstream reasoning_tokens from usage", () => {
+    const resp = makeAnthropicResp({
+      usage: { input_tokens: 10, output_tokens: 5, reasoning_tokens: 1234 } as any,
+    });
+    const result = translateResponseAnthropicToResponses(resp);
+    expect(result.usage?.output_tokens_details?.reasoning_tokens).toBe(1234);
+  });
 });
 
 describe("buildResponsesOutput", () => {
@@ -180,5 +209,59 @@ describe("anthropicSseToResponsesSse", () => {
     const out = await readStream(stream);
     expect(out).toContain('"status":"incomplete"');
     expect(out).toContain('"incomplete_details":{"reason":"max_output_tokens"}');
+  });
+
+  // v0.2.0.10: regression tests for cache_read_input_tokens + thinking_delta
+  // forwarding through the Responses API streaming path.
+  it("v0.2.0.10: forwards cache_read_input_tokens in response.completed usage", async () => {
+    const anthropicSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_c","model":"glm-4.6","usage":{"input_tokens":1152,"output_tokens":0,"cache_read_input_tokens":40000}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+
+    const stream = anthropicSseToResponsesSse(new Response(anthropicSse).body!, "glm-4.6");
+    const out = await readStream(stream);
+    // The final response.completed event must carry cache_read_input_tokens
+    // so the proxy stats observer can show "in: 41152 (c:40000)".
+    expect(out).toContain('"cache_read_input_tokens":40000');
+  });
+
+  it("v0.2.0.10: counts thinking_delta chunks as reasoning_tokens in response.completed", async () => {
+    const anthropicSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_th","model":"glm-4.6","usage":{"input_tokens":10,"output_tokens":0}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step 1"}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step 2"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+
+    const stream = anthropicSseToResponsesSse(new Response(anthropicSse).body!, "glm-4.6");
+    const out = await readStream(stream);
+    // The thinking_delta events should be counted (2 chunks) and surfaced
+    // as reasoning_tokens in the final response.completed usage payload.
+    expect(out).toContain('"reasoning_tokens":2');
+  });
+
+  it("v0.2.0.10: prefers upstream-provided reasoning_tokens over chunk count", async () => {
+    const anthropicSse = [
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_at","model":"glm-4.6","usage":{"input_tokens":10,"output_tokens":0}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"x"}}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5,"reasoning_tokens":1234}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("");
+
+    const stream = anthropicSseToResponsesSse(new Response(anthropicSse).body!, "glm-4.6");
+    const out = await readStream(stream);
+    expect(out).toContain('"reasoning_tokens":1234');
+    expect(out).not.toMatch(/"reasoning_tokens":1[},]/);
   });
 });

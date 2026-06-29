@@ -87,6 +87,17 @@ export function translateResponseAnthropicToResponses(
   const status = mapStopReasonToStatus(resp.stop_reason);
   const inputTokens = resp.usage?.input_tokens ?? 0;
   const outputTokens = resp.usage?.output_tokens ?? 0;
+  // v0.2.0.10: preserve cache_read_input_tokens from upstream Anthropic usage.
+  // The proxy's stats observer (handler.ts observeStreamParseSse) reads this
+  // from response.completed.response.usage so the dashboard shows
+  // "in: N (c:M)". Without this, the Responses API batch path silently
+  // dropped cache tokens when prompt caching was active.
+  const cacheReadTokens = resp.usage?.cache_read_input_tokens ?? 0;
+  // v0.2.0.10: thinking_delta events don't reach the batch translator (only
+  // streaming), but the upstream Anthropic batch response may carry a
+  // reasoning token count in usage.reasoning_tokens (GLM extension). If
+  // present, forward it; otherwise we can't recover it from the batch body.
+  const reasoningTokens = (resp.usage as any)?.reasoning_tokens ?? 0;
 
   return {
     id: genId("resp"),
@@ -99,7 +110,11 @@ export function translateResponseAnthropicToResponses(
       input_tokens: inputTokens,
       output_tokens: outputTokens,
       total_tokens: inputTokens + outputTokens,
-      output_tokens_details: { reasoning_tokens: 0 },
+      output_tokens_details: { reasoning_tokens: reasoningTokens },
+      // v0.2.0.10: forward as a top-level usage field too so the proxy
+      // stats observer can pick it up (it reads j.response.usage.cache_read_input_tokens).
+      // OpenAI clients ignore unknown usage fields, so this is safe.
+      ...(cacheReadTokens > 0 ? { cache_read_input_tokens: cacheReadTokens } : {}),
     },
     previous_response_id: previousResponseId ?? null,
     incomplete_details: status === "incomplete" ? { reason: "max_output_tokens" } : null,
@@ -125,6 +140,10 @@ interface StreamState {
   anthropicMessageId: string;
   inputTokens: number;
   outputTokens: number;
+  /** v0.2.0.10: cache_read_input_tokens from upstream Anthropic usage. */
+  cacheReadInputTokens: number;
+  /** v0.2.0.10: thinking chunk count from thinking_delta events. */
+  thinkingTokens: number;
   stopReason: string | null;
   /** Have we emitted response.created + response.in_progress yet? */
   headerSent: boolean;
@@ -152,6 +171,8 @@ function initState(model: string): StreamState {
     anthropicMessageId: "",
     inputTokens: 0,
     outputTokens: 0,
+    cacheReadInputTokens: 0,
+    thinkingTokens: 0,
     stopReason: null,
     headerSent: false,
     nextOutputIndex: 0,
@@ -180,7 +201,13 @@ function buildResponseSnapshot(state: StreamState, status: OpenAIResponse["statu
       input_tokens: state.inputTokens,
       output_tokens: state.outputTokens,
       total_tokens: state.inputTokens + state.outputTokens,
-      output_tokens_details: { reasoning_tokens: 0 },
+      // v0.2.0.10: use the real thinking token count instead of a hardcoded 0.
+      // The proxy stats observer reads response.usage.output_tokens_details.reasoning_tokens
+      // for the "(th:M)" indicator.
+      output_tokens_details: { reasoning_tokens: state.thinkingTokens },
+      // v0.2.0.10: forward cache_read_input_tokens so the proxy can show
+      // "in: N (c:M)". OpenAI clients ignore unknown usage fields.
+      ...(state.cacheReadInputTokens > 0 ? { cache_read_input_tokens: state.cacheReadInputTokens } : {}),
     },
     incomplete_details: status === "incomplete" ? { reason: "max_output_tokens" } : null,
   };
@@ -323,6 +350,10 @@ function translateStreamEvent(state: StreamState, sse: ParsedSSE): string[] {
       state.anthropicMessageId = msg?.id ?? "msg_stream";
       state.model = msg?.model ?? state.model;
       state.inputTokens = msg?.usage?.input_tokens ?? 0;
+      // v0.2.0.10: preserve cache_read_input_tokens from upstream. The
+      // authoritative value usually arrives in message_delta, but
+      // message_start sometimes carries it too.
+      state.cacheReadInputTokens = msg?.usage?.cache_read_input_tokens ?? 0;
       // Emit response.created + response.in_progress
       out.push(...emitHeaderIfNeeded(state));
       return out;
@@ -374,6 +405,16 @@ function translateStreamEvent(state: StreamState, sse: ParsedSSE): string[] {
             delta: delta.partial_json ?? "",
           }));
         }
+      } else if (delta?.type === "thinking_delta") {
+        // v0.2.0.10: count thinking_delta chunks so the final response.completed
+        // usage can carry a real reasoning_tokens value. Codex CLI doesn't render
+        // reasoning summaries (we skip thinking blocks in buildResponsesOutput),
+        // but the proxy stats observer reads reasoning_tokens for the "(th:M)"
+        // dashboard indicator. We don't emit any Responses API event for thinking
+        // — the protocol has no standard streaming format for reasoning summaries
+        // and emitting a non-standard one would break Codex.
+        const t = delta?.thinking;
+        if (typeof t === "string" && t.length > 0) state.thinkingTokens++;
       }
       return out;
     }
@@ -389,6 +430,15 @@ function translateStreamEvent(state: StreamState, sse: ParsedSSE): string[] {
       const delta = dataAny.delta;
       if (dataAny?.usage?.output_tokens !== undefined) {
         state.outputTokens = dataAny.usage.output_tokens;
+      }
+      // v0.2.0.10: message_delta is the AUTHORITATIVE source for cache_read_input_tokens.
+      if (typeof dataAny?.usage?.cache_read_input_tokens === "number" && dataAny.usage.cache_read_input_tokens > 0) {
+        state.cacheReadInputTokens = dataAny.usage.cache_read_input_tokens;
+      }
+      // v0.2.0.10: if upstream provides an authoritative reasoning_tokens count,
+      // prefer it over our chunk count.
+      if (typeof dataAny?.usage?.reasoning_tokens === "number" && dataAny.usage.reasoning_tokens > 0) {
+        state.thinkingTokens = dataAny.usage.reasoning_tokens;
       }
       if (delta?.stop_reason) {
         state.stopReason = delta.stop_reason;

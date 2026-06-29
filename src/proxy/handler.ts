@@ -2069,16 +2069,35 @@ function observeStreamParseSse(text: string, state: {
         continue;
       }
       if (j.type === "response.completed" && j.response?.usage) {
-        if (j.response.usage.output_tokens) state.tokens = j.response.usage.output_tokens;
-        if (j.response.usage.input_tokens) state.inputTokens = j.response.usage.input_tokens;
-        if (j.response.usage.cache_read_input_tokens) state.cacheReadTokens = j.response.usage.cache_read_input_tokens;
+        const u = j.response.usage;
+        if (u.output_tokens) state.tokens = u.output_tokens;
+        if (u.input_tokens) state.inputTokens = u.input_tokens;
+        if (u.cache_read_input_tokens) state.cacheReadTokens = u.cache_read_input_tokens;
+        // v0.2.0.10: Responses API carries thinking token count in
+        // usage.output_tokens_details.reasoning_tokens. Prefer this
+        // authoritative value over chunk counting when present.
+        const rt = u.output_tokens_details?.reasoning_tokens;
+        if (typeof rt === "number" && rt > 0) state.thinkingTokens = rt;
         continue;
       }
       if (j.type === "message_delta" && j.usage) {
         if (j.usage.output_tokens) state.tokens = j.usage.output_tokens;
         if (j.usage.input_tokens) state.inputTokens = j.usage.input_tokens;
         if (j.usage.cache_read_input_tokens) state.cacheReadTokens = j.usage.cache_read_input_tokens;
+        // v0.2.0.10: GLM extension — message_delta.usage may carry an
+        // authoritative reasoning_tokens count. Prefer it over chunk counting.
+        if (typeof j.usage.reasoning_tokens === "number" && j.usage.reasoning_tokens > 0) state.thinkingTokens = j.usage.reasoning_tokens;
         continue;
+      }
+      // v0.2.0.10: Chat Completions streaming — the final chunk carries usage
+      // with cache_read_input_tokens / reasoning_tokens as non-standard
+      // extension fields (added by sse-translator.ts). OpenAI chunks don't
+      // have a `type` field, so we match by the presence of `choices` +
+      // `usage`. This must run AFTER the message_delta / response.completed
+      // branches above so those take precedence on type collisions.
+      if (j.choices && j.usage) {
+        if (j.usage.cache_read_input_tokens) state.cacheReadTokens = j.usage.cache_read_input_tokens;
+        if (typeof j.usage.reasoning_tokens === "number" && j.usage.reasoning_tokens > 0) state.thinkingTokens = j.usage.reasoning_tokens;
       }
     } catch {}
   }

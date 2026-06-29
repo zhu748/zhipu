@@ -194,6 +194,111 @@ describe("anthropicSseToOpenaiSse", () => {
     // The OpenAI tool_calls index should be 0 (first tool call).
     expect(output).toContain('"index":0');
   });
+
+  // v0.2.0.10: regression tests for cache_read_input_tokens + thinking_delta
+  // forwarding. Without these, the proxy dashboard under-reports token
+  // counts by ~35x when prompt caching is active, and never shows the
+  // "(th:M)" thinking indicator for OpenAI Chat Completions streaming clients.
+  it("v0.2.0.10: forwards cache_read_input_tokens in the final usage chunk", async () => {
+    const sse = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"id":"msg_c","model":"glm-4.6","usage":{"input_tokens":1152,"output_tokens":0,"cache_read_input_tokens":40000}}}',
+      '',
+      'event: content_block_start',
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}',
+      '',
+      'event: content_block_stop',
+      'data: {"type":"content_block_stop","index":0}',
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}',
+      '',
+      'event: message_stop',
+      'data: {"type":"message_stop"}',
+      '',
+    ].join('\n');
+    const input = makeStream(sse);
+    const output = await collectStream(anthropicSseToOpenaiSse(input, "glm-4.6"));
+    // The final usage chunk must carry cache_read_input_tokens so the proxy
+    // stats observer can compute "in: 41152 (c:40000)".
+    expect(output).toContain('"cache_read_input_tokens":40000');
+  });
+
+  it("v0.2.0.10: counts thinking_delta chunks and forwards reasoning_tokens", async () => {
+    const sse = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"id":"msg_th","model":"glm-4.6","usage":{"input_tokens":10,"output_tokens":0,"cache_read_input_tokens":0}}}',
+      '',
+      'event: content_block_start',
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step 1"}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step 2"}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"step 3"}}',
+      '',
+      'event: content_block_stop',
+      'data: {"type":"content_block_stop","index":0}',
+      '',
+      'event: content_block_start',
+      'data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}',
+      '',
+      'event: content_block_stop',
+      'data: {"type":"content_block_stop","index":1}',
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}',
+      '',
+      'event: message_stop',
+      'data: {"type":"message_stop"}',
+      '',
+    ].join('\n');
+    const input = makeStream(sse);
+    const output = await collectStream(anthropicSseToOpenaiSse(input, "glm-4.6"));
+    // The thinking_delta events should NOT appear as OpenAI content chunks
+    // (we don't pollute the OpenAI protocol with reasoning content).
+    expect(output).not.toContain('"thinking"');
+    // But the final usage chunk must carry reasoning_tokens so the proxy
+    // can show "out: 5 (th:3)".
+    expect(output).toContain('"reasoning_tokens":3');
+  });
+
+  it("v0.2.0.10: prefers upstream-provided reasoning_tokens over chunk count", async () => {
+    // If GLM provides an authoritative reasoning_tokens in message_delta.usage,
+    // we should use that instead of our chunk count (which is approximate).
+    const sse = [
+      'event: message_start',
+      'data: {"type":"message_start","message":{"id":"msg_at","model":"glm-4.6","usage":{"input_tokens":10,"output_tokens":0}}}',
+      '',
+      'event: content_block_delta',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"x"}}',
+      '',
+      'event: message_delta',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5,"reasoning_tokens":1234}}',
+      '',
+      'event: message_stop',
+      'data: {"type":"message_stop"}',
+      '',
+    ].join('\n');
+    const input = makeStream(sse);
+    const output = await collectStream(anthropicSseToOpenaiSse(input, "glm-4.6"));
+    // The authoritative value (1234) should win, not the chunk count (1).
+    expect(output).toContain('"reasoning_tokens":1234');
+    // Check that no usage chunk carries the chunk-count value (1). We match
+    // `reasoning_tokens":1` followed by `,` or `}` to avoid false positives
+    // from `reasoning_tokens":1234` (which contains the substring `:1`).
+    expect(output).not.toMatch(/"reasoning_tokens":1[},]/);
+  });
 });
 
 describe("openaiSseToAnthropicSse", () => {
