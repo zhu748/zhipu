@@ -81,10 +81,16 @@ export async function anthropicSseToBatchMessage(
       buffer += decoder.decode(value, { stream: true });
 
       // Process complete SSE events (separated by \n\n)
+      //
+      // v0.2.2+ PERF: use a cursor instead of `buffer = buffer.slice(...)`
+      // for each event. The previous form was O(N²) — every event slice
+      // copied the remaining buffer. With a cursor, we only compact the
+      // buffer once when the loop exits (to retain the unfinished tail).
+      let cursor = 0;
       let eventEnd: number;
-      while ((eventEnd = buffer.indexOf("\n\n")) !== -1) {
-        const eventStr = buffer.slice(0, eventEnd);
-        buffer = buffer.slice(eventEnd + 2);
+      while ((eventEnd = buffer.indexOf("\n\n", cursor)) !== -1) {
+        const eventStr = buffer.slice(cursor, eventEnd);
+        cursor = eventEnd + 2;
 
         // Parse the SSE event — extract `data:` lines, ignore `event:`/`id:`/etc.
         // Anthropic's wire format puts the type inside the JSON `data` payload,
@@ -131,6 +137,11 @@ export async function anthropicSseToBatchMessage(
         if (result.error) {
           return { error: result.error };
         }
+      }
+      // Compact the buffer: keep only the unfinished tail (from cursor onward).
+      // This is the only slice — one allocation per chunk instead of one per event.
+      if (cursor > 0) {
+        buffer = buffer.slice(cursor);
       }
     }
   } finally {

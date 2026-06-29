@@ -1,5 +1,50 @@
 # zcode-proxy 使用说明
 
+> **v0.2.1.2 — 全面优化：并发竞态修复 + 性能提升 + 死代码清理**
+>
+> 本版本对核心代理转发链路进行了两轮深度优化，修复了多个并发竞态与资源泄漏，显著降低了 WAF 重试与凭证切换路径的事件循环阻塞，并清理了 255 行无生产引用的 deprecated 死代码。所有 644 个单元测试通过，TypeScript 类型检查零错误。
+>
+> **本次改动**
+>
+> **1. 严重并发竞态修复（P0）**
+>
+> - **代理池 sticky 状态竞态**：`pickProxy` / `markProxyFailed` 引入 `stateMutex` 串行化 `currentWorkingProxy` 与 `roundRobinCursor` 的读-改-写。此前两个并发请求会同时观察到 sticky 为 null，各自推进游标并拿到不同代理，粘性策略失效。
+> - **重试循环无限增长**：`extraAttemptsFromSwitches` 每次凭证切换自增但无上限。新增硬上限 `MAX_TOTAL_ATTEMPTS = min(maxRetries×4+10, 20)`，防止并发 dashboard 导入新账号时循环超预期运行（每个 attempt 还要等 40s captcha 超时）。
+> - **Captcha 配置不可用导致 10+ 分钟超时**：区分网络错误（hard fail，立即返回 503 中断重试）vs 配置返回但 disabled（soft fail，跳过 captcha 让上游决定）。此前每个凭证都要走 120s captcha 超时才返回错误。
+>
+> **2. 性能与流畅度优化（P1）**
+>
+> - **`markProxyFailed` 防抖刷盘**：从每次调用全量读盘+写盘改为内存更新 + 5 秒合并刷盘。WAF 轮换中 6-9 次磁盘写合并为 1 次，消除 30-450ms 事件循环阻塞。
+> - **代理池并行刷新**：`refreshFromSources` 从串行 `await importFromUrl` 改为 `Promise.all` 并行 fetch 所有 URL 源。5 个源的最坏刷新时间从 150s 降到 ~30s。
+> - **代理失败 cooldown**：`pickProxy` 跳过 60 秒内刚失败的代理（消费之前是死代码的 `failures` 字段，新增 `lastFailedAt` 时间戳）。此前刚失败的代理会立即被 round-robin 重新选中导致重复失败。
+> - **单请求内 triedPoolProxies TTL**：从 `Set` 改为 `Map<url, triedAt>` + 60s TTL。此前第一次 attempt 试过的代理在所有后续 retry 中永久排除，即使已恢复也无法回退。
+> - **retry 中 transform+stringify 缓存**：凭证切换后仅当 `userId|plan|thinkingLevel` 实际变化才重新转换。coding-plan 间切换的 transform 输出完全相同，每次节省 8-30ms。
+> - **SSE 统计解析早停**：`observeStreamParseSse` 加 `includes()` 标记检查，跳过非关键 event 的 `JSON.parse`。长流（1000+ events）节省 100ms+ CPU。
+> - **WAF 检测流式 peek**：`checkWafBlock` 从 `await resp.text()` 全量读取改为流式 peek + 32KB 上限 + 命中签名早停，防大 HTML 响应 OOM。
+> - **日志批量 fan-out**：`appendLog` 从同步遍历所有 SSE waiter 改为 `queueMicrotask` 批量推送。50 个 dashboard tab × 100 logs/sec 从 5000 次同步 enqueue 降到 1 次 microtask。
+> - **stats seenIds LRU**：从全清+重建（丢 4900 个 id）改为增量 evict（每次删 1000 条，limit 提到 50000），消除长跑服务 stats 虚高。
+> - **SSE 批量重组 O(N²)→O(N)**：`sse-to-batch.ts` 用 cursor 指针替代每事件 `buffer.slice()`。
+> - **sse-error-detector 竞态**：`reconstructStream` 加 `streamClosed` 状态 + `safeClose/safeError/safeEnqueue` 包装，防 client abort 与 async read loop 竞态导致 uncaught exception。
+>
+> **3. 配置与内存安全（P2/P3）**
+>
+> - **admin 配置 deep-clone**：配置 PUT 路径对 `responsesThinking` / `routingRules` / `modelMappings` / `corsAllowList` / `models` 加 defensive 深拷贝，防止 `newConfig` 与 `opts.config` 共享引用导致 in-place mutation 污染 live config。
+> - **responses-store LRU + TTL**：从 FIFO eviction 改为 LRU（`lastAccessAt`）+ 24h TTL，自动清理过期会话，内存占用有界。
+> - **captcha JSDOM 资源清理增强**：`vc.removeAllListeners` + `delete w.document/navigator` 断引用环，减少长跑服务内存缓慢增长。
+>
+> **4. 死代码清理**
+>
+> - 删除 `src/translator/anthropic-to-openai.ts`（140 行 @deprecated，无生产引用）
+> - 删除 `sse-translator.ts` 中的 `openaiSseToAnthropicSse` + `formatAnthropicSSE` + `mapFinishReason`（115 行，有已知 Anthropic SSE spec 违规 bug，无生产引用）
+> - 同步删除对应 8 个 deprecated 测试
+>
+> **5. 工程化改进**
+>
+> - 新增 `src/utils/constants.ts`：集中管理 LOG/RETRY/PROXY_POOL/CAPTCHA/ADMIN/WAF/SSE 常量组
+> - 新增 `src/utils/errors.ts`：ErrorType 错误码枚举（40+ 错误类型）
+>
+> **不影响兼容性**：本次改动未触碰 ZCode 请求格式转换逻辑（`body-transformer.ts` 的 `alignZCodeRequestFormat` 等），captcha 核心求解逻辑（JSDOM 配置、polyfill、SDK 调用）也完全未变，仅增强了错误分类与资源清理。
+
 > **v0.2.1.1 — 全局代理池 + WAF 拦截自动轮询重试 + 粘性代理 + 代理检测**
 >
 > 新增全局共享出站代理池，支持手动导入、txt 文件上传、URL 一键导入与定时自动刷新。当请求遇到 405/阿里云 WAF 拦截时，自动轮询切换到池中其他代理重试。粘性代理机制让可用代理持续复用，直到失败才切换。

@@ -1,21 +1,20 @@
 /**
  * Tests for OpenAI ↔ Anthropic translators.
  * @see .omo/plans/zcode-proxy.md Task 11
+ *
+ * v0.2.2+: the reverse-direction translators
+ * (`translateRequestAnthropicToOpenAI`, `translateResponseOpenAIToAnthropic`)
+ * were removed as dead code (never used in production, marked @deprecated).
+ * Their test sections were removed alongside.
  */
 import { describe, it, expect } from "bun:test";
 import {
   translateRequestOpenAIToAnthropic,
   translateResponseAnthropicToOpenAI,
 } from "./openai-to-anthropic.js";
-import {
-  translateRequestAnthropicToOpenAI,
-  translateResponseOpenAIToAnthropic,
-} from "./anthropic-to-openai.js";
 import type {
   OpenAIChatRequest,
   AnthropicMessagesResponse,
-  AnthropicMessagesRequest,
-  OpenAIChatResponse,
 } from "./types.js";
 
 describe("translateRequestOpenAIToAnthropic", () => {
@@ -225,82 +224,5 @@ describe("translateResponseAnthropicToOpenAI", () => {
     expect(result.usage!.prompt_tokens).toBe(100);
     expect(result.usage!.completion_tokens).toBe(50);
     expect(result.usage!.total_tokens).toBe(150);
-  });
-});
-
-describe("translateRequestAnthropicToOpenAI", () => {
-  it("converts system string to system message", () => {
-    const req: AnthropicMessagesRequest = {
-      model: "glm-4.6",
-      messages: [{ role: "user", content: "Hi" }],
-      system: "Be helpful",
-      max_tokens: 1000,
-    };
-    const result = translateRequestAnthropicToOpenAI(req);
-    expect(result.messages[0].role).toBe("system");
-    expect(result.messages[0].content).toBe("Be helpful");
-    expect(result.max_tokens).toBe(1000);
-  });
-
-  it("converts stop_sequences to stop", () => {
-    const req: AnthropicMessagesRequest = {
-      model: "glm-4.6",
-      messages: [{ role: "user", content: "Hi" }],
-      max_tokens: 100,
-      stop_sequences: ["END"],
-    };
-    const result = translateRequestAnthropicToOpenAI(req);
-    expect(result.stop).toBe("END");
-  });
-
-  it("translates tools", () => {
-    const req: AnthropicMessagesRequest = {
-      model: "glm-4.6",
-      messages: [{ role: "user", content: "Search" }],
-      max_tokens: 100,
-      tools: [{ name: "search", description: "Search web", input_schema: { type: "object" } }],
-    };
-    const result = translateRequestAnthropicToOpenAI(req);
-    expect(result.tools).toHaveLength(1);
-    expect(result.tools![0].function.name).toBe("search");
-  });
-});
-
-describe("translateResponseOpenAIToAnthropic", () => {
-  it("converts text response", () => {
-    const resp: OpenAIChatResponse = {
-      id: "chatcmpl-1",
-      object: "chat.completion",
-      created: 1234567890,
-      model: "glm-4.6",
-      choices: [{
-        index: 0,
-        message: { role: "assistant", content: "Hello" },
-        finish_reason: "stop",
-      }],
-      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-    };
-    const result = translateResponseOpenAIToAnthropic(resp);
-    expect(result.content[0]).toEqual({ type: "text", text: "Hello" });
-    expect(result.stop_reason).toBe("end_turn");
-    expect(result.usage.input_tokens).toBe(10);
-    expect(result.usage.output_tokens).toBe(5);
-  });
-
-  it("maps finish_reason to stop_reason", () => {
-    const resp: OpenAIChatResponse = {
-      id: "chatcmpl-1",
-      object: "chat.completion",
-      created: 1234567890,
-      model: "glm-4.6",
-      choices: [{
-        index: 0,
-        message: { role: "assistant", content: "..." },
-        finish_reason: "length",
-      }],
-      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
-    };
-    const result = translateResponseOpenAIToAnthropic(resp);
-    expect(result.stop_reason).toBe("max_tokens");
   });
 });

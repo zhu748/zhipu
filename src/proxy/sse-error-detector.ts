@@ -501,11 +501,32 @@ function reconstructStream(
   bufferedChunks: Uint8Array[],
   reader: ReadableStreamDefaultReader<Uint8Array>,
 ): Response {
+  // v0.2.2+ FIX: track stream state so cancel() / error() / close() calls
+  // don't throw "Cannot X an already-closed stream". Without this guard,
+  // a client abort (cancel) racing with the async read loop's controller.error
+  // would surface an uncaught exception — rare in production but visible
+  // under high concurrency / flaky networks.
+  let streamClosed = false;
+  const safeClose = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+    if (streamClosed) return;
+    streamClosed = true;
+    try { controller.close(); } catch { /* already closed */ }
+  };
+  const safeError = (controller: ReadableStreamDefaultController<Uint8Array>, err: unknown) => {
+    if (streamClosed) return;
+    streamClosed = true;
+    try { controller.error(err); } catch { /* already closed */ }
+  };
+  const safeEnqueue = (controller: ReadableStreamDefaultController<Uint8Array>, chunk: Uint8Array) => {
+    if (streamClosed) return;
+    try { controller.enqueue(chunk); } catch { /* already closed — drop */ }
+  };
+
   const reconstructed = new ReadableStream<Uint8Array>({
     start(controller) {
       // Emit buffered chunks first (the bytes we already read while peeking)
       for (const chunk of bufferedChunks) {
-        controller.enqueue(chunk);
+        safeEnqueue(controller, chunk);
       }
 
       // Continue reading from where we left off
@@ -514,17 +535,20 @@ function reconstructStream(
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            controller.enqueue(value);
+            safeEnqueue(controller, value);
           }
-          controller.close();
+          safeClose(controller);
         } catch (err) {
-          controller.error(err);
+          safeError(controller, err);
         } finally {
           try { reader.releaseLock(); } catch {}
         }
       })();
     },
     cancel(reason) {
+      // Mark closed so the async read loop's subsequent safeEnqueue/safeClose
+      // calls become no-ops instead of throwing.
+      streamClosed = true;
       try { reader.cancel(reason); } catch {}
     },
   });

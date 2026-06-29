@@ -158,8 +158,15 @@ async function fetchCaptchaConfig(reqId?: string): Promise<FetchedCaptchaConfig 
   } catch (err) {
     // Config fetch failure is unrecoverable — don't retry. The retry loop
     // in getCaptchaToken treats null-config as a hard failure.
+    //
+    // v0.2.2+: tag the error so refreshCaptchaHeaders can distinguish
+    // "network error fetching config" (hard-fail, retry won't help) from
+    // "config returned but captcha disabled" (soft-fail, skip captcha
+    // and let the upstream decide if it's needed).
+    const wrapped = new Error(`captcha_config_fetch_failed: ${(err as Error).message}`);
+    (wrapped as Error & { configFetchFailed?: boolean }).configFetchFailed = true;
     console.warn(`${tag}[captcha] config fetch failed: ${(err as Error).message}`);
-    return null;
+    throw wrapped;
   }
 }
 
@@ -181,15 +188,22 @@ export async function getCaptchaToken(reqId?: string): Promise<{ verifyParam: st
   const tag = reqId ? `${reqId} ` : "";
   const solveStart = Date.now();
   return solveMutex.run(async () => {
-    const cfg = await fetchCaptchaConfig(reqId);
+    let cfg: FetchedCaptchaConfig | null;
+    try {
+      cfg = await fetchCaptchaConfig(reqId);
+    } catch (err) {
+      // Config FETCH failed (network error) — re-throw with the tag so
+      // handler.ts can hard-fail the retry loop. We DON'T catch this
+      // here because retrying getCaptchaToken won't help (the network
+      // won't suddenly recover).
+      throw err;
+    }
     if (!cfg || !cfg.enabled || !cfg.prefix || !cfg.sceneId) {
-      // Hard failure — config unavailable. Throwing here means retry attempts
-      // upstream won't help (the config won't suddenly appear), so handler.ts
-      // returns 503 immediately.
-      throw new Error(
-        "Captcha config unavailable (zcode.z.ai unreachable or returned disabled/empty config). " +
-        "Check network connectivity to zcode.z.ai; if behind a corporate proxy, set ZCODE_CAPTCHA_CONFIG_TIMEOUT_MS.",
-      );
+      // Config was returned but captcha is disabled or malformed.
+      // This is NOT a hard-fail — the upstream may not require captcha.
+      // handler.ts treats this as a soft-fail (skip captcha, let the
+      // upstream decide). Throw a distinguishable error.
+      throw new Error("captcha_disabled_by_config");
     }
 
     const verifyParam = await solveInJsdomWithRetry(cfg, reqId);
@@ -364,6 +378,15 @@ async function solveInJsdom(cfg: FetchedCaptchaConfig): Promise<string> {
     // and a fake XMLHttpRequest pool that all leak if we don't tear down.
     if (sdkLoadInterval) { try { clearInterval(sdkLoadInterval); } catch {} sdkLoadInterval = null; }
     if (solveTimeout) { try { clearTimeout(solveTimeout); } catch {} solveTimeout = null; }
+    // v0.2.2+ PERF: remove the jsdomError listener explicitly before
+    // closing the window. VirtualConsole keeps an internal listener list
+    // that can retain references to the dom/window even after w.close().
+    // Without this, every solve leaves a small closure graph behind
+    // (~50-200KB) that adds up under sustained start-plan traffic.
+    try {
+      vc.removeAllListeners?.("jsdomError");
+      vc.removeAllListeners?.();
+    } catch { /* VirtualConsole API may differ across jsdom versions */ }
     try {
       // Close the window — fires the unload event, releases internal
       // resources. Second arg "true" forces close even if pending
@@ -374,6 +397,14 @@ async function solveInJsdom(cfg: FetchedCaptchaConfig): Promise<string> {
     // Null out the major references to help GC.
     try { (dom as any)._document = null; } catch {}
     try { (dom as any)._defaultView = null; } catch {}
+    // v0.2.2+: also null out the captured window reference (the `w` const
+    // above) so the JSDOM internal map of windows can drop this instance.
+    // We can't reassign `w` (it's a const), but we can clear its key
+    // properties to break reference cycles.
+    try {
+      delete (w as any).document;
+      delete (w as any).navigator;
+    } catch { /* some props are non-configurable; ignore */ }
   }
 }
 

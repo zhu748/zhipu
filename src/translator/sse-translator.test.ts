@@ -1,9 +1,13 @@
 /**
  * Tests for SSE event translator.
  * @see .omo/plans/zcode-proxy.md Task 12
+ *
+ * v0.2.2+: the deprecated `openaiSseToAnthropicSse` function was removed
+ * as dead code (never used in production, had a known spec-violation bug).
+ * Its test section was removed alongside.
  */
 import { describe, it, expect } from "bun:test";
-import { anthropicSseToOpenaiSse, openaiSseToAnthropicSse } from "./sse-translator.js";
+import { anthropicSseToOpenaiSse } from "./sse-translator.js";
 
 function makeStream(text: string): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
@@ -298,43 +302,5 @@ describe("anthropicSseToOpenaiSse", () => {
     // `reasoning_tokens":1` followed by `,` or `}` to avoid false positives
     // from `reasoning_tokens":1234` (which contains the substring `:1`).
     expect(output).not.toMatch(/"reasoning_tokens":1[},]/);
-  });
-});
-
-describe("openaiSseToAnthropicSse", () => {
-  it("emits message_start on first chunk", async () => {
-    const sse = [
-      'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":123,"model":"glm-4.6","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
-      '',
-    ].join('\n');
-    const input = makeStream(sse);
-    const output = await collectStream(openaiSseToAnthropicSse(input, "glm-4.6"));
-    expect(output).toContain("message_start");
-    expect(output).toContain('"role":"assistant"');
-  });
-
-  it("translates delta.content to text_delta", async () => {
-    const sse = [
-      'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"glm-4.6","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}',
-      '',
-      'data: [DONE]',
-      '',
-    ].join('\n');
-    const input = makeStream(sse);
-    const output = await collectStream(openaiSseToAnthropicSse(input, "glm-4.6"));
-    expect(output).toContain("text_delta");
-    expect(output).toContain('"text":"Hi"');
-  });
-
-  it("emits message_stop on [DONE]", async () => {
-    const sse = [
-      'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"glm-4.6","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
-      '',
-      'data: [DONE]',
-      '',
-    ].join('\n');
-    const input = makeStream(sse);
-    const output = await collectStream(openaiSseToAnthropicSse(input, "glm-4.6"));
-    expect(output).toContain("message_stop");
   });
 });
