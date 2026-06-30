@@ -1749,7 +1749,7 @@ function stripUndefinedStringFields(node: unknown): number {
  * here is the clean fix — the Body mixin's constructor accepts a string
  * and produces a fresh, readable stream.
  */
-async function checkWafBlock(resp: Response): Promise<{ wafBlocked: true } | { wafBlocked: false; response: Response }> {
+export async function checkWafBlock(resp: Response): Promise<{ wafBlocked: true } | { wafBlocked: false; response: Response }> {
   // Fast path: status codes that the WAF typically uses.
   // 405 = Method Not Allowed (the classic WAF block)
   // 403 = Forbidden (captcha challenge or WAF block)
@@ -1807,12 +1807,59 @@ async function checkWafBlock(resp: Response): Promise<{ wafBlocked: true } | { w
       // No body — nothing to peek. Treat as non-WAF.
       return { wafBlocked: false, response: resp };
     }
-    // The Aliyun WAF error page always contains this string.
-    if (text.includes("errors.aliyun.com") || text.includes("aliyun") && text.includes("WAF")) {
+    // === Aliyun WAF standard block page ===
+    // 已有指纹 1: errors.aliyun.com 字符串(图片 URL / 错误页链接)
+    if (text.includes("errors.aliyun.com") || (text.includes("aliyun") && text.includes("WAF"))) {
       return { wafBlocked: true };
     }
-    // Secondary signal: Tengine server + status 405 + HTML body
+    // 已有指纹 2: Tengine server + 405 + text/html
     if (resp.status === 405 && ct.includes("text/html") && server.toLowerCase().includes("tengine")) {
+      return { wafBlocked: true };
+    }
+    // 新增指纹 3: 阿里云 WAF 拦截页更稳的特征(不依赖图片 URL 是否变化)
+    //   - data-spm 是阿里云埋点属性,几乎所有阿里云系拦截页都带
+    //   - block_message / block_traceid_tips 是阿里云 WAF 标准 JS 文案 key
+    //   - 这些字段即使 errors.aliyun.com 域名换了也仍然存在
+    if (ct.includes("text/html") &&
+        text.includes("data-spm") &&
+        (text.includes("block_message") || text.includes("block_traceid_tips"))) {
+      return { wafBlocked: true };
+    }
+
+    // === Nginx 伪装 405 拦截页 (Render 日志观察到的形态) ===
+    // 形态:`<html><head><title>405 Not Allowed</title></head>
+    //        <body><center><h1>405 Not Allowed</h1></center>
+    //        <hr><center>nginx/1.31.2</center></body></html>`
+    //
+    // 关键特征:
+    //   - body 极短(<2KB),纯标准 nginx 默认错误页
+    //   - server 头声称 nginx/1.31.x,但 nginx 实际不存在 1.31 mainline
+    //     (2025 年 nginx mainline 是 1.27.x,stable 是 1.26.x)
+    //     这种"未来版本号"几乎肯定是 WAF/网关伪装
+    //   - z.ai / bigmodel 的 API 端点正常情况下绝不返回 HTML 405
+    //
+    // 新增指纹 4: nginx 不存在的版本号(1.31+ 都不存在)
+    if (resp.status === 405 && ct.includes("text/html") &&
+        /nginx\/1\.(3[1-9]|[4-9]\d|1\d{2}|[2-9]\d{2})/i.test(server)) {
+      return { wafBlocked: true };
+    }
+    // 新增指纹 5: nginx 默认 405 错误页 + nginx 标志性 footer (`<hr><center>nginx`)
+    // 即使 server 头丢失或被改成其他值,只要 body 是这个标准模板
+    // 且来自一个 JSON API 上游(返回 text/html 本身就异常),就认定为 WAF
+    if (resp.status === 405 && ct.includes("text/html") &&
+        text.length < 2048 &&
+        text.includes("<title>405 Not Allowed</title>") &&
+        /<hr[^>]*>\s*<center>\s*nginx/i.test(text)) {
+      return { wafBlocked: true };
+    }
+
+    // 新增兜底指纹 6: JSON API 上游(anthropic/openai)返回 405 + text/html
+    // 正常的 API 405 应该是 JSON 格式错误;HTML 405 来自 nginx/Caddy 这类
+    // 反向代理或 WAF 拦截。这个项目所有上游都是 JSON API,任何 HTML 405
+    // 都是异常。为了保守,只匹配明显是网关默认错误页的(短 body + 标准
+    // 标题),避免误伤偶发的 HTML 帮助页。
+    if (resp.status === 405 && ct.includes("text/html") && text.length < 2048 &&
+        (text.includes("<title>405") || text.includes("<h1>405"))) {
       return { wafBlocked: true };
     }
     // Not a WAF block — reconstruct a fresh Response with the peeked

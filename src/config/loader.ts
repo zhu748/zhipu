@@ -46,7 +46,12 @@ const DEFAULTS = {
   RETRY_INITIAL_DELAY_MS: 1000,
   RETRY_MAX_DELAY_MS: 8000,
   RETRY_BACKOFF_FACTOR: 2,
-  RETRY_STATUSES: [529],
+  // v0.2.3.1+: 429 added by default. GLM 上游对超并发返回 429
+  // `{"code":3010,"msg":"model admission concurrency limit exceeded"}`,
+  // 短暂退避后重试通常能成功。503 不加入默认(偶发但语义模糊,
+  // 可能是真正的服务挂了,无脑重试反而加剧);用户需要可通过
+  // ZCODE_RETRY_STATUSES=529,429,503 显式开启。
+  RETRY_STATUSES: [529, 429],
   // v0.1.5+: lowered from 5 to 2. With maxRetries=3 (default), the old
   // value 5 meant the retry loop ALWAYS exhausted before the switch could
   // trigger — making the feature a no-op. 2 means after the initial

@@ -70,7 +70,7 @@ services:
       - key: ZCODE_RETRY_MAX
         value: "5"
       - key: ZCODE_RETRY_STATUSES
-        value: "529,429,503"
+        value: "529,429"
     # Persistent disk — only supported on paid plans. On free tier, comment
     # this out; the proxy will fall back to /tmp/zcode-proxy (ephemeral).
     # disk:

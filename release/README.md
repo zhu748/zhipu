@@ -1,5 +1,32 @@
 # zcode-proxy 使用说明
 
+> **v0.2.1.6 — 扩展 WAF 拦截检测 + 默认重试加入 429**
+>
+> 修复两个生产反馈问题:(1) Render 部署时遇到一种伪装成 nginx 标准错误页的 405 拦截,旧版 WAF 检测无法识别,导致代理池不轮换、错误页直接透传给客户端;(2) GLM 上游对超并发返回 429 `{"code":3010,"msg":"model admission concurrency limit exceeded"}`,旧版默认只重试 529,429 直接报错给用户。
+>
+> **本次改动**
+>
+> - **新增 4 类 WAF 指纹** (`src/proxy/handler.ts` 的 `checkWafBlock`):
+>   - **指纹 3**:阿里云 WAF 标准拦截页的更稳特征(`data-spm` + `block_message` / `block_traceid_tips`)。即使 `errors.aliyun.com` 域名或图片 URL 变化也能识别。
+>   - **指纹 4**:nginx 不存在的版本号(`nginx/1.31+`)。nginx 实际不存在 1.31 mainline(2025 年 mainline 是 1.27.x),这种"未来版本号"几乎肯定是 WAF/网关伪装。
+>   - **指纹 5**:nginx 默认 405 错误页模板(`<title>405 Not Allowed</title>` + `<hr><center>nginx`)。即使 server 头丢失也能识别。
+>   - **指纹 6**(兜底):JSON API 上游(anthropic/openai)返回短 HTML 405。这个项目所有上游都是 JSON API,任何 HTML 405 都是异常。
+> - **`checkWafBlock` 导出**:从 `async function` 改为 `export async function`,便于外部测试脚本调用。
+> - **新增验证脚本** `scripts/verify-waf-detect.ts`:用 Render 日志和 Cherry Studio 报错的两份真实 405 body + 两个负样本(正常 JSON 405 / SSE 200)跑检测,确认新指纹能命中且不误伤。
+> - **默认重试码加入 429** (`src/config/loader.ts` 的 `DEFAULTS.RETRY_STATUSES`):`[529]` → `[529, 429]`。GLM 上游的超并发 429 在短暂退避后重试通常能成功,无脑报错给用户体验差。503 不加入默认(语义模糊,无脑重试反而加剧),需要可通过 `ZCODE_RETRY_STATUSES=529,429,503` 显式开启。
+> - **`config.example.yaml` 同步**:种子配置的 `retryableStatuses` 也加上 429,保证新部署开箱即用。
+> - **`render.yaml` 同步**:Render Blueprint 的 `ZCODE_RETRY_STATUSES` 从 `"529,429,503"` 改为 `"529,429"`,与默认值保持一致(避免 Render 部署无脑重试 503)。
+> - **测试**:`src/config/loader.test.ts` 默认值断言同步更新。676 个单元测试通过,TypeScript 零错误。
+> - **影响**:
+>   - Render / Docker / 云厂商部署用户:遇到 nginx 伪装 405 拦截时,代理池会自动轮换到下一个代理(前提是池里有多代理),不再透传错误页给客户端。
+>   - 所有用户:GLM 上游超并发 429 自动重试,无需手动配置。
+>   - 已有 `config.yaml` 用户:如果文件里已硬编码 `retryableStatuses: [529]`,需要手动改成 `[529, 429]` 或删掉该行让它走默认。
+>   - Render Blueprint 部署用户:env 变量 `ZCODE_RETRY_STATUSES` 优先级高于默认值,本次改动通过 render.yaml 同步生效。
+>
+> **升级建议**:Render / Docker / 云厂商部署用户,以及遇到 GLM 超并发报错的所有用户,立即升级到 v0.2.1.6。本地 Windows exe + 住宅 IP 直连用户可选升级(WAF 拦截主要发生在云 IP)。
+
+---
+
 > **v0.2.1.5 — 修复 SOCKS4/SOCKS5 代理无法使用的问题**
 >
 > 之前版本中，所有 SOCKS 协议代理（`socks4://`、`socks4a://`、`socks5://`、`socks5h://`）在 dashboard 测试和实际请求转发时都会报错 `UnsupportedProxyProtocol fetching "https://api.z.ai/"`，导致 SOCKS 代理完全不可用。本版本通过引入本地 HTTP-CONNECT→SOCKS 桥彻底修复了这个问题。

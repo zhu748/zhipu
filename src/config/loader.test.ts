@@ -224,7 +224,7 @@ auth:
     expect(cfg.retry.initialDelayMs).toBe(1000);
     expect(cfg.retry.maxDelayMs).toBe(8000);
     expect(cfg.retry.backoffFactor).toBe(2);
-    expect(cfg.retry.retryableStatuses).toEqual([529]);
+    expect(cfg.retry.retryableStatuses).toEqual([529, 429]);
   });
 
   it("retry: loads retry config from YAML", () => {

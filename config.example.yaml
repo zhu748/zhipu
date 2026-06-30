@@ -129,9 +129,10 @@ retry:
   # Exponential backoff multiplier. 2 = each retry waits ~2x longer.
   backoffFactor: 2
   # HTTP status codes that trigger a retry.
-  # Common values: 429 (rate limited), 503 (service unavailable), 529 (site overloaded).
+  # Common values: 429 (rate limited / concurrency limit), 503 (service unavailable), 529 (site overloaded).
   retryableStatuses:
     - 529
+    - 429
   # Credential auto-switching: when the SAME credential fails this many times
   # consecutively (including the initial request), the proxy automatically
   # switches to another stored credential (if available) and continues retrying.
